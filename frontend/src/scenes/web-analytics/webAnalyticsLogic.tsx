@@ -218,6 +218,11 @@ export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
         setTileVisualization: (tileId: TileId, visualization: TileVisualizationOption) => ({ tileId, visualization }),
         setTileVisibility: (tileId: TileId, visible: boolean) => ({ tileId, visible }),
         resetTileVisibility: () => true,
+        zoomIntoPeriod: (dateFrom: string, dateTo: string) => ({ dateFrom, dateTo }),
+        resetZoom: true,
+        setPreZoomDateFilter: (
+            filter: { dateFrom: string | null; dateTo: string | null; interval: IntervalType } | null
+        ) => ({ filter }),
         clearFilters: true,
     }),
     loaders(({ values }) => ({
@@ -396,6 +401,15 @@ export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
                     interval: INITIAL_INTERVAL,
                     isIntervalManuallySet: false,
                 }),
+            },
+        ],
+        preZoomDateFilter: [
+            null as { dateFrom: string | null; dateTo: string | null; interval: IntervalType } | null,
+            {
+                setPreZoomDateFilter: (_, { filter }) => filter,
+                setDates: () => null,
+                setDateInterval: () => null,
+                clearFilters: () => null,
             },
         ],
         shouldFilterTestAccounts: [
@@ -1100,8 +1114,8 @@ export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
                             kind: 'query',
                             tileId: TileId.WEB_VITALS,
                             layout: {
-                                colSpanClassName: '@4xl/main-content:col-span-full',
-                                orderWhenLargeClassName: '@7xl/main-content:order-0',
+                                colSpanClassName: 'md:col-span-full',
+                                orderWhenLargeClassName: 'xxl:order-0',
                             },
                             query: {
                                 kind: NodeKind.WebVitalsQuery,
@@ -1130,8 +1144,8 @@ export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
                             kind: 'query',
                             tileId: TileId.WEB_VITALS_PATH_BREAKDOWN,
                             layout: {
-                                colSpanClassName: '@4xl/main-content:col-span-full',
-                                orderWhenLargeClassName: '@7xl/main-content:order-0',
+                                colSpanClassName: 'md:col-span-full',
+                                orderWhenLargeClassName: 'xxl:order-0',
                             },
                             query: {
                                 kind: NodeKind.WebVitalsPathBreakdownQuery,
@@ -1164,8 +1178,8 @@ export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
                         kind: 'query',
                         tileId: TileId.OVERVIEW,
                         layout: {
-                            colSpanClassName: '@4xl/main-content:col-span-full',
-                            orderWhenLargeClassName: '@7xl/main-content:order-0',
+                            colSpanClassName: 'md:col-span-full',
+                            orderWhenLargeClassName: 'xxl:order-0',
                             className: '-mt-2',
                         },
                         query: {
@@ -1186,8 +1200,8 @@ export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
                         kind: 'tabs',
                         tileId: TileId.GRAPHS,
                         layout: {
-                            colSpanClassName: `@4xl/main-content:col-span-2`,
-                            orderWhenLargeClassName: '@7xl/main-content:order-1',
+                            colSpanClassName: `md:col-span-2`,
+                            orderWhenLargeClassName: 'xxl:order-1',
                         },
                         activeTabId: graphsTab,
                         setTabId: actions.setGraphsTab,
@@ -1260,8 +1274,8 @@ export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
                         kind: 'tabs',
                         tileId: TileId.PATHS,
                         layout: {
-                            colSpanClassName: `@4xl/main-content:col-span-2`,
-                            orderWhenLargeClassName: '@7xl/main-content:order-4',
+                            colSpanClassName: `md:col-span-2`,
+                            orderWhenLargeClassName: 'xxl:order-4',
                         },
                         activeTabId: pathTab,
                         setTabId: actions.setPathTab,
@@ -1426,11 +1440,14 @@ export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
                         kind: 'tabs',
                         tileId: TileId.SOURCES,
                         layout: {
-                            colSpanClassName: `@4xl/main-content:col-span-1`,
-                            orderWhenLargeClassName: '@7xl/main-content:order-2',
+                            colSpanClassName: `md:col-span-1`,
+                            orderWhenLargeClassName: 'xxl:order-2',
                         },
                         activeTabId: sourceTab,
                         setTabId: actions.setSourceTab,
+                        splitIndices: featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_REFERRER_URL_DRILLDOWN]
+                            ? [1, 3] // [Channel] [Referring Domain ▼ Referring URL] [UTM Source ▼ ...]
+                            : [2], // [Channel] [Referring Domain] [UTM Source ▼ ...]
                         tabs: [
                             createTableTab(
                                 TileId.SOURCES,
@@ -1492,12 +1509,32 @@ export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
                                 {},
                                 {
                                     docs: {
-                                        url: 'https://posthog.com/docs/web-analytics/dashboard#referrers-channels-utms',
+                                        url: 'https://posthog.com/docs/web-analytics/dashboard#channels-referrers-utms',
                                         title: 'Referrers',
                                         description: 'Understand where your users are coming from',
                                     },
                                 }
                             ),
+                            ...(featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_REFERRER_URL_DRILLDOWN]
+                                ? [
+                                      createTableTab(
+                                          TileId.SOURCES,
+                                          SourceTab.REFERRING_URL,
+                                          'Referrer URLs',
+                                          'Referring URL',
+                                          WebStatsBreakdown.InitialReferringURL,
+                                          {},
+                                          {
+                                              docs: {
+                                                  url: 'https://posthog.com/docs/web-analytics/dashboard#channels-referrers-utms',
+                                                  title: 'Referrer URLs',
+                                                  description:
+                                                      'Full referring URLs (without query parameters) showing where your users came from',
+                                              },
+                                          }
+                                      ),
+                                  ]
+                                : []),
                             createTableTab(
                                 TileId.SOURCES,
                                 SourceTab.UTM_SOURCE,
@@ -1625,8 +1662,8 @@ export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
                         kind: 'tabs',
                         tileId: TileId.DEVICES,
                         layout: {
-                            colSpanClassName: `@4xl/main-content:col-span-1`,
-                            orderWhenLargeClassName: '@7xl/main-content:order-3',
+                            colSpanClassName: `md:col-span-1`,
+                            orderWhenLargeClassName: 'xxl:order-3',
                         },
                         activeTabId: deviceTab,
                         setTabId: actions.setDeviceTab,
@@ -1660,7 +1697,7 @@ export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
                         kind: 'tabs',
                         tileId: TileId.GEOGRAPHY,
                         layout: {
-                            colSpanClassName: '@4xl/main-content:col-span-full',
+                            colSpanClassName: 'md:col-span-full',
                         },
                         activeTabId:
                             geographyTab || (shouldShowGeoIPQueries ? GeographyTab.MAP : GeographyTab.LANGUAGES),
@@ -1794,7 +1831,7 @@ export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
                               tileId: TileId.RETENTION,
                               title: 'Retention',
                               layout: {
-                                  colSpanClassName: '@4xl/main-content:col-span-2',
+                                  colSpanClassName: 'md:col-span-2',
                               },
                               query: {
                                   kind: NodeKind.InsightVizNode,
@@ -1851,7 +1888,7 @@ export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
                         kind: 'tabs',
                         tileId: TileId.ACTIVE_HOURS,
                         layout: {
-                            colSpanClassName: '@4xl/main-content:col-span-full',
+                            colSpanClassName: 'md:col-span-full',
                         },
                         activeTabId: activeHoursTab,
                         setTabId: actions.setActiveHoursTab,
@@ -1992,7 +2029,7 @@ export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
                               tileId: TileId.GOALS,
                               title: 'Goals',
                               layout: {
-                                  colSpanClassName: '@4xl/main-content:col-span-2',
+                                  colSpanClassName: 'md:col-span-2',
                               },
                               query: {
                                   full: true,
@@ -2040,9 +2077,7 @@ export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
                               kind: 'replay',
                               tileId: TileId.REPLAY,
                               layout: {
-                                  colSpanClassName: conversionGoal
-                                      ? '@4xl/main-content:col-span-full'
-                                      : '@4xl/main-content:col-span-1',
+                                  colSpanClassName: conversionGoal ? 'md:col-span-full' : 'md:col-span-1',
                               },
                               docs: {
                                   url: 'https://posthog.com/docs/session-replay',
@@ -2057,7 +2092,7 @@ export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
                               kind: 'error_tracking',
                               tileId: TileId.ERROR_TRACKING,
                               layout: {
-                                  colSpanClassName: '@4xl/main-content:col-span-1',
+                                  colSpanClassName: 'md:col-span-1',
                               },
                               query: errorTrackingQ,
                               docs: {
@@ -2087,7 +2122,7 @@ export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
                               title: 'Frustrating Pages',
                               tileId: TileId.FRUSTRATING_PAGES,
                               layout: {
-                                  colSpanClassName: '@4xl/main-content:col-span-2',
+                                  colSpanClassName: 'md:col-span-2',
                               },
                               query: {
                                   full: true,
@@ -2165,8 +2200,7 @@ export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
 
     tabAwareActionToUrl(({ values }) => {
         const stateToUrl = (): string => {
-            const searchParams = { ...router.values.searchParams }
-            const urlParams = new URLSearchParams(searchParams)
+            const urlParams = new URLSearchParams(router.values.location.search)
 
             const {
                 rawWebAnalyticsFilters,
@@ -2198,6 +2232,8 @@ export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
             // spreading from their individual dropdowns to the global filters list
             if (rawWebAnalyticsFilters.length > 0) {
                 urlParams.set('filters', JSON.stringify(rawWebAnalyticsFilters))
+            } else {
+                urlParams.delete('filters')
             }
             if (conversionGoal) {
                 if ('actionId' in conversionGoal) {
@@ -2345,6 +2381,7 @@ export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
                 (date_to && date_to !== values.dateFilter.dateTo) ||
                 (interval && interval !== values.dateFilter.interval)
             ) {
+                actions.setPreZoomDateFilter(null)
                 actions.setDatesAndInterval(date_from, date_to, interval)
             }
             if (device_tab && device_tab !== values._deviceTab) {
@@ -2442,6 +2479,23 @@ export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
                 })
                 globalSetupLogic.findMounted()?.actions.markTaskAsCompleted(SetupTaskId.FilterWebAnalytics)
             },
+            zoomIntoPeriod: ({ dateFrom, dateTo }) => {
+                if (values.preZoomDateFilter === null) {
+                    actions.setPreZoomDateFilter({
+                        dateFrom: values.dateFilter.dateFrom,
+                        dateTo: values.dateFilter.dateTo,
+                        interval: values.dateFilter.interval,
+                    })
+                }
+                actions.setDatesAndInterval(dateFrom, dateTo, getDefaultInterval(dateFrom, dateTo))
+            },
+            resetZoom: () => {
+                const preZoom = values.preZoomDateFilter
+                if (preZoom) {
+                    actions.setPreZoomDateFilter(null)
+                    actions.setDatesAndInterval(preZoom.dateFrom, preZoom.dateTo, preZoom.interval)
+                }
+            },
             setWebAnalyticsFilters: () => {
                 globalSetupLogic.findMounted()?.actions.markTaskAsCompleted(SetupTaskId.FilterWebAnalytics)
             },
@@ -2529,6 +2583,7 @@ export const webAnalyticsLogic = kea<webAnalyticsLogicType>([
             loadPreset: ({ filters }) => {
                 if (filters.dateFrom !== undefined || filters.dateTo !== undefined) {
                     const interval = filters.interval ?? values.dateFilter.interval
+                    actions.setPreZoomDateFilter(null)
                     actions.setDatesAndInterval(
                         filters.dateFrom ?? values.dateFilter.dateFrom,
                         filters.dateTo ?? values.dateFilter.dateTo,

@@ -34,6 +34,8 @@ MODULE_PATH = "posthog.temporal.data_imports.workflow_activities.emit_signals"
 
 def _make_config(**overrides: Any) -> SignalSourceTableConfig:
     defaults: dict[str, Any] = {
+        "source_product": "test_product",
+        "source_type": "test",
         "emitter": lambda team_id, record: SignalEmitterOutput(
             source_product="test_product",
             source_type="test",
@@ -193,9 +195,28 @@ class TestBuildEmitterOutputs:
             return None
 
         records = [{"id": 1, "valid": True}, {"id": 2, "valid": False}, {"id": 3, "valid": True}]
-        outputs = _build_emitter_outputs(team_id=1, records=records, emitter=selective_emitter)
+        outputs, error_count = _build_emitter_outputs(team_id=1, records=records, emitter=selective_emitter)
 
         assert [o.source_id for o in outputs] == ["1", "3"]
+        assert error_count == 0
+
+    def test_converts_datetime_values_in_extra_to_isoformat(self):
+        dt = datetime(2025, 6, 15, 12, 30, 0, tzinfo=UTC)
+
+        def emitter_with_datetime(team_id, record):
+            return SignalEmitterOutput(
+                source_product="test",
+                source_type="test",
+                source_id="1",
+                description="test",
+                weight=1.0,
+                extra={"created_at": dt, "name": "keep_as_is"},
+            )
+
+        outputs, _ = _build_emitter_outputs(team_id=1, records=[{"id": 1}], emitter=emitter_with_datetime)
+
+        assert outputs[0].extra["created_at"] == "2025-06-15T12:30:00+00:00"
+        assert outputs[0].extra["name"] == "keep_as_is"
 
 
 class TestCheckActionability:
@@ -458,10 +479,21 @@ class TestEmitSignals:
             patch(f"{MODULE_PATH}.emit_signal", new_callable=AsyncMock) as mock_emit,
             patch(f"{MODULE_PATH}.activity"),
         ):
-            count = await _emit_signals(team=MagicMock(), outputs=[output], extra={})
+            with pytest.raises(RuntimeError, match="All 1 signal emissions failed"):
+                await _emit_signals(team=MagicMock(), outputs=[output], extra={})
 
-        assert count == 0
         mock_emit.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_raises_when_all_emissions_fail(self):
+        outputs = [_make_output(source_id="1"), _make_output(source_id="2")]
+
+        with (
+            patch(f"{MODULE_PATH}.emit_signal", side_effect=Exception("boom")),
+            patch(f"{MODULE_PATH}.activity"),
+        ):
+            with pytest.raises(RuntimeError, match="All 2 signal emissions failed"):
+                await _emit_signals(team=MagicMock(), outputs=outputs, extra={})
 
 
 class TestEmitDataImportSignalsWorkflow:

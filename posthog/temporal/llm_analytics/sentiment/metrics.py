@@ -8,6 +8,8 @@ and scraped by the Prometheus endpoint on the worker pod.
 import typing
 import datetime as dt
 
+from django.conf import settings
+
 from temporalio import activity, workflow
 from temporalio.worker import (
     ActivityInboundInterceptor,
@@ -28,6 +30,8 @@ SENTIMENT_LATENCY_HISTOGRAM_METRICS = (
     "llma_sentiment_activity_execution_latency",
     "llma_sentiment_activity_schedule_to_start_latency",
     "llma_sentiment_workflow_execution_latency",
+    "llma_sentiment_query_time",
+    "llma_sentiment_inference_time",
 )
 SENTIMENT_LATENCY_HISTOGRAM_BUCKETS = [
     100.0,  # 100ms
@@ -38,6 +42,7 @@ SENTIMENT_LATENCY_HISTOGRAM_BUCKETS = [
     10_000.0,  # 10 seconds
     30_000.0,  # 30 seconds
     60_000.0,  # 1 minute
+    120_000.0,  # 2 minutes
 ]
 
 # ---------------------------------------------------------------------------
@@ -93,6 +98,48 @@ def record_messages_classified(count: int) -> None:
     ).add(count)
 
 
+def record_generations_fetched(count: int) -> None:
+    if not activity.in_activity() and not workflow.in_workflow():
+        return
+    meter = get_metric_meter()
+    meter.create_counter(
+        "llma_sentiment_generations_fetched",
+        "Generation rows fetched from ClickHouse",
+    ).add(count)
+
+
+def record_query_time_ms(duration_ms: float) -> None:
+    if not activity.in_activity() and not workflow.in_workflow():
+        return
+    meter = get_metric_meter()
+    meter.create_histogram_timedelta(
+        name="llma_sentiment_query_time",
+        description="ClickHouse query time",
+        unit="ms",
+    ).record(dt.timedelta(milliseconds=duration_ms))
+
+
+def record_inference_time_ms(duration_ms: float) -> None:
+    if not activity.in_activity() and not workflow.in_workflow():
+        return
+    meter = get_metric_meter()
+    meter.create_histogram_timedelta(
+        name="llma_sentiment_inference_time",
+        description="ONNX model inference time",
+        unit="ms",
+    ).record(dt.timedelta(milliseconds=duration_ms))
+
+
+def record_generations_classified(count: int) -> None:
+    if not activity.in_activity() and not workflow.in_workflow():
+        return
+    meter = get_metric_meter()
+    meter.create_counter(
+        "llma_sentiment_generations_classified",
+        "Individual generations classified for sentiment",
+    ).add(count)
+
+
 def increment_errors(error_type: str) -> None:
     if not activity.in_activity() and not workflow.in_workflow():
         return
@@ -110,6 +157,8 @@ def increment_errors(error_type: str) -> None:
 
 class SentimentMetricsInterceptor(Interceptor):
     """Interceptor to emit Prometheus metrics for sentiment workflows."""
+
+    task_queue = settings.LLMA_SENTIMENT_TASK_QUEUE
 
     def intercept_activity(self, next: ActivityInboundInterceptor) -> ActivityInboundInterceptor:
         return _SentimentActivityInterceptor(super().intercept_activity(next))
