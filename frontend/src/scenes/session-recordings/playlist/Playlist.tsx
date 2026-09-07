@@ -1,42 +1,43 @@
 import './Playlist.scss'
 
+import { useVirtualizer } from '@tanstack/react-virtual'
 import clsx from 'clsx'
 import { useActions, useValues } from 'kea'
-import { ReactNode, useRef, useState } from 'react'
+import { ReactNode, useLayoutEffect, useRef, useState } from 'react'
 
-import { IconMagicWand, IconSidebarClose } from '@posthog/icons'
+import { IconSidebarClose } from '@posthog/icons'
 import {
     LemonBadge,
     LemonBanner,
     LemonButton,
     LemonCollapse,
     LemonSkeleton,
-    LemonTag,
     Link,
     Spinner,
     Tooltip,
 } from '@posthog/lemon-ui'
 
 import { PropertyKeyInfo } from 'lib/components/PropertyKeyInfo'
-import { FEATURE_FLAGS } from 'lib/constants'
 import { useResizeBreakpoints } from 'lib/hooks/useResizeObserver'
 import { LemonTableLoader } from 'lib/lemon-ui/LemonTable/LemonTableLoader'
-import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
-import { range } from 'lib/utils'
-import { maxGlobalLogic } from 'scenes/max/maxGlobalLogic'
+import { range } from 'lib/utils/arrays'
+import { pluralize } from 'lib/utils/strings'
 import { DraggableToNotebook } from 'scenes/notebooks/AddToNotebook/DraggableToNotebook'
 import { useNotebookNode } from 'scenes/notebooks/Nodes/NotebookNodeContext'
 import { RecordingsUniversalFiltersEmbedButton } from 'scenes/session-recordings/filters/RecordingsUniversalFiltersEmbed'
 import { playerSettingsLogic } from 'scenes/session-recordings/player/playerSettingsLogic'
+import { playlistFiltersLogic } from 'scenes/session-recordings/playlist/playlistFiltersLogic'
 import { SessionRecordingPreview } from 'scenes/session-recordings/playlist/SessionRecordingPreview'
+import { sessionRecordingsPlaylistLogic } from 'scenes/session-recordings/playlist/sessionRecordingsPlaylistLogic'
 import { SessionRecordingsPlaylistTopSettings } from 'scenes/session-recordings/playlist/SessionRecordingsPlaylistSettings'
 import { SessionRecordingsPlaylistTroubleshooting } from 'scenes/session-recordings/playlist/SessionRecordingsPlaylistTroubleshooting'
-import { sessionRecordingsPlaylistLogic } from 'scenes/session-recordings/playlist/sessionRecordingsPlaylistLogic'
 import { urls } from 'scenes/urls'
 
 import { ReplayTabs, SessionRecordingType } from '~/types'
 
 const SCROLL_TRIGGER_OFFSET = 100
+// Starting row height for the virtualizer; dynamic measurement corrects each row after it renders.
+const ESTIMATED_ROW_HEIGHT = 56
 
 type PlaylistSectionBase = {
     key: string
@@ -73,9 +74,6 @@ export function Playlist({
     description,
     selectInitialItem,
 }: PlaylistProps): JSX.Element {
-    const { featureFlags } = useValues(featureFlagLogic)
-    const { askSidePanelMax } = useActions(maxGlobalLogic)
-
     const { isPlaylistCollapsed } = useValues(playerSettingsLogic)
     const { setPlaylistCollapsed } = useActions(playerSettingsLogic)
 
@@ -86,7 +84,8 @@ export function Playlist({
     })
 
     const lastScrollPositionRef = useRef(0)
-    const contentRef = useRef<HTMLDivElement | null>(null)
+    // state, not a ref: the virtualizer must re-initialize when the scroll container mounts
+    const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null)
 
     const notebookNode = useNotebookNode()
     const embedded = !!notebookNode
@@ -97,12 +96,14 @@ export function Playlist({
         activeSessionRecordingId,
         totalFiltersCount,
         sessionRecordingsResponseLoading,
-        pinnedRecordings,
+        visiblePinnedRecordings: pinnedRecordings,
         otherRecordings,
         hasNext,
+        selectedRecordingOutsideFilters,
     } = useValues(sessionRecordingsPlaylistLogic)
-    const { maybeLoadSessionRecordings, setFilters, setSelectedRecordingId, loadSessionRecordings } =
+    const { maybeLoadSessionRecordings, setFilters, setSelectedRecordingId } =
         useActions(sessionRecordingsPlaylistLogic)
+    const { setIsFiltersExpanded } = useActions(playlistFiltersLogic)
 
     const onScrollListEdge = (edge: 'bottom' | 'top'): void => {
         if (edge === 'top') {
@@ -169,6 +170,29 @@ export function Playlist({
                             'No more results'
                         )}
                     </div>
+                    {!sessionRecordingsResponseLoading && !hasNext && (
+                        <div className="flex flex-col items-center gap-1 pt-2 pb-2">
+                            <span className="text-xs text-secondary">Looking for older recordings?</span>
+                            <div className="flex gap-2">
+                                {(filters.date_from === '-3d' || filters.date_from === '-7d') && (
+                                    <LemonButton
+                                        type="secondary"
+                                        size="small"
+                                        onClick={() =>
+                                            setFilters({
+                                                date_from: filters.date_from === '-3d' ? '-7d' : '-30d',
+                                            })
+                                        }
+                                    >
+                                        Search last {filters.date_from === '-3d' ? '7' : '30'} days
+                                    </LemonButton>
+                                )}
+                                <LemonButton type="secondary" size="small" onClick={() => setIsFiltersExpanded(true)}>
+                                    Show filters
+                                </LemonButton>
+                            </div>
+                        </div>
+                    )}
                 </div>
             ),
         })
@@ -235,9 +259,25 @@ export function Playlist({
                             setFilters={setFilters}
                             totalFiltersCount={totalFiltersCount}
                             currentSessionRecordingId={activeSessionRecordingId}
-                            onReload={() => loadSessionRecordings()}
+                            onReload={() => maybeLoadSessionRecordings()}
                         />
                     </DraggableToNotebook>
+                </div>
+            )}
+            {!!filters?.session_ids?.length && (
+                <div className="mb-2 flex items-center justify-between gap-2 rounded border bg-fill-primary px-2 py-1">
+                    <span className="min-w-0 truncate text-xs text-secondary">
+                        Showing {pluralize(filters.session_ids.length, 'selected recording')}
+                    </span>
+                    <LemonButton
+                        className="shrink-0"
+                        size="xsmall"
+                        type="tertiary"
+                        onClick={() => setFilters({ session_ids: undefined })}
+                        loading={!!sessionRecordingsResponseLoading}
+                    >
+                        Show all
+                    </LemonButton>
                 </div>
             )}
             <div
@@ -256,9 +296,9 @@ export function Playlist({
                     className="Playlist__list flex flex-col relative overflow-hidden h-full w-full"
                 >
                     <div className="flex flex-col relative w-full bg-bg-light overflow-hidden h-full Playlist__list">
-                        <DraggableToNotebook href={urls.replay(ReplayTabs.Home, filters)}>
-                            <div className="flex flex-col gap-1">
-                                <div className="shrink-0 bg-bg-3000 relative flex justify-between items-center gap-0.5 whitespace-nowrap border-b">
+                        <div className="relative">
+                            <DraggableToNotebook href={urls.replay(ReplayTabs.Home, filters)}>
+                                <div className="shrink-0 bg-bg-3000 flex justify-between items-center gap-0.5 whitespace-nowrap border-b">
                                     {title && <TitleWithCount title={title} count={itemsCount} />}
                                     <div className="flex items-center gap-0.5">
                                         <LemonButton
@@ -280,10 +320,16 @@ export function Playlist({
                                         />
                                     </div>
                                 </div>
-                                <LemonTableLoader loading={sessionRecordingsResponseLoading} />
-                            </div>
-                        </DraggableToNotebook>
-                        <div className="overflow-y-auto flex-1 min-h-0" onScroll={handleScroll} ref={contentRef}>
+                            </DraggableToNotebook>
+                            <LemonTableLoader loading={sessionRecordingsResponseLoading} />
+                        </div>
+                        {selectedRecordingOutsideFilters && (
+                            <LemonBanner type="warning" className="m-2">
+                                The recording you have open doesn't match the current filters. It stays in the list
+                                until you close it.
+                            </LemonBanner>
+                        )}
+                        <div className="overflow-y-auto flex-1 min-h-0" onScroll={handleScroll} ref={setScrollEl}>
                             {sectionCount > 1 ? (
                                 <LemonCollapse
                                     defaultActiveKeys={openSections}
@@ -298,6 +344,7 @@ export function Playlist({
                                                     setActiveItemId={onChangeActiveItem}
                                                     activeItemId={activeItemId}
                                                     emptyState={listEmptyState}
+                                                    scrollEl={scrollEl}
                                                 />
                                             ),
                                             className: 'p-0',
@@ -315,6 +362,7 @@ export function Playlist({
                                     setActiveItemId={onChangeActiveItem}
                                     activeItemId={activeItemId}
                                     emptyState={listEmptyState}
+                                    scrollEl={scrollEl}
                                 />
                             ) : sessionRecordingsResponseLoading ? (
                                 <LoadingState />
@@ -323,24 +371,6 @@ export function Playlist({
                             )}
                         </div>
                     </div>
-                    {featureFlags[FEATURE_FLAGS.MAX_SESSION_SUMMARIZATION_BUTTON] && (
-                        <LemonButton
-                            icon={<IconMagicWand />}
-                            type="primary"
-                            onClick={() => {
-                                askSidePanelMax('Summarize recordings based on the current filters')
-                            }}
-                            fullWidth
-                            size="small"
-                            className="mt-2"
-                            disabledReason={!firstItem ? 'No recordings in the list' : undefined}
-                        >
-                            Summarize these recordings
-                            <LemonTag type="warning" size="small" className="ml-auto uppercase">
-                                Beta
-                            </LemonTag>
-                        </LemonButton>
-                    )}
                 </div>
             </div>
         </div>
@@ -432,17 +462,19 @@ function SectionContent({
     activeItemId,
     setActiveItemId,
     emptyState,
+    scrollEl,
 }: {
     section: PlaylistSection
     loading: boolean
     activeItemId: SessionRecordingType['id'] | null
     setActiveItemId: (item: SessionRecordingType) => void
     emptyState: JSX.Element
+    scrollEl: HTMLDivElement | null
 }): JSX.Element {
     return 'content' in section ? (
         <>{section.content}</>
     ) : 'items' in section && !!section.items.length ? (
-        <ListSection {...section} onClick={setActiveItemId} activeItemId={activeItemId} />
+        <ListSection {...section} onClick={setActiveItemId} activeItemId={activeItemId} scrollEl={scrollEl} />
     ) : loading ? (
         <LoadingState />
     ) : (
@@ -456,19 +488,68 @@ export function ListSection({
     footer,
     onClick,
     activeItemId,
+    scrollEl,
 }: PlaylistRecordingPreviewBlock & {
     onClick: (item: SessionRecordingType) => void
     activeItemId: SessionRecordingType['id'] | null
+    scrollEl: HTMLDivElement | null
 }): JSX.Element {
+    const listRef = useRef<HTMLDivElement>(null)
+    const [scrollMargin, setScrollMargin] = useState(0)
+
+    const virtualizer = useVirtualizer({
+        count: items.length,
+        getScrollElement: () => scrollEl,
+        estimateSize: () => ESTIMATED_ROW_HEIGHT,
+        overscan: 10,
+        getItemKey: (index) => items[index].id,
+        scrollMargin,
+    })
+
+    // The list can sit below a banner or a pinned section inside the shared scroll container, and that
+    // offset changes when those appear or collapse. Realign the virtualizer's origin on layout shifts.
+    // The formula is scroll-invariant, so it only updates state on real shifts, not on every scroll frame.
+    useLayoutEffect(() => {
+        const listEl = listRef.current
+        if (!listEl || !scrollEl || virtualizer.isScrolling) {
+            return
+        }
+        const nextMargin =
+            listEl.getBoundingClientRect().top - scrollEl.getBoundingClientRect().top + scrollEl.scrollTop
+        setScrollMargin((current) => (Math.abs(current - nextMargin) > 1 ? nextMargin : current))
+    })
+
+    // Transformed absolute rows opt out of browser scroll anchoring, so compensate for
+    // prepended items ("newer" loads) to keep the visible rows in place.
+    const prevFirstIdRef = useRef(items[0]?.id)
+    useLayoutEffect(() => {
+        const prevFirstId = prevFirstIdRef.current
+        prevFirstIdRef.current = items[0]?.id
+        const insertedCount = items.findIndex((item) => item.id === prevFirstId)
+        if (insertedCount > 0 && scrollEl && scrollEl.scrollTop > 0) {
+            scrollEl.scrollTop += insertedCount * ESTIMATED_ROW_HEIGHT
+        }
+    }, [items, scrollEl])
+
     return (
         <>
-            {items.length > 0
-                ? items.map((item) => (
-                      <div key={item.id} className="border-b" onClick={() => onClick(item)}>
-                          {render({ item, isActive: item.id === activeItemId })}
-                      </div>
-                  ))
-                : null}
+            <div ref={listRef} className="relative w-full" style={{ height: virtualizer.getTotalSize() }}>
+                {virtualizer.getVirtualItems().map((virtualItem) => {
+                    const item = items[virtualItem.index]
+                    return (
+                        <div
+                            key={virtualItem.key}
+                            data-index={virtualItem.index}
+                            ref={virtualizer.measureElement}
+                            className="border-b absolute top-0 left-0 w-full"
+                            style={{ transform: `translateY(${virtualItem.start - scrollMargin}px)` }}
+                            onClick={() => onClick(item)}
+                        >
+                            {render({ item, isActive: item.id === activeItemId })}
+                        </div>
+                    )
+                })}
+            </div>
             {footer}
         </>
     )

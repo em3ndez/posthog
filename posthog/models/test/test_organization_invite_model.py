@@ -10,8 +10,9 @@ from posthog.models.organization import OrganizationMembership
 from posthog.models.team.team import Team
 from posthog.models.user import User
 
+from products.access_control.backend.models.access_control import AccessControl
+
 from ee.models.explicit_team_membership import ExplicitTeamMembership
-from ee.models.rbac.access_control import AccessControl
 
 
 class TestOrganizationInvite(BaseTest):
@@ -123,10 +124,6 @@ class TestOrganizationInvite(BaseTest):
     def test_invite_use_sends_email_notification(self, mock_send_email, mock_is_email_available):
         """Test that using an invite sends an email notification when configured"""
         mock_is_email_available.return_value = True
-
-        # Set organization to enable member join emails
-        self.organization.is_member_join_email_enabled = True
-        self.organization.save()
 
         # Create a user who will use the invite
         user = User.objects.create_user(email="email_test@posthog.com", password="password", first_name="first_name")

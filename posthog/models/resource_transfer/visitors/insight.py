@@ -21,6 +21,7 @@ class InsightVisitor(
         "dive_dashboard",
         "dashboard",
         "dashboards",
+        "subscriptions_dashboard_export",
         "short_id",
         "filters_hash",
         "refreshing",
@@ -31,13 +32,14 @@ class InsightVisitor(
 ):
     @classmethod
     def get_model(cls) -> type[models.Model]:
-        from posthog.models import Insight
+        from products.product_analytics.backend.facade.models import Insight
 
         return Insight
 
     @classmethod
     def get_dynamic_edges(cls, resource: Any) -> list[ResourceTransferEdge]:
-        from posthog.models import Action, Cohort
+        from products.actions.backend.models.action import Action
+        from products.cohorts.backend.models.cohort import Cohort
 
         action_ids = cls._extract_action_ids(resource.filters, resource.query)
         cohort_ids = cls._extract_cohort_ids(resource.filters, resource.query)

@@ -1,5 +1,6 @@
 import datetime
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, get_args, get_origin
 from uuid import UUID
 
@@ -11,14 +12,15 @@ from posthog.schema import CurrencyCode, HumanMessage
 
 from posthog.event_usage import groups
 from posthog.models import Team
-from posthog.models.action.action import Action
 from posthog.models.user import User
+
+from products.actions.backend.models.action import Action
+from products.posthog_ai.backend.models.assistant import Conversation, CoreMemory
 
 from ee.hogai.utils.dispatcher import AssistantDispatcher, create_dispatcher_from_config
 from ee.hogai.utils.feature_flags import is_core_memory_disabled
 from ee.hogai.utils.helpers import find_start_message
 from ee.hogai.utils.types.base import AssistantState, BaseStateWithIntermediateSteps, NodePath
-from ee.models import Conversation, CoreMemory
 
 
 class AssistantContextMixin(ABC):
@@ -145,10 +147,18 @@ class AssistantContextMixin(ABC):
         return False
 
 
+@dataclass(frozen=True)
+class StateClasses:
+    """The state types extracted from a class's generic parameters."""
+
+    state_class: type
+    partial_state_class: type
+
+
 class StateClassMixin:
     """Mixin to extract state types from generic class parameters."""
 
-    def _get_state_class(self, target_class: type) -> tuple[type, type]:
+    def _get_state_class(self, target_class: type) -> StateClasses:
         """Extract the State type from the class's generic parameters."""
         # Check if this class has generic arguments
         if hasattr(self.__class__, "__orig_bases__"):
@@ -156,7 +166,8 @@ class StateClassMixin:
                 if get_origin(base) is target_class:
                     args = get_args(base)
                     if args:
-                        return args[0], args[1]  # State is the first argument and PartialState is the second argument
+                        # State is the first argument and PartialState is the second argument
+                        return StateClasses(state_class=args[0], partial_state_class=args[1])
 
         # No generic type found - this shouldn't happen in proper usage
         raise ValueError(

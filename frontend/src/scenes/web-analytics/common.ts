@@ -1,7 +1,10 @@
 import { BreakPointFunction } from 'kea'
 
+import { LemonMenuItem } from '@posthog/lemon-ui'
+
 import { PostHogComDocsURL } from 'lib/lemon-ui/Link/Link'
-import { UnexpectedNeverError, getDefaultInterval } from 'lib/utils'
+import { getDefaultInterval } from 'lib/utils/dateFilters'
+import { UnexpectedNeverError } from 'lib/utils/guards'
 
 import { hogqlQuery } from '~/queries/query'
 import {
@@ -14,15 +17,24 @@ import {
     WebStatsBreakdown,
 } from '~/queries/schema/schema-general'
 import { hogql } from '~/queries/utils'
-import { InsightLogicProps, PropertyFilterType, PropertyMathType } from '~/types'
+import { InsightLogicProps, PropertyFilterType, PropertyMathType, PropertyOperator } from '~/types'
+
+/** Matches BREAKDOWN_NULL_DISPLAY in posthog/hogql_queries/web_analytics/stats_table.py */
+export const BREAKDOWN_NULL_DISPLAY = '(none)'
+/** Matches BREAKDOWN_REFERRER_PREFIX in posthog/hogql_queries/web_analytics/stats_table.py */
+export const BREAKDOWN_REFERRER_PREFIX = 'referrer:'
 
 export interface WebTileLayout {
     /** The class has to be spelled out without interpolation, as otherwise Tailwind can't pick it up. */
-    colSpanClassName?: `@4xl/main-content:col-span-${number}` | '@4xl/main-content:col-span-full'
+    colSpanClassName?:
+        | `md:col-span-${number}`
+        | 'md:col-span-full'
+        | `md:col-span-${number} 2xl:col-span-${number}`
+        | `md:col-span-${number} 2xl:col-span-full`
     /** The class has to be spelled out without interpolation, as otherwise Tailwind can't pick it up. */
-    rowSpanClassName?: `@4xl/main-content:row-span-${number}`
+    rowSpanClassName?: `md:row-span-${number}`
     /** The class has to be spelled out without interpolation, as otherwise Tailwind can't pick it up. */
-    orderWhenLargeClassName?: `@7xl/main-content:order-${number}`
+    orderWhenLargeClassName?: `2xl:order-${number}`
     className?: string
 }
 
@@ -77,6 +89,24 @@ export enum TileId {
     MARKETING = 'MARKETING',
     MARKETING_CAMPAIGN_BREAKDOWN = 'MARKETING_CAMPAIGN_BREAKDOWN',
     MARKETING_NON_INTEGRATED_CONVERSIONS = 'MARKETING_NON_INTEGRATED_CONVERSIONS',
+
+    // Bot Analytics Tiles
+    BOT_OVERVIEW = 'BOT_OVERVIEW',
+    BOT_TRENDS = 'BOT_TRENDS',
+    BOT_PATHS = 'BOT_PATHS',
+    BOT_SOURCES = 'BOT_SOURCES',
+    BOT_AI_REFERRALS = 'BOT_AI_REFERRALS',
+    BOT_AI_ENGAGEMENT = 'BOT_AI_ENGAGEMENT',
+    BOT_CRAWLERS = 'BOT_CRAWLERS',
+
+    AI_REFERRALS_TREND = 'AI_REFERRALS_TREND',
+    AI_REFERRALS_BY_ENGINE = 'AI_REFERRALS_BY_ENGINE',
+    AI_LANDING_PAGES = 'AI_LANDING_PAGES',
+    AI_CRAWLERS_TREND = 'AI_CRAWLERS_TREND',
+    AI_CRAWLERS = 'AI_CRAWLERS',
+    AI_CRAWLED_PAGES = 'AI_CRAWLED_PAGES',
+
+    PAGE_PERFORMANCE_TABLE = 'PAGE_PERFORMANCE_TABLE',
 }
 
 export enum ProductTab {
@@ -87,14 +117,17 @@ export enum ProductTab {
     MARKETING = 'marketing',
     HEALTH = 'health',
     LIVE = 'live',
+    BOT_ANALYTICS = 'bots',
+    PAGE_PERFORMANCE = 'page-performance',
+    AGENTS = 'agents',
 }
 
 export type DeviceType = 'Desktop' | 'Mobile'
 
 export type WebVitalsPercentile = PropertyMathType.P75 | PropertyMathType.P90 | PropertyMathType.P99
 
-export const tabSplitIndexMap: Partial<Record<TileId, number>> = {
-    [TileId.SOURCES]: 2, // Show Channel + Referring Domain as buttons, rest in dropdown
+export const tabSplitIndicesMap: Partial<Record<TileId, number[]>> = {
+    [TileId.SOURCES]: [1, 3], // [Channel] [Referring Domain ▼ Referring URL] [UTM Source ▼ ...]
 }
 
 export const loadPriorityMap: Record<TileId, number> = {
@@ -150,6 +183,24 @@ export const loadPriorityMap: Record<TileId, number> = {
     [TileId.MARKETING]: 2,
     [TileId.MARKETING_CAMPAIGN_BREAKDOWN]: 3,
     [TileId.MARKETING_NON_INTEGRATED_CONVERSIONS]: 4,
+
+    // Bot Analytics Tiles
+    [TileId.BOT_OVERVIEW]: 1,
+    [TileId.BOT_TRENDS]: 2,
+    [TileId.BOT_PATHS]: 3,
+    [TileId.BOT_SOURCES]: 4,
+    [TileId.BOT_AI_REFERRALS]: 5,
+    [TileId.BOT_AI_ENGAGEMENT]: 6,
+    [TileId.BOT_CRAWLERS]: 7,
+
+    [TileId.AI_REFERRALS_TREND]: 3,
+    [TileId.AI_REFERRALS_BY_ENGINE]: 4,
+    [TileId.AI_LANDING_PAGES]: 5,
+    [TileId.AI_CRAWLERS_TREND]: 7,
+    [TileId.AI_CRAWLERS]: 8,
+    [TileId.AI_CRAWLED_PAGES]: 9,
+
+    [TileId.PAGE_PERFORMANCE_TABLE]: 1,
 }
 
 // To enable a tile here, you must update the QueryRunner to support it
@@ -215,6 +266,20 @@ export const TILE_LABELS: Record<TileId, string> = {
     [TileId.MARKETING]: 'Marketing',
     [TileId.MARKETING_CAMPAIGN_BREAKDOWN]: 'Campaign breakdown',
     [TileId.MARKETING_NON_INTEGRATED_CONVERSIONS]: 'Non-integrated conversions',
+    [TileId.BOT_OVERVIEW]: 'Bot traffic overview',
+    [TileId.BOT_TRENDS]: 'Bot requests over time',
+    [TileId.BOT_PATHS]: 'Most crawled paths',
+    [TileId.BOT_SOURCES]: 'Bot referrer domains',
+    [TileId.BOT_AI_REFERRALS]: 'AI referral traffic',
+    [TileId.BOT_AI_ENGAGEMENT]: 'AI referral engagement',
+    [TileId.BOT_CRAWLERS]: 'Crawlers',
+    [TileId.AI_REFERRALS_TREND]: 'AI referrals over time',
+    [TileId.AI_REFERRALS_BY_ENGINE]: 'AI referrals by engine',
+    [TileId.AI_LANDING_PAGES]: 'Landing pages from AI',
+    [TileId.AI_CRAWLERS_TREND]: 'AI crawler activity over time',
+    [TileId.AI_CRAWLERS]: 'AI crawlers',
+    [TileId.AI_CRAWLED_PAGES]: 'Pages AI crawlers read',
+    [TileId.PAGE_PERFORMANCE_TABLE]: 'Pages by search & AI',
 }
 
 export interface BaseTile {
@@ -238,6 +303,7 @@ export interface QueryTile extends BaseTile {
     insightProps: InsightLogicProps
     canOpenModal?: boolean
     canOpenInsight?: boolean
+    extraMenuItems?: LemonMenuItem[]
 }
 
 export interface TabsTileTab {
@@ -251,6 +317,7 @@ export interface TabsTileTab {
     canOpenModal?: boolean
     canOpenInsight?: boolean
     docs?: Docs
+    extraMenuItems?: LemonMenuItem[]
 }
 
 export interface TabsTile extends BaseTile {
@@ -258,6 +325,7 @@ export interface TabsTile extends BaseTile {
     activeTabId: string
     setTabId: (id: string) => void
     tabs: TabsTileTab[]
+    splitIndices?: number[]
 }
 
 export interface ReplayTile extends BaseTile {
@@ -291,6 +359,7 @@ export enum GraphsTab {
 export enum SourceTab {
     CHANNEL = 'CHANNEL',
     REFERRING_DOMAIN = 'REFERRING_DOMAIN',
+    REFERRING_URL = 'REFERRING_URL',
     UTM_SOURCE = 'UTM_SOURCE',
     UTM_MEDIUM = 'UTM_MEDIUM',
     UTM_CAMPAIGN = 'UTM_CAMPAIGN',
@@ -336,12 +405,25 @@ export enum ConversionGoalWarning {
     CustomEventWithNoSessionId = 'CustomEventWithNoSessionId',
 }
 
-export interface WebAnalyticsStatusCheck {
-    isSendingWebVitals: boolean
-    isSendingPageViews: boolean
-    isSendingPageLeaves: boolean
-    isSendingPageLeavesScroll: boolean
-    hasAuthorizedUrls: boolean
+export const SOURCE_DRILL_DOWN_MAP: Partial<Record<WebStatsBreakdown, SourceTab>> = {
+    [WebStatsBreakdown.InitialChannelType]: SourceTab.REFERRING_DOMAIN,
+    [WebStatsBreakdown.InitialReferringDomain]: SourceTab.REFERRING_URL,
+    [WebStatsBreakdown.InitialUTMSource]: SourceTab.UTM_MEDIUM,
+    [WebStatsBreakdown.InitialUTMMedium]: SourceTab.UTM_CAMPAIGN,
+    [WebStatsBreakdown.InitialUTMCampaign]: SourceTab.UTM_CONTENT,
+    [WebStatsBreakdown.InitialUTMContent]: SourceTab.UTM_TERM,
+    [WebStatsBreakdown.InitialUTMSourceMediumCampaign]: SourceTab.UTM_CONTENT,
+}
+
+export const GEOGRAPHY_DRILL_DOWN_MAP: Partial<Record<WebStatsBreakdown, GeographyTab>> = {
+    [WebStatsBreakdown.Country]: GeographyTab.REGIONS,
+    [WebStatsBreakdown.Region]: GeographyTab.CITIES,
+}
+
+export const DEVICE_DRILL_DOWN_MAP: Partial<Record<WebStatsBreakdown, DeviceTab>> = {
+    [WebStatsBreakdown.DeviceType]: DeviceTab.BROWSER,
+    [WebStatsBreakdown.Browser]: DeviceTab.OS,
+    [WebStatsBreakdown.OS]: DeviceTab.VIEWPORT,
 }
 
 export type TileVisualizationOption = 'table' | 'graph'
@@ -368,6 +450,8 @@ export const webStatsBreakdownToPropertyName = (
             return { key: '$channel_type', type: PropertyFilterType.Session }
         case WebStatsBreakdown.InitialReferringDomain:
             return { key: '$entry_referring_domain', type: PropertyFilterType.Session }
+        case WebStatsBreakdown.InitialReferringURL:
+            return { key: '$session_entry_referrer', type: PropertyFilterType.Event }
         case WebStatsBreakdown.InitialUTMSource:
             return { key: '$entry_utm_source', type: PropertyFilterType.Session }
         case WebStatsBreakdown.InitialUTMCampaign:
@@ -400,6 +484,17 @@ export const webStatsBreakdownToPropertyName = (
             return { key: '$pathname', type: PropertyFilterType.Event }
         case WebStatsBreakdown.InitialUTMSourceMediumCampaign:
             return undefined
+        case WebStatsBreakdown.FirstPageviewChannelType:
+        case WebStatsBreakdown.FirstPageviewReferringDomain:
+        case WebStatsBreakdown.FirstPageviewUTMSource:
+        case WebStatsBreakdown.FirstPageviewUTMCampaign:
+        case WebStatsBreakdown.FirstPageviewUTMMedium:
+        case WebStatsBreakdown.FirstPageviewUTMTerm:
+        case WebStatsBreakdown.FirstPageviewUTMContent:
+        case WebStatsBreakdown.FirstPageviewUTMSourceMediumCampaign:
+            // Computed per-session from the first pageview at query time — there is
+            // no stored property to filter sessions by.
+            return undefined
         default:
             throw new UnexpectedNeverError(breakdownBy)
     }
@@ -426,6 +521,9 @@ export const INITIAL_WEB_ANALYTICS_FILTER = [] as WebAnalyticsPropertyFilters
 export const INITIAL_DATE_FROM = '-7d' as string | null
 export const INITIAL_DATE_TO = null as string | null
 export const INITIAL_INTERVAL = getDefaultInterval(INITIAL_DATE_FROM, INITIAL_DATE_TO)
+
+/** Events included in bot analytics queries — crawlers don't execute JS so $http_log captures most real bot traffic */
+export const BOT_ANALYTICS_EVENTS = ['$pageview', '$screen', '$http_log']
 
 export const WEB_ANALYTICS_DEFAULT_QUERY_TAGS: QueryLogTags = {
     productKey: ProductKey.WEB_ANALYTICS,
@@ -469,6 +567,30 @@ export const sessionPropertiesToPathClean = new Set([
 ])
 export const personPropertiesToPathClean = new Set(['$initial_pathname', '$initial_current_url'])
 
+/**
+ * Pick the operator for an exact match on a breakdown value. With path cleaning on, the value is a
+ * cleaned path such as `/user/:id`, which no raw property equals. `IsCleanedPathExact` cleans the
+ * stored property too, so the comparison happens on cleaned paths on both sides.
+ */
+export const exactMatchOperatorFor = (
+    key: string,
+    type: PropertyFilterType,
+    doPathCleaning: boolean | undefined
+): PropertyOperator => {
+    if (!doPathCleaning) {
+        return PropertyOperator.Exact
+    }
+
+    const cleanableProperties =
+        type === PropertyFilterType.Session
+            ? sessionPropertiesToPathClean
+            : type === PropertyFilterType.Person
+              ? personPropertiesToPathClean
+              : eventPropertiesToPathClean
+
+    return cleanableProperties.has(key) ? PropertyOperator.IsCleanedPathExact : PropertyOperator.Exact
+}
+
 // Utility function to map SQL/internal column names to UI-friendly display names
 export const getDisplayColumnName = (column: string, breakdownBy?: WebStatsBreakdown): string => {
     // Strip the "context.columns." prefix if present
@@ -510,6 +632,8 @@ export const getDisplayColumnName = (column: string, breakdownBy?: WebStatsBreak
                 return 'Channel Type'
             case WebStatsBreakdown.InitialReferringDomain:
                 return 'Referring Domain'
+            case WebStatsBreakdown.InitialReferringURL:
+                return 'Referring URL'
             case WebStatsBreakdown.InitialUTMSource:
                 return 'UTM Source'
             case WebStatsBreakdown.InitialUTMCampaign:
@@ -542,6 +666,22 @@ export const getDisplayColumnName = (column: string, breakdownBy?: WebStatsBreak
                 return 'URL'
             case WebStatsBreakdown.InitialUTMSourceMediumCampaign:
                 return 'Source / Medium / Campaign'
+            case WebStatsBreakdown.FirstPageviewChannelType:
+                return 'Channel Type (First Pageview)'
+            case WebStatsBreakdown.FirstPageviewReferringDomain:
+                return 'Referring Domain (First Pageview)'
+            case WebStatsBreakdown.FirstPageviewUTMSource:
+                return 'UTM Source (First Pageview)'
+            case WebStatsBreakdown.FirstPageviewUTMCampaign:
+                return 'UTM Campaign (First Pageview)'
+            case WebStatsBreakdown.FirstPageviewUTMMedium:
+                return 'UTM Medium (First Pageview)'
+            case WebStatsBreakdown.FirstPageviewUTMTerm:
+                return 'UTM Term (First Pageview)'
+            case WebStatsBreakdown.FirstPageviewUTMContent:
+                return 'UTM Content (First Pageview)'
+            case WebStatsBreakdown.FirstPageviewUTMSourceMediumCampaign:
+                return 'Source / Medium / Campaign (First Pageview)'
         }
     }
 

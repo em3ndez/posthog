@@ -102,8 +102,46 @@ describe('hogvm execute', () => {
         expect(execSync(['_h', op.STRING, 'bla', op.CALL_GLOBAL, 'toFloat', 1], options)).toBe(null)
         expect(execSync(['_h', op.STRING, 'asd', op.CALL_GLOBAL, 'toUUID', 1], options)).toBe('asd')
 
+        const r = execSync(['_h', op.CALL_GLOBAL, 'randomFloat', 0], options) as number
+        expect(typeof r).toBe('number')
+        expect(r).toBeGreaterThanOrEqual(0)
+        expect(r).toBeLessThan(1)
+
         expect(execSync(['_h', op.NULL, op.INTEGER, 1, op.EQ], options)).toBe(false)
         expect(execSync(['_h', op.NULL, op.INTEGER, 1, op.NOT_EQ], options)).toBe(true)
+    })
+
+    test('sortable semver arrays use numeric component ordering', () => {
+        const sortableSemver = (version: string): any[] => [op.STRING, version, op.CALL_GLOBAL, 'sortableSemver', 1]
+        const options = {
+            external: {
+                regex: {
+                    extract: (regex: string, value: string): string => {
+                        const match = new RegExp(regex).exec(value)
+                        return match?.[1] ?? match?.[0] ?? ''
+                    },
+                },
+            },
+        }
+        const compareSemver = (left: string, right: string, operation: op): boolean =>
+            execSync(['_H', 1, ...sortableSemver(right), ...sortableSemver(left), operation], options)
+
+        for (const [operation, left, right, expected] of [
+            [op.EQ, '1.2.3', '1.2.3', true],
+            [op.EQ, '1.2.3', '1.2.4', false],
+            [op.NOT_EQ, '1.2.3', '1.2.4', true],
+            [op.NOT_EQ, '1.2.3', '1.2.3', false],
+            [op.GT, '2.0.0', '1.9.9', true],
+            [op.GT, '1.9.9', '2.0.0', false],
+            [op.GT_EQ, '2.0.0', '2.0.0', true],
+            [op.GT_EQ, '1.9.9', '2.0.0', false],
+            [op.LT, '2.9.0', '2.10.0', true],
+            [op.LT, '2.10.0', '2.10.0', false],
+            [op.LT_EQ, '2.10.0', '2.10.0', true],
+            [op.LT_EQ, '2.10.1', '2.10.0', false],
+        ] as const) {
+            expect(compareSemver(left, right, operation)).toBe(expected)
+        }
     })
 
     test('error handling', async () => {
@@ -131,6 +169,13 @@ describe('hogvm execute', () => {
         expect(() => execSync(['_H', 1, op.CALL_GLOBAL, 'match', 1], options)).toThrow(
             'Not enough arguments on the stack'
         )
+
+        expect(() => execSync(['_H', 1, op.STRING, 'a', op.CALL_GLOBAL, 'replaceOne', 1], options)).toThrow(
+            'Function replaceOne requires at least 3 arguments'
+        )
+        expect(() =>
+            execSync(['_H', 1, op.STRING, 'AB', op.STRING, 'extra', op.CALL_GLOBAL, 'lower', 2], options)
+        ).toThrow('Function lower requires at most 1 arguments')
     })
 
     test('null coercion in ordering comparisons - preserved behavior', () => {
@@ -389,6 +434,11 @@ describe('hogvm execute', () => {
             (await execAsync(['_h', op.STRING, '2', op.CALL_GLOBAL, 'stringify', 1, op.RETURN], { asyncFunctions }))
                 .result
         ).toBe('zero')
+    })
+
+    test.each(['hasOwnProperty', 'constructor', '__proto__'])('global dispatch rejects inherited name %s', (name) => {
+        const bytecode = ['_h', op.CALL_GLOBAL, name, 0, op.RETURN]
+        expect(() => execSync(bytecode, { asyncFunctions: {} })).toThrow(`Unsupported function call: ${name}`)
     })
 
     test('bytecode variable assignment', async () => {
@@ -1911,7 +1961,7 @@ describe('hogvm execute', () => {
     test('ternary', () => {
         const values: any[] = []
         const functions = {
-            noisy_print: (e) => {
+            noisy_print: (e: any) => {
                 values.push(e)
                 return e
             },
@@ -1953,7 +2003,7 @@ describe('hogvm execute', () => {
     test('ifNull', () => {
         const values: any[] = []
         const functions = {
-            noisy_print: (e) => {
+            noisy_print: (e: any) => {
                 values.push(e)
                 return e
             },
@@ -1984,7 +2034,7 @@ describe('hogvm execute', () => {
 
     test('uncaught exceptions', () => {
         // throw Error('Not a good day')
-        const bytecode1 = ['_h', op.NULL, op.NULL, op.STRING, 'Not a good day', op.CALL_GLOBAL, 'Error', 3, op.THROW]
+        const bytecode1 = ['_h', op.STRING, 'Not a good day', op.CALL_GLOBAL, 'Error', 1, op.THROW]
         expect(() => execSync(bytecode1)).toThrow(new UncaughtHogVMException('Error', 'Not a good day', null))
 
         // throw RetryError('Not a good day', {'key': 'value'})

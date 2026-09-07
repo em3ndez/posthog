@@ -3,6 +3,9 @@ from typing import Any, Literal, Optional
 from rest_framework import status
 
 from posthog.models.team import Team
+from posthog.test.insight_queries import default_pageview_query
+
+from products.dashboards.backend.widget_registry import DashboardWidgetType
 
 
 class DashboardAPI:
@@ -147,8 +150,9 @@ class DashboardAPI:
         if team_id is None:
             team_id = self.team.id
 
-        if "filters" not in data and "query" not in data:
-            data["filters"] = {"events": [{"id": "$pageview"}]}
+        # Writing an insight needs a query, so a test with nothing to say about the definition
+        # still gets one.
+        data.setdefault("query", default_pageview_query())
 
         response = self.client.post(
             f"/api/projects/{team_id}/insights",
@@ -217,6 +221,45 @@ class DashboardAPI:
         self.assertEqual(activity.status_code, expected_status)
         return activity.json()
 
+    def create_button_tile(
+        self,
+        dashboard_id: int,
+        url: str = "https://example.com",
+        text: str = "Click me",
+        placement: str = "left",
+        style: str = "primary",
+        extra_data: Optional[dict] = None,
+        team_id: Optional[int] = None,
+        expected_status: int = status.HTTP_200_OK,
+    ) -> tuple[int, dict[str, Any]]:
+        if team_id is None:
+            team_id = self.team.id
+
+        if extra_data is None:
+            extra_data = {}
+
+        response = self.client.patch(
+            f"/api/projects/{team_id}/dashboards/{dashboard_id}",
+            {
+                "tiles": [
+                    {
+                        "button_tile": {
+                            "url": url,
+                            "text": text,
+                            "placement": placement,
+                            "style": style,
+                        },
+                        **extra_data,
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(response.status_code, expected_status, response.json())
+
+        response_json = response.json()
+        return response_json.get("id", None), response_json
+
     def update_text_tile(
         self,
         dashboard_id: int,
@@ -282,3 +325,24 @@ class DashboardAPI:
             {"dashboards": dashboard_ids},
         )
         self.assertEqual(response.status_code, expected_status)
+
+    def create_widget_tile(
+        self,
+        dashboard_id: int,
+        widget_type: DashboardWidgetType = "error_tracking_list",
+        config: dict[str, Any] | None = None,
+        team_id: int | None = None,
+        expected_status: int = status.HTTP_200_OK,
+    ) -> tuple[int, dict[str, Any]]:
+        if team_id is None:
+            team_id = self.team.id
+        if config is None:
+            config = {"limit": 10}
+
+        response = self.client.patch(
+            f"/api/projects/{team_id}/dashboards/{dashboard_id}",
+            {"tiles": [{"widget": {"widget_type": widget_type, "config": config}}]},
+        )
+        self.assertEqual(response.status_code, expected_status)
+        response_json = response.json()
+        return dashboard_id, response_json

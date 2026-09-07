@@ -2,15 +2,16 @@ import { useActions, useValues } from 'kea'
 import { BindLogic } from 'kea'
 import posthog from 'posthog-js'
 
-import { IconFunnels, IconRetention, IconTrends } from '@posthog/icons'
-
+import { IconInsightFunnels, IconInsightRetention, IconInsightTrends } from 'lib/lemon-ui/icons'
 import { LemonBanner } from 'lib/lemon-ui/LemonBanner'
 import { LemonButton } from 'lib/lemon-ui/LemonButton'
 import { LemonModal } from 'lib/lemon-ui/LemonModal'
 import { Popover } from 'lib/lemon-ui/Popover'
-import { AddSavedInsightsToDashboard } from 'scenes/saved-insights/AddSavedInsightsToDashboard'
-import { INSIGHT_TYPES_METADATA } from 'scenes/saved-insights/SavedInsights'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
 import { addSavedInsightsModalLogic } from 'scenes/saved-insights/addSavedInsightsModalLogic'
+import { AddSavedInsightsToDashboard } from 'scenes/saved-insights/AddSavedInsightsToDashboard'
+import { isInsightTypeCreatable } from 'scenes/saved-insights/insightTypesMetadata'
+import { INSIGHT_TYPES_METADATA } from 'scenes/saved-insights/SavedInsights'
 import { urls } from 'scenes/urls'
 
 import { InsightType } from '~/types'
@@ -19,15 +20,16 @@ import { addInsightToDashboardLogic } from '../addInsightToDashboardModalLogic'
 import { dashboardLogic } from '../dashboardLogic'
 
 const QUICK_CREATE_TYPES = [
-    { type: InsightType.TRENDS, icon: IconTrends, label: 'Trend' },
-    { type: InsightType.FUNNELS, icon: IconFunnels, label: 'Funnel' },
-    { type: InsightType.RETENTION, icon: IconRetention, label: 'Retention' },
+    { type: InsightType.TRENDS, icon: IconInsightTrends, label: 'Trend' },
+    { type: InsightType.FUNNELS, icon: IconInsightFunnels, label: 'Funnel' },
+    { type: InsightType.RETENTION, icon: IconInsightRetention, label: 'Retention' },
 ]
 
 export function AddInsightToDashboardModal(): JSX.Element {
     const { hideAddInsightToDashboardModal, toggleShowMoreInsightTypes } = useActions(addInsightToDashboardLogic)
     const { addInsightToDashboardModalVisible, showMoreInsightTypes } = useValues(addInsightToDashboardLogic)
     const { dashboard } = useValues(dashboardLogic)
+    const { featureFlags } = useValues(featureFlagLogic)
 
     const handleClose = (): void => {
         posthog.capture('insight dashboard modal - closed')
@@ -43,7 +45,7 @@ export function AddInsightToDashboardModal(): JSX.Element {
 
     const additionalTypes = Object.entries(INSIGHT_TYPES_METADATA).filter(
         ([type, meta]) =>
-            meta.inMenu &&
+            isInsightTypeCreatable(meta, featureFlags) &&
             type !== InsightType.JSON &&
             type !== InsightType.HOG &&
             !QUICK_CREATE_TYPES.some((qt) => qt.type === type)
@@ -67,12 +69,12 @@ export function AddInsightToDashboardModal(): JSX.Element {
                                     Build a new insight and add it to this dashboard
                                 </div>
                             </div>
-                            <div className="flex items-center gap-2 sm:ml-auto flex-wrap">
+                            <div className="flex items-center gap-2 sm:ml-auto flex-wrap pr-0.5">
                                 {QUICK_CREATE_TYPES.map(({ type, icon: Icon, label }) => (
                                     <LemonButton
                                         key={type}
                                         type="primary"
-                                        size="xsmall"
+                                        size="small"
                                         icon={<Icon />}
                                         to={urls.insightNew({ type: type, dashboardId: dashboard?.id })}
                                         tooltip={INSIGHT_TYPES_METADATA[type]?.description}
@@ -89,16 +91,22 @@ export function AddInsightToDashboardModal(): JSX.Element {
                                         <div className="p-2 space-y-1 min-w-48">
                                             {additionalTypes.map(([type, metadata]) => {
                                                 const Icon = metadata.icon
+                                                const typeUrl =
+                                                    type === InsightType.SQL
+                                                        ? urls.sqlEditor({
+                                                              dashboard: dashboard?.id,
+                                                          })
+                                                        : urls.insightNew({
+                                                              type: type as InsightType,
+                                                              dashboardId: dashboard?.id,
+                                                          })
                                                 return (
                                                     <LemonButton
                                                         key={type}
                                                         type="tertiary"
                                                         fullWidth
                                                         icon={Icon ? <Icon /> : undefined}
-                                                        to={urls.insightNew({
-                                                            type: type as InsightType,
-                                                            dashboardId: dashboard?.id,
-                                                        })}
+                                                        to={typeUrl}
                                                         data-attr={`create-${type.toLowerCase()}`}
                                                         onClick={() => handleNewInsightClicked(type)}
                                                     >
@@ -111,7 +119,7 @@ export function AddInsightToDashboardModal(): JSX.Element {
                                 >
                                     <LemonButton
                                         type="secondary"
-                                        size="xsmall"
+                                        size="small"
                                         onClick={() => toggleShowMoreInsightTypes()}
                                     >
                                         More

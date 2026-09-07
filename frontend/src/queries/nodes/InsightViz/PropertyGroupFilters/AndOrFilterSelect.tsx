@@ -2,12 +2,14 @@ import { LemonButtonProps, LemonSelect } from '@posthog/lemon-ui'
 
 import { FilterLogicalOperator } from '~/types'
 
-interface AndOrFilterSelectProps {
+export interface AndOrFilterSelectProps {
     onChange: (type: FilterLogicalOperator) => void
     value: FilterLogicalOperator
     topLevelFilter?: boolean
     prefix?: React.ReactNode
     suffix?: [singular: string, plural: string]
+    /** Shown instead of `suffix` in a narrow editor panel. Needs an `editor-panel` container ancestor */
+    shortSuffix?: string
     disabledReason?: LemonButtonProps['disabledReason']
     size?: LemonButtonProps['size']
 }
@@ -18,12 +20,13 @@ export function AndOrFilterSelect({
     topLevelFilter,
     prefix = 'Match',
     suffix = ['filter in this group', 'filters in this group'],
+    shortSuffix,
     disabledReason,
     size = 'small',
 }: AndOrFilterSelectProps): JSX.Element {
     return (
         <div className="flex items-center font-medium">
-            <span className="ml-2">{prefix}</span>
+            <span className="ml-2 @max-[410px]/editor-panel:ml-0">{prefix}</span>
             <LemonSelect
                 className="mx-2"
                 size={size}
@@ -59,7 +62,10 @@ export function AndOrFilterSelect({
                 optionTooltipPlacement={topLevelFilter ? 'bottom-end' : 'bottom-start'}
                 dropdownMatchSelectWidth={false}
             />
-            {value === FilterLogicalOperator.Or ? suffix[0] : suffix[1]}
+            <span className={shortSuffix ? '@max-[375px]/editor-panel:hidden' : undefined}>
+                {value === FilterLogicalOperator.Or ? suffix[0] : suffix[1]}
+            </span>
+            {shortSuffix && <span className="hidden @max-[375px]/editor-panel:inline">{shortSuffix}</span>}
         </div>
     )
 }

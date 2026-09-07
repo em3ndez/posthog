@@ -5,76 +5,150 @@ import { LemonBanner } from '@posthog/lemon-ui'
 
 import { LemonButton } from 'lib/lemon-ui/LemonButton'
 import { copyToClipboard } from 'lib/utils/copyToClipboard'
-import { sceneLogic } from 'scenes/sceneLogic'
+import { cn } from 'lib/utils/css-classes'
 import { urls } from 'scenes/urls'
 
+import { SceneName } from '~/layout/scenes/components/SceneTitleSection'
+
+import { DebugLogsMenu } from 'products/posthog_ai/frontend/api/primitives'
+import { EmbeddedRunner } from 'products/posthog_ai/frontend/api/runner'
+
 import { Intro } from '../Intro'
-import { Thread } from '../Thread'
 import { maxGlobalLogic } from '../maxGlobalLogic'
 import { maxLogic } from '../maxLogic'
 import { MaxThreadLogicProps, maxThreadLogic } from '../maxThreadLogic'
-import { ChatHistoryPanel } from './ChatHistoryPanel'
+import { phaiAiComposerSeedLogic } from '../phaiAiComposerSeedLogic'
+import { Thread } from '../Thread'
+import { MaxNotConfigured } from './MaxNotConfigured'
+import { PhaiViewToggle } from './PhaiViewToggle'
 import { SidebarQuestionInputWithSuggestions } from './SidebarQuestionInputWithSuggestions'
 import { ThreadAutoScroller } from './ThreadAutoScroller'
+
+/* Sits above the chat area */
+export function ChatHeader({
+    conversationId,
+    tabId,
+    children,
+    hideBorder,
+    isSandboxRuntime,
+}: {
+    conversationId: string | null
+    tabId?: string
+    children?: React.ReactNode
+    hideBorder?: boolean
+    /** Debug rows only exist on the sandbox runtime, so the staff menu that reveals them is hidden elsewhere. */
+    isSandboxRuntime?: boolean
+}): JSX.Element {
+    const { openSidePanelMax } = useActions(maxGlobalLogic)
+    const { chatTitle } = useValues(maxLogic)
+    const isTitleLoading = chatTitle === 'New chat'
+
+    return (
+        <div
+            className={cn(
+                'flex w-full gap-2 py-2 border-b border-primary items-center justify-between px-2',
+                hideBorder && 'border-b-0'
+            )}
+        >
+            <div className="flex items-center gap-2 pl-2 text-sm font-medium truncate min-w-0 flex-1">
+                {children}
+                {chatTitle === null ? null : isTitleLoading ? (
+                    <div className="w-100">
+                        <SceneName name="New chat" isLoading />
+                    </div>
+                ) : (
+                    <SceneName name={chatTitle} />
+                )}
+            </div>
+            <div className="flex items-center gap-2">
+                {isSandboxRuntime && <DebugLogsMenu variant="lemon" />}
+                <PhaiViewToggle variant="lemon" />
+                {conversationId ? (
+                    <LemonButton
+                        size="small"
+                        type="secondary"
+                        sideIcon={<IconShare />}
+                        onClick={() => {
+                            copyToClipboard(
+                                urls.absolute(urls.currentProject(urls.ai(conversationId ?? undefined))),
+                                'conversation sharing link'
+                            )
+                        }}
+                    >
+                        Copy link
+                    </LemonButton>
+                ) : undefined}
+                {tabId ? (
+                    <LemonButton
+                        size="small"
+                        type="secondary"
+                        sideIcon={<IconOpenSidebar />}
+                        onClick={() => {
+                            openSidePanelMax(conversationId ?? undefined)
+                        }}
+                    >
+                        Open in context panel
+                    </LemonButton>
+                ) : undefined}
+            </div>
+        </div>
+    )
+}
 
 interface AiFirstMaxInstanceProps {
     tabId: string
 }
 
 export function AiFirstMaxInstance({ tabId }: AiFirstMaxInstanceProps): JSX.Element {
-    const { threadVisible, threadLogicKey, conversation, conversationId } = useValues(maxLogic({ tabId }))
-    const { startNewConversation } = useActions(maxLogic({ tabId }))
-    const { openSidePanelMax } = useActions(maxGlobalLogic)
-    const { closeTabId } = useActions(sceneLogic)
+    const { threadVisible, threadLogicKey, conversation, conversationId } = useValues(maxLogic({ panelId: tabId }))
+    const { startNewConversation } = useActions(maxLogic({ panelId: tabId }))
+    const { isMaxAvailable, effectivePhaiView } = useValues(maxGlobalLogic)
+
+    // On `/ai` the new view is the full TaskTracker product (tasks list + composer + run detail); a thin
+    // bar keeps the toggle reachable so the user can drop back to the legacy chat.
+    if (effectivePhaiView === 'new') {
+        return (
+            <div className="flex flex-col grow overflow-hidden h-full">
+                <div className="flex w-full items-center justify-end gap-2 py-2 px-2 border-b border-primary">
+                    {/* The new view is the runner, which is always the sandbox runtime — no runtime check needed. */}
+                    <DebugLogsMenu variant="lemon" />
+                    <PhaiViewToggle variant="lemon" />
+                </div>
+                <div className="flex flex-col flex-1 min-h-0">
+                    <BindLogic logic={phaiAiComposerSeedLogic} props={{}}>
+                        <EmbeddedRunner />
+                    </BindLogic>
+                </div>
+            </div>
+        )
+    }
 
     const threadProps: MaxThreadLogicProps = {
-        tabId,
+        panelId: tabId,
         conversationId: threadLogicKey,
         conversation,
     }
 
     return (
         <div className="flex grow overflow-hidden h-full">
-            <ChatHistoryPanel tabId={tabId} />
-            <BindLogic logic={maxLogic} props={{ tabId }}>
+            <BindLogic logic={maxLogic} props={{ panelId: tabId }}>
                 <BindLogic logic={maxThreadLogic} props={threadProps}>
                     <div className="flex flex-col grow overflow-hidden">
-                        <div className="flex w-full gap-2 py-2 border-b border-primary items-center justify-end px-2">
-                            {tabId && conversationId ? (
-                                <LemonButton
-                                    size="small"
-                                    type="secondary"
-                                    sideIcon={<IconShare />}
-                                    onClick={() => {
-                                        copyToClipboard(
-                                            urls.absolute(urls.currentProject(urls.ai(conversationId ?? undefined))),
-                                            'conversation sharing link'
-                                        )
-                                    }}
-                                >
-                                    Copy link to chat
-                                </LemonButton>
-                            ) : undefined}
-                            {tabId ? (
-                                <LemonButton
-                                    size="small"
-                                    type="secondary"
-                                    sideIcon={<IconOpenSidebar />}
-                                    onClick={() => {
-                                        openSidePanelMax(conversationId ?? undefined)
-                                        closeTabId(tabId, { source: 'open_in_side_panel' })
-                                    }}
-                                >
-                                    Open in context panel
-                                </LemonButton>
-                            ) : undefined}
-                        </div>
-                        <ChatArea
-                            threadVisible={threadVisible}
+                        <ChatHeader
                             conversationId={conversationId}
-                            conversation={conversation}
-                            onStartNewConversation={startNewConversation}
+                            tabId={tabId}
+                            isSandboxRuntime={conversation?.agent_runtime === 'sandbox'}
                         />
+                        {isMaxAvailable ? (
+                            <ChatArea
+                                threadVisible={threadVisible}
+                                conversationId={conversationId}
+                                conversation={conversation}
+                                onStartNewConversation={startNewConversation}
+                            />
+                        ) : (
+                            <MaxNotConfigured />
+                        )}
                     </div>
                 </BindLogic>
             </BindLogic>
@@ -99,7 +173,7 @@ function ChatArea({ threadVisible, conversation, onStartNewConversation }: ChatA
 
             {/* Intro - fades out when messages appear */}
             <div
-                className={`flex flex-col items-center transition-all duration-200 ease-out ${
+                className={`flex flex-col items-center transition-[opacity,height,padding] duration-200 ease-out ${
                     hasMessages ? 'opacity-0 h-0 overflow-hidden' : 'opacity-100 pb-3'
                 }`}
             >
@@ -127,7 +201,7 @@ function ChatArea({ threadVisible, conversation, onStartNewConversation }: ChatA
 
             {/* Input - always in flow, mt-auto pushes to bottom when messages exist */}
             <div
-                className={`w-full max-w-3xl mx-auto px-4 transition-all duration-300 ease-out z-50 ${
+                className={`w-full max-w-3xl mx-auto px-4 transition-[max-width,padding,background-color] duration-300 ease-out z-50 ${
                     hasMessages ? 'sticky bottom-0 bg-primary py-2 max-w-none' : 'pb-4'
                 }`}
             >

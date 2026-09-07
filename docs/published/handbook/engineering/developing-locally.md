@@ -26,12 +26,14 @@ We also have a growing collection of Rust services that handle performance-criti
 - property-defs-rs – extracts and infers property definitions from events
 - hook services – manages webhooks with high performance
 - hogvm – evaluates HogQL bytecode via a stack machine implementation
+- personhog-replica – serves person data over gRPC, backed by PostgreSQL
+- personhog-router – routes person data requests to replica instances via gRPC
 
 These components rely on a few external services:
 
 - ClickHouse – for storing big data (events, persons – analytics queries)
 - Kafka – for queuing events for ingestion
-- MinIO – for storing files (session recordings, file exports)
+- SeaweedFS – S3-compatible object storage for files (session recordings, file exports)
 - PostgreSQL – for storing ordinary data (users, projects, saved insights)
 - Redis – for caching and inter-service communication
 - Zookeeper – for coordinating Kafka and ClickHouse clusters
@@ -39,7 +41,7 @@ These components rely on a few external services:
 When spinning up an instance of PostHog for development, we recommend the following hybrid configuration:
 
 - External services (ClickHouse, Kafka, PostgreSQL, Redis, etc.) run in Docker via `docker compose`
-- PostHog apps (Django, frontend, plugin-server, Celery) run on the host using `hogli start` (which uses mprocs, a terminal UI, to manage and display logs from all processes simultaneously)
+- PostHog apps (Django, frontend, plugin-server, Celery) run on the host using `hogli start` (which uses phrocs, a terminal UI, to manage and display logs from all processes simultaneously)
 
 This approach gives you fast iteration on the code you're developing while keeping infrastructure isolated.
 
@@ -52,13 +54,17 @@ For other Linux distros, adjust the steps as needed (e.g. use `dnf` or `pacman` 
 
 Windows isn't supported natively. But, Windows users can run a Linux virtual machine. The latest Ubuntu LTS Desktop is recommended. (Ubuntu Server is not recommended as debugging the frontend will require a browser that can access localhost.)
 
-In case some steps here have fallen out of date, please tell us about it – feel free to [submit a patch](https://github.com/PostHog/posthog.com/blob/master/contents/handbook/engineering/developing-locally.md)!
+In case some steps here have fallen out of date, please tell us about it – feel free to [submit a patch](https://github.com/PostHog/posthog/blob/master/docs/published/handbook/engineering/developing-locally.md)!
 
 ## Option 1: Developing locally
 
 This is the recommended option for most developers.
 
 ### Prerequisites
+
+**GitHub access.**
+Before your first push, set up an [SSH key and commit signing](https://posthog.com/handbook/engineering/security#github) using Secretive or 1Password.
+Signing is required: an org-wide ruleset rejects unsigned commits in every PostHog repository, so an unsigned push fails with `GH013: Commits must have verified signatures`.
 
 #### macOS
 
@@ -99,7 +105,12 @@ Clone the [PostHog repo](https://github.com/posthog/posthog). All future command
 git clone --filter=blob:none https://github.com/PostHog/posthog && cd posthog/
 ```
 
-**Performance tip:** The `--filter=blob:none` flag downloads all commit history and tree structure, but defers file contents (blobs) until needed. This reduces the clone from ~3 GB to a few hundred MB and makes the initial clone **15-17x faster**. You still get full git history for commands like `git log` and `git diff` – blobs are fetched on demand as you use them.
+**Performance tip:** The `--filter=blob:none` flag downloads all commit history and tree structure, but defers file contents (blobs) until needed.
+File contents are about 95% of this repository, so the clone is a few hundred MB instead of several GB, and it finishes much faster.
+You still get full git history for commands like `git log` and `git diff`. Blobs are fetched on demand as you use them.
+
+`hogli start` keeps a blobless clone healthy, because git does not consolidate the pack files these on-demand fetches create.
+It repacks in the background when they build up. Run `hogli doctor:git` to do it yourself.
 
 > The `feature-flags` container relies on the presence of the GeoLite cities
 > database in the `/share` directory. If you haven't run `hogli start` this database may not exist.
@@ -132,7 +143,13 @@ To get PostHog running in a dev environment:
 
    > Note on app dependencies: Python requirements get updated every time the environment is activated (`uv sync` is lightning fast). JS dependencies only get installed if `node_modules/` is not present (`pnpm install` still takes a couple lengthy seconds). Dependencies for other languages currently don't get auto-installed.
 
-3. After successful environment activation, run `hogli start`. This launches the Docker infrastructure and all PostHog processes together via mprocs — a terminal UI that shows logs from every service side by side.
+3. After successful environment activation, run `hogli start`. This automatically cleans up any orphaned dev processes from a previous unclean shutdown, then launches the Docker infrastructure and all PostHog processes together via phrocs, a terminal UI that aggregates logs from all processes in one place.
+
+   > Note on connection errors: If you see connection errors on `hogli start`, ensure the following entry exists in `/etc/hosts`:
+   >
+   > ```text
+   > 127.0.0.1 db redis7 kafka clickhouse clickhouse-coordinator objectstorage seaweedfs temporal
+   > ```
 
 This is it – you should be seeing the PostHog app at <a href="http://localhost:8010" target="_blank">http://localhost:8010</a>.
 
@@ -141,6 +158,49 @@ You can now change PostHog in any way you want. See [Project structure](./projec
 ### Customizing which services run
 
 By default, `hogli start` runs a minimal set of services (enough for product analytics). To customize which services start, run `hogli dev:setup` which lets you select intents based on the products you're working on. Your choices are saved and used automatically by `hogli start`.
+
+### Setting environment variables
+
+Three env files come into play when `hogli start` runs:
+
+- `.env.services` (committed) — how to reach local services like Postgres, Redis, Kafka, ClickHouse. Shared with hobby deployments and Docker containers.
+- `.env.development` (committed) — dev-mode runtime knobs: `DEBUG`, OpenTelemetry, DuckLake, ports, etc.
+- `.env.local` (gitignored) — your overrides and secrets. Copy `.env.local.example` to get started.
+
+Precedence (highest wins): `shell env > .env.local > .env.development > .env.services`.
+
+To run AI features locally, you'll need API keys for OpenAI, Anthropic, and others. PostHog employees can pull them from 1Password without ever pasting raw values:
+
+```bash
+cp .env.local.example .env.local           # uncomment the op:// lines you need
+brew install 1password-cli                 # one-time
+hogli start                                 # auto-resolves op:// via `op run`
+```
+
+If `bin/start` sees any `op://` reference in `.env.local`, it re-execs itself under `op run --env-file=.env.local`. No need to remember the wrapper command.
+
+If the `op` CLI isn't installed, `op://` lines are skipped (rather than sourced as literal `op://...` strings that break downstream services with cryptic errors). Services that need those secrets will fail with their own "missing key" errors — install `1password-cli` or replace the refs with literal values.
+
+### Running in detached mode
+
+By default, `hogli start` runs interactively with a terminal UI (phrocs) that displays logs from all processes. If you prefer to run the dev stack in the background without an attached terminal, use detached mode:
+
+```bash
+hogli up -d
+```
+
+This starts all services in the background and returns once the IPC socket is bound. `hogli start -d` is also available as an equivalent. Detached mode is useful for:
+
+- Coder workspaces and remote development environments
+- CI pipelines and automated testing
+- Agent sessions and headless development
+
+**Companion commands:**
+
+- `hogli wait` – blocks until all services are ready (useful in scripts)
+- `hogli down` – gracefully stops the detached stack (`hogli stop` is also available as an equivalent)
+- `hogli docker:services:down` – stops the docker compose containers, which keep running after `hogli down` or quitting phrocs (the compose stack is shared across worktrees)
+- `hogli docker:services:remove` – like `docker:services:down`, but also wipes all docker volumes (postgres, clickhouse, and the rest of the stack's data)
 
 ### Manual setup
 
@@ -157,10 +217,37 @@ If you see "Exit Code 137" or out-of-memory errors, your Docker container doesn'
 If you see `Error while fetching server API version: 500 Server Error for http+docker://localhost/version`, make sure Docker (or OrbStack) is actually running.
 
 **Port conflicts**
-If you see a port binding error for 5432, you have Postgres running locally. Use `lsof -i :5432` to find the process, then `sudo service postgresql stop` to stop it. You may also see errors like `role "posthog" does not exist`, which could indicate that a local PostgreSQL instance is being used instead of the expected containerized one.
+`hogli start` automatically cleans up orphaned PostHog processes before launching, which resolves most port conflicts. To skip this, set `HOGLI_SKIP_ZOMBIE_CHECK=1`. If you still see a port binding error for 5432, you likely have Postgres running locally. Use `lsof -i :5432` to find the process, then `sudo service postgresql stop` to stop it. You may also see errors like `role "posthog" does not exist`, which could indicate that a local PostgreSQL instance is being used instead of the expected containerized one.
 
 **GeoLite database missing**
 The feature-flags container needs the GeoLite database in `/share`. If it's missing, run `./bin/download-mmdb` and then `chmod 0755 ./share/GeoLite2-City.mmdb`.
+
+**Local ClickHouse suddenly empty (July 2026 named-volume switch)**
+ClickHouse and ZooKeeper store their data in named docker volumes (`clickhouse-data`, `zookeeper-data`), so their state survives container recreation.
+The first `hogli start` after updating past the July 2026 switch to named volumes would otherwise recreate both containers with fresh volumes (the data previously lived in anonymous volumes that container recreation discards).
+`hogli start` runs `hogli doctor:migrate-volumes` before bringing the stack up, which salvages the old anonymous volumes into the new named ones automatically whenever it can prove the mapping is unambiguous — no action needed, and it's a no-op on every subsequent start once migrated.
+
+If it prints a warning instead of migrating (an ambiguous or missing old container — for example two clickhouse containers left over under this same compose project, or the old container already removed by a prior cleanup), it deliberately didn't guess, and local ClickHouse data resets once instead.
+Run `hogli migrations:run` to recreate the ClickHouse schema, or `hogli dev:reset` for a full wipe plus demo data.
+The old anonymous volumes are left dangling in that case; reclaim the disk space with `docker volume prune` (check first with `docker volume ls -f dangling=true`) once you're done, or salvage them manually if you still need that data:
+
+Stop the stack (`hogli docker:services:down`), then identify the old volumes by peeking inside each dangling candidate:
+
+```bash
+docker volume ls -qf dangling=true
+docker run --rm -v <volume>:/v alpine ls /v
+```
+
+The ClickHouse volume contains `store` and `metadata`; the ZooKeeper snapshot volume has `version-2/snapshot.*`; the ZooKeeper transaction-log volume has `version-2/log.*`.
+Copy each old volume into its named replacement. The `posthog_` prefix below is the compose project name (`$COMPOSE_PROJECT_NAME`, `posthog` by default); substitute yours if you've overridden it:
+
+```bash
+docker run --rm -v <old-clickhouse-volume>:/from:ro -v posthog_clickhouse-data:/to alpine sh -c 'rm -rf /to/* && cp -a /from/. /to/'
+```
+
+Repeat for `posthog_zookeeper-data` (snapshots) and `posthog_zookeeper-datalog` (transaction logs).
+ClickHouse and ZooKeeper state must move together — restoring only one side breaks every replicated table with "replica already exists" errors.
+Then start the stack again with `hogli up`.
 
 **ClickHouse "get_mempolicy" warning**
 You might see `get_mempolicy: Operation not permitted` in the ClickHouse logs. This is harmless and can be ignored. To verify ClickHouse started properly, run `docker exec -it posthog-clickhouse-1 bash` then `clickhouse-client --query "SELECT 1"`.
@@ -201,25 +288,11 @@ If you get `Configuration property "enable.ssl.certificate.verification" not sup
 **pyproject.toml parse warnings**
 When running `uv sync`, you may see a `Failed to parse` warning related to `pyproject.toml`. This is usually harmless – if you see the `Activate with:` line at the end, your environment was created successfully.
 
-## Option 2: Developing with Codespaces
+## Option 2: Developing with Coder workspaces (PostHog employees only)
 
-This is a faster option to get up and running if you can't or don't want to set up locally.
+If you work at PostHog and want a remote workspace instead of running the stack on your laptop, see the [internal Coder workspaces guide](https://github.com/PostHog/posthog/blob/master/docs/internal/coder-workspaces.md).
 
-1. Create your codespace.
-   ![](https://user-images.githubusercontent.com/890921/231489405-cb2010b4-d9e3-4837-bfdf-b2d4ef5c5d0b.png)
-2. Update it to 8-core machine type (the smallest is probably too small to get PostHog running properly).
-   ![](https://user-images.githubusercontent.com/890921/231490278-140f814e-e77b-46d5-9a4f-31c1b1d6956a.png)
-3. Open the codespace, using one of the "Open in" options from the list.
-4. In the codespace, open a terminal window and run `docker compose -f docker-compose.dev.yml up`.
-5. Ensure that you are using the right Node version (`nvm install 22 && nvm use 22`) then, in another terminal, run `pnpm i` (and use the same terminal for the following commands).
-6. Then run `uv sync`
-   - If this doesn't activate your python virtual environment, run `uv venv` (install `uv` following the [uv standalone installer guide](https://docs.astral.sh/uv/getting-started/installation/#standalone-installer) if needed)
-7. Install `sqlx-cli` with `cargo install sqlx-cli` (install Cargo following the [Cargo getting started guide](https://doc.rust-lang.org/cargo/getting-started/installation.html) if needed)
-8. Now run `DEBUG=1 ./bin/migrate`
-9. Install [mprocs](https://github.com/pvolok/mprocs#installation) (`cargo install mprocs`)
-10. Run `bin/hogli start` (or just `hogli start` if using Flox).
-11. Open browser to <http://localhost:8010/>.
-12. To get some practical test data into your brand-new instance of PostHog, run `DEBUG=1 ./manage.py generate_demo_data`.
+If you drive your workflow with a coding agent (Claude Code, Cursor, etc.), the `setting-up-devbox` skill walks the agent through the whole flow — the tailnet prerequisite, `hogli devbox:setup`, starting a box, storing auth as Coder user secrets, and running commands on the box with `hogli devbox:exec`. Just ask it to set up your devbox.
 
 ## Testing
 
@@ -230,25 +303,19 @@ For a PostHog PR to be merged, all tests must be green, and ideally you should b
 For frontend unit tests, run:
 
 ```bash
-pnpm --filter=@posthog/frontend test
+hogli test frontend/src/
 ```
 
 You can narrow the run down to only files under matching paths:
 
 ```bash
-pnpm jest --testPathPattern=frontend/src/lib/components/DateFilter/DateFilter.test.tsx
+hogli test frontend/src/lib/components/DateFilter/DateFilter.test.tsx
 ```
 
-To update all visual regression test snapshots, make sure Storybook is running on your machine (you can start it with `pnpm storybook` in a separate Terminal tab). You may also need to install Playwright with `pnpm exec playwright install`. And then run:
+To update all visual regression test snapshots, make sure Storybook is running on your machine (you can start it with `hogli storybook` in a separate Terminal tab). You may also need to install Playwright with `pnpm exec playwright install`. And then run:
 
 ```bash
-pnpm test:visual
-```
-
-To only update snapshots for stories under a specific path, run:
-
-```bash
-pnpm test:visual:update frontend/src/lib/Example.stories.tsx
+hogli storybook:test
 ```
 
 ### Backend
@@ -256,26 +323,32 @@ pnpm test:visual:update frontend/src/lib/Example.stories.tsx
 For backend tests, run:
 
 ```bash
-pytest
+hogli test posthog/test/
 ```
 
 You can narrow the run down to only files under matching paths:
 
 ```bash
-pytest posthog/test/test_example.py
+hogli test posthog/test/test_example.py
 ```
 
 Or to only test cases with matching function names:
 
 ```bash
-pytest posthog/test/test_example.py -k test_something
+hogli test posthog/test/test_example.py -k test_something
 ```
 
 To see debug logs (such as ClickHouse queries), add argument `--log-cli-level=DEBUG`.
 
+You can also run tests for all files changed on the current branch:
+
+```bash
+hogli test --changed
+```
+
 ### End-to-end
 
-For Playwright end-to-end tests, run `bin/e2e-test-runner`. This will spin up a test instance of PostHog and show you the Playwright interface, from which you'll manually choose tests to run. You'll need `uv` installed (the Python package manager), which you can do so with `brew install uv`. Once you're done, terminate the command with Cmd + C.
+For Playwright end-to-end tests, run `hogli test:e2e` (which wraps `bin/e2e-test-runner`). This will spin up a test instance of PostHog and show you the Playwright interface, from which you'll manually choose tests to run. You'll need `uv` installed (the Python package manager), which you can do so with `brew install uv`. Once you're done, terminate the command with Cmd + C.
 
 ## Django migrations
 
@@ -306,7 +379,13 @@ If you'd like to have ALL feature flags that exist in PostHog at your disposal r
 
 This command automatically turns any feature flag ending in `_EXPERIMENT` as a multivariate flag with `control` and `test` variants.
 
-Backend side flags are only evaluated locally, which requires the `POSTHOG_PERSONAL_API_KEY` env var to be set. Generate the key in [your user settings](http://localhost:8010/settings/user#personal-api-keys).
+Backend side flags are automatically configured in DEBUG mode using the
+dev API key created by `manage.py setup_local_api_key`.
+If you need to override the key, set the `POSTHOG_PERSONAL_API_KEY` env var.
+
+That dev key's full value is also shown in [Settings > Personal API keys](http://localhost:8010/settings/user-api-keys), so you can copy it without rerunning the command.
+This needs `DEBUG=1` and `ALLOW_DEV_API_KEY_REVEAL=1`, both of which are already set in `.env.development`.
+No other personal API key is ever shown in full: the dev key is the only one whose value is a repo constant rather than a hash.
 
 ## Extra: Debugging with VS Code
 
@@ -326,7 +405,7 @@ With PyCharm's built in support for Django, it's fairly easy to setup debugging 
    - If using Flox: `path_to_repo/posthog/.flox/cache/venv/bin/python`.
 3. Setup Django support (Settings… > Languages & Frameworks > Django):
    - Django project root: `path_to_repo`
-   - Settings: `posthog/settings/__init__py`
+   - Settings: `posthog/settings/__init__.py`
 4. To run tests correctly in PyCharm, disable the Django test runner:
    - Go to Settings… > Languages & Frameworks > Django
    - Check "Do not use Django test runner"
@@ -439,6 +518,36 @@ When creating a new email, there are a few steps to take. It's important to add 
    message.send()
    ```
 
+## Extra: Using AI assistants with your local dev environment
+
+Phrocs (the process manager) includes an MCP (Model Context Protocol) server that lets AI coding assistants query your local dev environment. This is useful for debugging issues with AI tools like Claude Desktop, Cursor, Windsurf, or other MCP-compatible assistants.
+
+### Setup
+
+The repository includes a `.mcp.json` configuration file in the repo root that registers the phrocs MCP server. To use it:
+
+1. Ensure your AI tool supports MCP and can read `.mcp.json` configuration files
+2. Open the PostHog repository in your AI tool
+3. The phrocs MCP server is available automatically when `hogli start` is running
+
+### Available tools
+
+The MCP server provides two tools:
+
+- **get_process_status** – Returns process status including PID, running state, readiness, and real-time metrics (CPU, memory, threads)
+- **get_process_logs** – Retrieves recent log lines from a process's in-memory buffer, with optional grep filtering
+
+### Example usage
+
+Ask your AI assistant questions like:
+
+- "What processes are currently running?"
+- "Show me the recent logs from the backend process"
+- "Is the frontend process ready?"
+- "Search the worker logs for error messages"
+
+The AI assistant uses the MCP tools to query phrocs directly and provide you with the relevant information.
+
 ## Extra: Developing paid features (PostHog employees only)
 
 If you're a PostHog employee, you can get access to paid features on your local instance to make development easier. [Learn how to do so in our internal billing guide](https://github.com/PostHog/billing?tab=readme-ov-file#licensing-your-local-instance).
@@ -463,7 +572,7 @@ If you need to start fresh with a clean database (for example, if your local dat
 
 3. Wait for all migrations to complete. You can monitor the logs to ensure migrations have finished running.
 
-4. Once PostHog is running, click the **generate-demo-data** service in the mprocs terminal UI (you may have to scroll), then type `r` to start the service and generate test data.
+4. Once PostHog is running, click the **generate-demo-data** service in the phrocs terminal UI (you may have to scroll), then type `r` to start the service and generate test data.
 
 > **Note:** This process will completely wipe your local database. Make sure you don't have any important local data before proceeding.
 
@@ -476,6 +585,13 @@ hogli build:openapi
 ```
 
 See the [Type system guide](type-system) for details on how type generation works and best practices for documenting your API.
+
+## Extra: Working on multiple branches simultaneously
+
+If you frequently switch between features, bug fixes, and PR reviews, the
+[isolated development with Flox](./flox-multi-instance-workflow) guide shows
+how to use Git worktrees with per-worktree Flox environments for fast context
+switching.
 
 ## Extra: Working with the data warehouse
 

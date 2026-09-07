@@ -1,25 +1,28 @@
 import { useActions, useValues } from 'kea'
 
-import { LemonButton, LemonInput, LemonTable, LemonTag, LemonTagType, Link, Spinner, Tooltip } from '@posthog/lemon-ui'
+import { LemonButton, LemonInput, LemonTable, LemonTag, Link, Spinner, Tooltip } from '@posthog/lemon-ui'
 
+import { AccessControlAction } from 'lib/components/AccessControlAction'
 import { TZLabel } from 'lib/components/TZLabel'
+import { FEATURE_FLAGS } from 'lib/constants'
 import { More } from 'lib/lemon-ui/LemonButton/More'
 import { LemonTableLink } from 'lib/lemon-ui/LemonTable/LemonTableLink'
-import { humanFriendlyDetailedTime } from 'lib/utils'
+import { humanFriendlyDetailedTime } from 'lib/utils/datetime'
 import { urls } from 'scenes/urls'
 
+import { AccessControlObjectModal } from '~/layout/navigation-3000/sidepanel/panels/access_control/AccessControlObjectModal'
 import { DataWarehouseSavedQueryOrigin } from '~/queries/schema/schema-general'
-import { DataWarehouseSavedQuery, DataWarehouseSavedQueryRunHistory } from '~/types'
+import {
+    AccessControlLevel,
+    AccessControlResourceType,
+    DataWarehouseSavedQuery,
+    DataWarehouseSavedQueryRunHistory,
+} from '~/types'
 
+import { STATUS_TAG_SETTINGS } from 'products/data_modeling/frontend/lineage/nodeStyles'
+
+import { TableCertificationTag } from '../TableCertificationBadge'
 import { PAGE_SIZE, viewsTabLogic } from './viewsTabLogic'
-
-const STATUS_TAG_SETTINGS: Record<string, LemonTagType> = {
-    Running: 'primary',
-    Completed: 'success',
-    Failed: 'danger',
-    Cancelled: 'muted',
-    Modified: 'warning',
-}
 
 const getDisabledReason = (view: DataWarehouseSavedQuery): string | undefined => {
     if (view.managed_viewset_kind !== null) {
@@ -77,7 +80,12 @@ function DependencyCount({ count, loading }: { count?: number; loading?: boolean
     return <span>{count}</span>
 }
 
-export function ViewsTab(): JSX.Element {
+interface ViewsTabProps {
+    /** Optional function to build the URL when clicking on a view. Defaults to SQL editor. */
+    getViewUrl?: (view: DataWarehouseSavedQuery) => string
+}
+
+export function ViewsTab({ getViewUrl }: ViewsTabProps = {}): JSX.Element {
     const {
         filteredViews,
         filteredMaterializedViews,
@@ -90,12 +98,49 @@ export function ViewsTab(): JSX.Element {
         runHistoryMapLoading,
         materializedViewsCurrentPage,
         viewsCurrentPage,
+        accessControlModalOpen,
+        editingAccessControlView,
+        featureFlags,
+        viewsMapById,
     } = useValues(viewsTabLogic)
-    const { setSearchTerm, deleteView, runMaterialization, setMaterializedViewsPage, setViewsPage } =
-        useActions(viewsTabLogic)
+    const {
+        setSearchTerm,
+        deleteView,
+        runMaterialization,
+        setMaterializedViewsPage,
+        setViewsPage,
+        openAccessControlModal,
+        closeAccessControlModal,
+    } = useActions(viewsTabLogic)
+
+    const warehouseAccessControlEnabled = !!featureFlags[FEATURE_FLAGS.HOGQL_WAREHOUSE_ACCESS_CONTROL]
+
+    const nameWithCertification = (view: DataWarehouseSavedQuery, content: JSX.Element): JSX.Element => (
+        <div className="flex items-center gap-2">
+            <div>{content}</div>
+            <TableCertificationTag certification={viewsMapById[view.id]?.certification} />
+        </div>
+    )
+
+    const accessControlMenuButton = (view: DataWarehouseSavedQuery): JSX.Element | null => {
+        if (!warehouseAccessControlEnabled || view.managed_viewset_kind !== null) {
+            return null
+        }
+        return <LemonButton onClick={() => openAccessControlModal(view)}>Access control</LemonButton>
+    }
 
     return (
         <div className="space-y-4">
+            {editingAccessControlView ? (
+                <AccessControlObjectModal
+                    isOpen={accessControlModalOpen}
+                    onClose={closeAccessControlModal}
+                    resource={AccessControlResourceType.WarehouseView}
+                    resource_id={editingAccessControlView.id}
+                    title={editingAccessControlView.name}
+                    description="Control who can query this view. Users without access won't see it and queries referencing it will fail for them."
+                />
+            ) : null}
             {(filteredViews.length > 0 || filteredMaterializedViews.length > 0 || searchTerm) && (
                 <div className="flex gap-2 justify-between items-center">
                     <LemonInput
@@ -123,43 +168,50 @@ export function ViewsTab(): JSX.Element {
                                 title: 'Name',
                                 key: 'name',
                                 render: (_, view: DataWarehouseSavedQuery) =>
-                                    view.managed_viewset_kind !== null ? (
-                                        <>
-                                            <Tooltip
-                                                title={
-                                                    <>
-                                                        You cannot edit the definition for a view that belongs to a
-                                                        managed viewset. You can enable/disable the viewset in the{' '}
-                                                        <Link to={urls.dataWarehouseManagedViewsets()}>
-                                                            Managed Viewsets
-                                                        </Link>{' '}
-                                                        page.
-                                                    </>
-                                                }
-                                            >
-                                                <span className="font-bold text-primary">{view.name}</span>
-                                            </Tooltip>
-                                            <br />
-                                            <span className="text-muted text-xs">
-                                                Created by the{' '}
-                                                <Link to={urls.dataWarehouseManagedViewsets()} className="text-muted">
-                                                    <code>{view.managed_viewset_kind}</code>
-                                                </Link>{' '}
-                                                managed viewset
-                                            </span>
-                                        </>
-                                    ) : view.origin === DataWarehouseSavedQueryOrigin.ENDPOINT ? (
-                                        <LemonTableLink
-                                            to={urls.endpoint(view.name)}
-                                            title={view.name}
-                                            description={`Created by the ${view.name} endpoint.`}
-                                        />
-                                    ) : (
-                                        <LemonTableLink
-                                            to={urls.sqlEditor({ view_id: view.id })}
-                                            title={view.name}
-                                            description="Materialized view"
-                                        />
+                                    nameWithCertification(
+                                        view,
+                                        view.managed_viewset_kind !== null ? (
+                                            <>
+                                                <Tooltip
+                                                    interactive
+                                                    title={
+                                                        <>
+                                                            You cannot edit the definition for a view that belongs to a
+                                                            managed viewset. You can enable/disable the viewset in the{' '}
+                                                            <Link to={urls.dataWarehouseManagedViewsets()}>
+                                                                Managed Viewsets
+                                                            </Link>{' '}
+                                                            page.
+                                                        </>
+                                                    }
+                                                >
+                                                    <span className="font-bold text-primary">{view.name}</span>
+                                                </Tooltip>
+                                                <br />
+                                                <span className="text-muted text-xs">
+                                                    Created by the{' '}
+                                                    <Link
+                                                        to={urls.dataWarehouseManagedViewsets()}
+                                                        className="text-muted"
+                                                    >
+                                                        <code>{view.managed_viewset_kind}</code>
+                                                    </Link>{' '}
+                                                    managed viewset
+                                                </span>
+                                            </>
+                                        ) : view.origin === DataWarehouseSavedQueryOrigin.ENDPOINT ? (
+                                            <LemonTableLink
+                                                to={urls.endpoint(view.name)}
+                                                title={view.name}
+                                                description={`Created by the ${view.name} endpoint.`}
+                                            />
+                                        ) : (
+                                            <LemonTableLink
+                                                to={getViewUrl?.(view) ?? urls.sqlEditor({ view_id: view.id })}
+                                                title={view.name}
+                                                description="Materialized view"
+                                            />
+                                        )
                                     ),
                             },
                             {
@@ -231,23 +283,35 @@ export function ViewsTab(): JSX.Element {
                                     <More
                                         overlay={
                                             <>
-                                                <LemonButton
-                                                    onClick={() => runMaterialization(view.id)}
-                                                    disabledReason={
-                                                        view.status === 'Running'
-                                                            ? 'Materialization is already running'
-                                                            : undefined
-                                                    }
+                                                <AccessControlAction
+                                                    resourceType={AccessControlResourceType.WarehouseObjects}
+                                                    minAccessLevel={AccessControlLevel.Editor}
                                                 >
-                                                    Sync now
-                                                </LemonButton>
-                                                <LemonButton
-                                                    status="danger"
-                                                    onClick={() => deleteView(view.id)}
-                                                    disabledReason={getDisabledReason(view)}
+                                                    <LemonButton
+                                                        onClick={() => runMaterialization(view.id)}
+                                                        disabledReason={
+                                                            view.status === 'Running'
+                                                                ? 'Materialization is already running'
+                                                                : undefined
+                                                        }
+                                                    >
+                                                        Sync now
+                                                    </LemonButton>
+                                                </AccessControlAction>
+                                                {accessControlMenuButton(view)}
+                                                <AccessControlAction
+                                                    resourceType={AccessControlResourceType.WarehouseObjects}
+                                                    minAccessLevel={AccessControlLevel.Editor}
+                                                    userAccessLevel={view.user_access_level}
                                                 >
-                                                    Delete
-                                                </LemonButton>
+                                                    <LemonButton
+                                                        status="danger"
+                                                        onClick={() => deleteView(view.id)}
+                                                        disabledReason={getDisabledReason(view)}
+                                                    >
+                                                        Delete
+                                                    </LemonButton>
+                                                </AccessControlAction>
                                             </>
                                         }
                                     />
@@ -285,33 +349,43 @@ export function ViewsTab(): JSX.Element {
                                 title: 'Name',
                                 key: 'name',
                                 render: (_, view: DataWarehouseSavedQuery) =>
-                                    view.managed_viewset_kind !== null ? (
-                                        <>
-                                            <Tooltip
-                                                title={
-                                                    <>
-                                                        You cannot edit the definition for a view that belongs to a
-                                                        managed viewset. You can enable/disable the viewset in the{' '}
-                                                        <Link to={urls.dataWarehouseManagedViewsets()}>
-                                                            Managed Viewsets
-                                                        </Link>{' '}
-                                                        page.
-                                                    </>
-                                                }
-                                            >
-                                                <span className="font-bold text-primary">{view.name}</span>
-                                            </Tooltip>
-                                            <br />
-                                            <span className="text-muted text-xs">
-                                                Created by the{' '}
-                                                <Link to={urls.dataWarehouseManagedViewsets()} className="text-muted">
-                                                    <code>{view.managed_viewset_kind}</code>
-                                                </Link>{' '}
-                                                managed viewset
-                                            </span>
-                                        </>
-                                    ) : (
-                                        <LemonTableLink to={urls.sqlEditor({ view_id: view.id })} title={view.name} />
+                                    nameWithCertification(
+                                        view,
+                                        view.managed_viewset_kind !== null ? (
+                                            <>
+                                                <Tooltip
+                                                    interactive
+                                                    title={
+                                                        <>
+                                                            You cannot edit the definition for a view that belongs to a
+                                                            managed viewset. You can enable/disable the viewset in the{' '}
+                                                            <Link to={urls.dataWarehouseManagedViewsets()}>
+                                                                Managed Viewsets
+                                                            </Link>{' '}
+                                                            page.
+                                                        </>
+                                                    }
+                                                >
+                                                    <span className="font-bold text-primary">{view.name}</span>
+                                                </Tooltip>
+                                                <br />
+                                                <span className="text-muted text-xs">
+                                                    Created by the{' '}
+                                                    <Link
+                                                        to={urls.dataWarehouseManagedViewsets()}
+                                                        className="text-muted"
+                                                    >
+                                                        <code>{view.managed_viewset_kind}</code>
+                                                    </Link>{' '}
+                                                    managed viewset
+                                                </span>
+                                            </>
+                                        ) : (
+                                            <LemonTableLink
+                                                to={getViewUrl?.(view) ?? urls.sqlEditor({ view_id: view.id })}
+                                                title={view.name}
+                                            />
+                                        )
                                     ),
                             },
                             {
@@ -353,13 +427,20 @@ export function ViewsTab(): JSX.Element {
                                     <More
                                         overlay={
                                             <>
-                                                <LemonButton
-                                                    status="danger"
-                                                    onClick={() => deleteView(view.id)}
-                                                    disabledReason={getDisabledReason(view)}
+                                                {accessControlMenuButton(view)}
+                                                <AccessControlAction
+                                                    resourceType={AccessControlResourceType.WarehouseObjects}
+                                                    minAccessLevel={AccessControlLevel.Editor}
+                                                    userAccessLevel={view.user_access_level}
                                                 >
-                                                    Delete
-                                                </LemonButton>
+                                                    <LemonButton
+                                                        status="danger"
+                                                        onClick={() => deleteView(view.id)}
+                                                        disabledReason={getDisabledReason(view)}
+                                                    >
+                                                        Delete
+                                                    </LemonButton>
+                                                </AccessControlAction>
                                             </>
                                         }
                                     />
@@ -393,9 +474,14 @@ export function ViewsTab(): JSX.Element {
                             Create your first view to transform and organize your data warehouse tables.
                         </p>
                     )}
-                    <LemonButton type="primary" to={urls.sqlEditor()} className="inline-block">
-                        Create view
-                    </LemonButton>
+                    <AccessControlAction
+                        resourceType={AccessControlResourceType.WarehouseObjects}
+                        minAccessLevel={AccessControlLevel.Editor}
+                    >
+                        <LemonButton type="primary" to={urls.sqlEditor({ source: 'view' })} className="inline-block">
+                            Create view
+                        </LemonButton>
+                    </AccessControlAction>
                 </div>
             )}
         </div>

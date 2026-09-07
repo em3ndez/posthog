@@ -1,14 +1,19 @@
 from typing import Any
 
+from django.conf import settings
+
 from rest_framework.request import Request
 
-from posthog.models.organization_domain import OrganizationDomain
+from posthog.models.identity_provider_config import IdentityProviderConfig
 
 from ee.models.scim_provisioned_user import SCIMProvisionedUser
 
 from .auth import generate_scim_token
 
 PII_FIELDS = {"userName", "displayName", "givenName", "familyName", "value", "display", "formatted"}
+
+REDACTED_HEADERS = {"cookie", "set-cookie"}
+MASKED_HEADERS = {"authorization"}
 
 
 def _looks_like_email(value: str) -> bool:
@@ -71,57 +76,67 @@ def mask_scim_payload(data: Any, depth: int = 0) -> Any:
             return data
 
 
-def enable_scim_for_domain(domain: OrganizationDomain) -> str:
+def mask_headers(headers: dict[str, str]) -> dict[str, str]:
+    result = {}
+    for key, value in headers.items():
+        normalized = key.lower().strip()
+        if normalized in REDACTED_HEADERS:
+            continue
+        if normalized in MASKED_HEADERS:
+            result[key] = "***"
+        else:
+            result[key] = value
+    return result
+
+
+def enable_scim_for_config(config: IdentityProviderConfig) -> str:
     """
-    Enable SCIM for an OrganizationDomain and generate a new bearer token.
+    Enable SCIM for an IdentityProviderConfig and generate a new bearer token.
     Returns the plain text token (only shown once).
     """
-    plain_token, hashed_token = generate_scim_token()
+    token = generate_scim_token()
 
-    domain.scim_enabled = True
-    domain.scim_bearer_token = hashed_token
-    domain.save()
+    config.scim_enabled = True
+    config.scim_bearer_token = token.hashed
+    config.save()
 
-    return plain_token
+    return token.plain
 
 
-def disable_scim_for_domain(domain: OrganizationDomain) -> None:
+def disable_scim_for_config(config: IdentityProviderConfig) -> None:
     """
-    Disable SCIM for an OrganizationDomain.
+    Disable SCIM for an IdentityProviderConfig.
     """
-    domain.scim_enabled = False
-    domain.scim_bearer_token = None
-    domain.save()
+    config.scim_enabled = False
+    config.scim_bearer_token = None
+    config.save()
 
 
-def regenerate_scim_token(domain: OrganizationDomain) -> str:
+def regenerate_scim_token_for_config(config: IdentityProviderConfig) -> str:
     """
-    Regenerate SCIM bearer token for a domain.
+    Regenerate SCIM bearer token for an IdentityProviderConfig.
     Returns the new plain text token (only shown once).
     """
-    plain_token, hashed_token = generate_scim_token()
+    token = generate_scim_token()
 
-    domain.scim_bearer_token = hashed_token
-    domain.save()
+    config.scim_bearer_token = token.hashed
+    config.save()
 
-    return plain_token
+    return token.plain
 
 
-def get_scim_base_url(domain: OrganizationDomain, request=None) -> str:
+def get_scim_base_url(config: IdentityProviderConfig) -> str:
     """
-    Get the SCIM base URL for a domain.
+    Get the SCIM base URL for an IdentityProviderConfig.
     """
-    from django.conf import settings
-
-    base_url = settings.SITE_URL
-    return f"{base_url}/scim/v2/{domain.id}"
+    return f"{settings.SITE_URL}/scim/v2/{config.scim_slug}"
 
 
 def detect_identity_provider(request: Request) -> SCIMProvisionedUser.IdentityProvider:
     """
     Detect identity provider from request User-Agent header.
     """
-    user_agent = request.META.get("HTTP_USER_AGENT", "").lower()
+    user_agent = request.headers.get("user-agent", "").lower()
 
     if "okta" in user_agent:
         return SCIMProvisionedUser.IdentityProvider.OKTA

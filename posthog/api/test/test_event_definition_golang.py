@@ -1,3 +1,4 @@
+import os
 import tempfile
 import subprocess
 from pathlib import Path
@@ -10,6 +11,8 @@ from rest_framework import status
 
 from posthog.api.event_definition_generators.golang import GolangGenerator
 from posthog.models import EventDefinition, EventSchema, SchemaPropertyGroup, SchemaPropertyGroupProperty
+
+from ee.models.event_definition import EnterpriseEventDefinition
 
 
 class TestGolangGenerator(APIBaseTest):
@@ -387,12 +390,31 @@ func CreativeNamingCaptureFromBase(
         # Check presence of usage guide
         self.assertIn("// USAGE GUIDE", code)
 
-    def _create_mock_property(self, name: str, property_type: str, required: bool = False) -> MagicMock:
+    def test_generate_event_with_optional_in_types(self):
+        props = [
+            self._create_mock_property("file_name", "String", required=True),
+            self._create_mock_property("file_size", "Numeric", required=True, is_optional_in_types=True),
+            self._create_mock_property("label", "String", required=False),
+        ]
+
+        code = self.generator._generate_event_with_properties("file_uploaded", props)  # type: ignore[arg-type]
+
+        # file_size should become an option function (not a required param)
+        self.assertIn("FileUploadedWithFileSize(fileSize float64)", code)
+        # file_name should still be a required param
+        self.assertIn("fileName string", code)
+        # file_size should NOT appear as a required param in the capture function signature
+        self.assertNotIn("fileSize float64,\n\toptions", code)
+
+    def _create_mock_property(
+        self, name: str, property_type: str, required: bool = False, is_optional_in_types: bool = False
+    ) -> MagicMock:
         """Create a mock SchemaPropertyGroupProperty for testing"""
         prop = MagicMock()
         prop.name = name
         prop.property_type = property_type
         prop.is_required = required
+        prop.is_optional_in_types = is_optional_in_types
         return prop
 
 
@@ -477,16 +499,16 @@ class TestGolangGeneratorAPI(APIBaseTest):
         # Verify telemetry was called
         self._test_telemetry_called(mock_report)
 
-    def test_golang_endpoint_excludes_non_whitelisted_system_events(self):
-        # $autocapture should be excluded
-        # $pageview is whitelisted and should be included
-        EventDefinition.objects.create(team=self.team, project=self.project, name="$autocapture")
+    def test_golang_endpoint_excludes_non_core_system_events(self):
+        # $money is not a core PostHog event so it should be excluded
+        # $pageview is a core event and should be included
+        EventDefinition.objects.create(team=self.team, project=self.project, name="$money")
         EventDefinition.objects.create(team=self.team, project=self.project, name="$pageview")
 
         response = self.client.get(f"/api/projects/{self.project.id}/event_definitions/golang")
 
         code = response.json()["content"]
-        self.assertNotIn("Autocapture", code)
+        self.assertNotIn("Money", code)
         self.assertIn("Pageview", code)
 
     @patch("posthog.api.event_definition_generators.base.report_user_action")
@@ -513,6 +535,9 @@ class TestGolangGeneratorAPI(APIBaseTest):
         4. Runs Go compiler to verify no errors
 
         This ensures the generated code is syntactically correct and type-safe.
+
+        The posthog-go dependency is a local stub resolved through a `replace`
+        directive, so the compiler never reaches the network.
         """
         special_event = EventDefinition.objects.create(
             team=self.team, project=self.project, name="user'event\"with\\quotes"
@@ -535,21 +560,14 @@ class TestGolangGeneratorAPI(APIBaseTest):
             self.assertEqual(response.status_code, status.HTTP_200_OK)
             go_content = response.json()["content"]
 
-            subprocess.run(["go", "mod", "init", "testmodule"], cwd=str(tmpdir_path), check=True, capture_output=True)
-            # Install posthog-go dependency
-            install_result = subprocess.run(
-                ["go", "get", "github.com/posthog/posthog-go"],
-                cwd=str(tmpdir_path),
-                capture_output=True,
-                text=True,
-                timeout=60,
+            self._write_posthog_go_stub(tmpdir_path)
+
+            (tmpdir_path / "go.mod").write_text(
+                "module testmodule\n\n"
+                "go 1.21\n\n"
+                "require github.com/posthog/posthog-go v0.0.0\n\n"
+                "replace github.com/posthog/posthog-go => ./posthog-go\n"
             )
-            if install_result.returncode != 0:
-                self.fail(
-                    f"Failed to install posthog-go dependency:\n"
-                    f"STDOUT: {install_result.stdout}\n"
-                    f"STDERR: {install_result.stderr}"
-                )
 
             # Write generated types
             typed_dir = tmpdir_path / "typed"
@@ -613,13 +631,14 @@ func main() {
 """
             )
 
-            # Run Go compiler
+            # Run Go compiler offline; the local stub resolves posthog-go.
             build_result = subprocess.run(
                 ["go", "build", "-o", "test", "main.go"],
                 cwd=str(tmpdir_path),
                 capture_output=True,
                 text=True,
                 timeout=30,
+                env={**os.environ, "GOPROXY": "off", "GOFLAGS": "-mod=mod"},
             )
 
             # Assert compilation succeeded
@@ -631,6 +650,62 @@ func main() {
                 f"STDERR:\n{build_result.stderr}\n\n"
                 f"Generated Go file:\n{go_content}",
             )
+
+    def test_excludes_unverified_events_without_schema(self):
+        EventDefinition.objects.create(team=self.team, project=self.project, name="spam_event")
+        EventDefinition.objects.create(team=self.team, project=self.project, name="John Smith clicked button")
+
+        response = self.client.get(f"/api/projects/{self.project.id}/event_definitions/golang")
+        code = response.json()["content"]
+
+        self.assertNotIn("spam_event", code)
+        self.assertNotIn("John Smith", code)
+        # Events with schemas from setUp should still be present
+        self.assertIn("FileDownloadedCapture", code)
+        self.assertIn("UserSignedUpCapture", code)
+
+    def test_includes_verified_events_without_schema(self):
+        EnterpriseEventDefinition.objects.create(
+            team=self.team, project=self.project, name="verified_no_schema", verified=True
+        )
+
+        response = self.client.get(f"/api/projects/{self.project.id}/event_definitions/golang")
+        code = response.json()["content"]
+
+        self.assertIn("VerifiedNoSchemaCapture", code)
+
+    def _write_posthog_go_stub(self, tmpdir_path: Path) -> None:
+        """Write a minimal local posthog-go module so the compile check needs no network.
+
+        It provides only the symbols the generated code and main.go reference:
+        the Properties map, its Merge method, and the Capture struct.
+        """
+        stub_dir = tmpdir_path / "posthog-go"
+        stub_dir.mkdir()
+        (stub_dir / "go.mod").write_text("module github.com/posthog/posthog-go\n\ngo 1.21\n")
+        (stub_dir / "posthog.go").write_text(
+            """package posthog
+
+type Properties map[string]interface{}
+
+func (p Properties) Merge(other Properties) Properties {
+\tresult := Properties{}
+\tfor k, v := range p {
+\t\tresult[k] = v
+\t}
+\tfor k, v := range other {
+\t\tresult[k] = v
+\t}
+\treturn result
+}
+
+type Capture struct {
+\tDistinctId string
+\tEvent      string
+\tProperties Properties
+}
+"""
+        )
 
     def _test_telemetry_called(self, mock_report) -> None:
         # Verify telemetry was called

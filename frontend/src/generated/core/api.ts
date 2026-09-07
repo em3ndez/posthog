@@ -1,3 +1,4 @@
+import { apiMutator } from '../../lib/api-orval-mutator'
 /**
  * Auto-generated from the Django backend OpenAPI schema.
  * To modify these types, update the Django serializers or views, then run:
@@ -7,75 +8,103 @@
  * PostHog API - core
  * OpenAPI spec version: 1.0.0
  */
-import { apiMutator } from '../../lib/api-orval-mutator'
 import type {
-    AnnotationApi,
-    AnnotationsListParams,
-    CommentApi,
-    CommentsListParams,
-    DashboardTemplateApi,
-    DashboardTemplatesListParams,
+    BulkUpdateTagsRequestApi,
+    BulkUpdateTagsResponseApi,
+    CIMDVerificationTokenApi,
+    CIMDVerificationTokenCreateApi,
+    CIMDVerificationTokenWithValueApi,
+    CimdVerificationTokensListParams,
     DomainsListParams,
-    EnterpriseEventDefinitionApi,
+    DomainsScimLogsRetrieveParams,
     EnterprisePropertyDefinitionApi,
-    EventDefinitionApi,
-    EventDefinitionsByNameRetrieveParams,
-    EventDefinitionsListParams,
+    EventIngestionRestrictionApi,
     ExportedAssetApi,
+    ExportedAssetCreateApi,
     ExportsListParams,
     FileSystemApi,
     FileSystemListParams,
-    FlagValueValuesRetrieve200Item,
-    FlagValueValuesRetrieveParams,
-    IntegrationApi,
-    IntegrationsList2Params,
+    FileSystemShortcutApi,
+    FileSystemShortcutListParams,
+    FileSystemShortcutReorderApi,
+    GitHubBranchesResponseApi,
+    GitHubInstallRequestListResponseApi,
+    GitHubReposRefreshResponseApi,
+    GitHubReposResponseApi,
+    IdentityProviderConfigApi,
+    IdentityProviderConfigsListParams,
+    IdentityProviderConfigsScimLogsRetrieveParams,
     InvitesListParams,
-    List2Params,
-    MembersListParams,
+    LeakedKeyReportApi,
+    LeakedKeyReportResponseApi,
+    OauthApplicationsListParams,
+    OnboardingSkipRequestApi,
     OrganizationDomainApi,
     OrganizationInviteApi,
-    OrganizationMemberApi,
-    PaginatedAnnotationListApi,
-    PaginatedCommentListApi,
-    PaginatedDashboardTemplateListApi,
-    PaginatedEnterpriseEventDefinitionListApi,
+    OrganizationInviteDelegateApi,
+    OrganizationNotificationLockBulkUpdateApi,
+    OrganizationNotificationMemberApi,
+    OrganizationsProjectsEventIngestionRestrictionsListParams,
+    OrganizationsProjectsListParams,
+    PaginatedCIMDVerificationTokenListApi,
     PaginatedEnterprisePropertyDefinitionListApi,
     PaginatedExportedAssetListApi,
     PaginatedFileSystemListApi,
-    PaginatedIntegrationListApi,
+    PaginatedFileSystemShortcutListApi,
+    PaginatedIdentityProviderConfigListApi,
     PaginatedOrganizationDomainListApi,
     PaginatedOrganizationInviteListApi,
-    PaginatedOrganizationMemberListApi,
+    PaginatedOrganizationOAuthApplicationListApi,
     PaginatedProjectBackwardCompatBasicListApi,
-    PaginatedRoleListApi,
-    PaginatedScheduledChangeListApi,
-    PaginatedSubscriptionListApi,
+    PaginatedProjectSecretAPIKeyListApi,
+    PaginatedSCIMRequestLogApi,
+    PaginatedUploadedMediaListApi,
+    PaginatedUserGitHubIntegrationListResponseListApi,
     PaginatedUserListApi,
-    PatchedAnnotationApi,
-    PatchedCommentApi,
-    PatchedDashboardTemplateApi,
-    PatchedEnterpriseEventDefinitionApi,
+    PatchedCIMDVerificationTokenUpdateApi,
     PatchedEnterprisePropertyDefinitionApi,
     PatchedFileSystemApi,
-    PatchedIntegrationApi,
+    PatchedFileSystemShortcutApi,
+    PatchedIdentityProviderConfigApi,
     PatchedOrganizationDomainApi,
-    PatchedOrganizationMemberApi,
+    PatchedProductIntroSeenApi,
     PatchedProjectBackwardCompatApi,
-    PatchedRoleApi,
-    PatchedScheduledChangeApi,
-    PatchedSubscriptionApi,
+    PatchedProjectSecretAPIKeyApi,
     PatchedUserApi,
+    ProductEnablementApi,
+    ProductEnablementResultApi,
     ProjectBackwardCompatApi,
+    ProjectSecretAPIKeyApi,
+    ProjectSecretApiKeysListParams,
     PropertyDefinitionsListParams,
-    RoleApi,
-    RolesListParams,
-    ScheduledChangeApi,
-    ScheduledChangesListParams,
+    RevokeOtherSessionsResponseApi,
+    SCIMTokenResponseApi,
     SharingConfigurationApi,
-    SubscriptionApi,
-    SubscriptionsListParams,
+    UploadedMediaApi,
+    UploadedMediaCreate201,
+    UploadedMediaCreateBody,
+    UploadedMediaListParams,
+    UploadedMediaStartUploadApi,
+    UploadedMediaUploadStartedApi,
     UserApi,
+    UserAuthSessionApi,
+    UserGitHubLinkStartRequestApi,
+    UserGitHubLinkStartResponseApi,
+    UserGitHubPrepareCallbackRequestApi,
+    UserGithubLoginApi,
+    UserPushTokenItemApi,
+    UserPushTokenRegisterRequestApi,
+    UserPushTokenUnregisterRequestApi,
+    UserSlackLinkStartRequestApi,
+    UserSlackLinkStartResponseApi,
+    UserSlackLinkableWorkspaceListResponseApi,
+    UsersIntegrationsGithubBranchesRetrieveParams,
+    UsersIntegrationsGithubReposRetrieveParams,
+    UsersIntegrationsListParams,
     UsersListParams,
+    UsersLoginSessionsListParams,
+    UsersProductIntroSeenPartialUpdate200,
+    VerifyEmailRequestApi,
 } from './api.schemas'
 
 // https://stackoverflow.com/questions/49579094/typescript-conditional-types-filter-out-readonly-properties-pick-only-requir/49579497#49579497
@@ -95,12 +124,184 @@ type NonReadonly<T> = [T] extends [UnionToIntersection<T>]
       }
     : DistributeReadOnlyOverUnions<T>
 
+export const getCimdVerificationTokensListUrl = (organizationId: string, params?: CimdVerificationTokensListParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/organizations/${organizationId}/cimd_verification_tokens/?${stringifiedParams}`
+        : `/api/organizations/${organizationId}/cimd_verification_tokens/`
+}
+
+/**
+ * Manage CIMD verification tokens for an organization.
+ *
+ * A partner embeds the plaintext token in their CIMD metadata document as
+ * `verification_token` inside the `com.posthog` object (the legacy top-level
+ * `posthog_verification_token` field still works as a fallback). When PostHog fetches
+ * the metadata, matching the token links the partner app to this organization and
+ * grants a higher default rate limit for account provisioning.
+ *
+ * Each token is scoped at creation to the one `cimd_url` it will be published at,
+ * and verifies nowhere else. Two organizations may name the same URL; only the one
+ * whose token is actually served there verifies, so claiming a URL cannot be used
+ * to block a partner from verifying theirs.
+ *
+ * The plaintext value is only available on creation; we store a hash.
+ */
+export const cimdVerificationTokensList = async (
+    organizationId: string,
+    params?: CimdVerificationTokensListParams,
+    options?: RequestInit
+): Promise<PaginatedCIMDVerificationTokenListApi> => {
+    return apiMutator<PaginatedCIMDVerificationTokenListApi>(getCimdVerificationTokensListUrl(organizationId, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getCimdVerificationTokensCreateUrl = (organizationId: string) => {
+    return `/api/organizations/${organizationId}/cimd_verification_tokens/`
+}
+
+/**
+ * Manage CIMD verification tokens for an organization.
+ *
+ * A partner embeds the plaintext token in their CIMD metadata document as
+ * `verification_token` inside the `com.posthog` object (the legacy top-level
+ * `posthog_verification_token` field still works as a fallback). When PostHog fetches
+ * the metadata, matching the token links the partner app to this organization and
+ * grants a higher default rate limit for account provisioning.
+ *
+ * Each token is scoped at creation to the one `cimd_url` it will be published at,
+ * and verifies nowhere else. Two organizations may name the same URL; only the one
+ * whose token is actually served there verifies, so claiming a URL cannot be used
+ * to block a partner from verifying theirs.
+ *
+ * The plaintext value is only available on creation; we store a hash.
+ */
+export const cimdVerificationTokensCreate = async (
+    organizationId: string,
+    cIMDVerificationTokenCreateApi: CIMDVerificationTokenCreateApi,
+    options?: RequestInit
+): Promise<CIMDVerificationTokenWithValueApi> => {
+    return apiMutator<CIMDVerificationTokenWithValueApi>(getCimdVerificationTokensCreateUrl(organizationId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(cIMDVerificationTokenCreateApi),
+    })
+}
+
+export const getCimdVerificationTokensRetrieveUrl = (organizationId: string, id: string) => {
+    return `/api/organizations/${organizationId}/cimd_verification_tokens/${id}/`
+}
+
+/**
+ * Manage CIMD verification tokens for an organization.
+ *
+ * A partner embeds the plaintext token in their CIMD metadata document as
+ * `verification_token` inside the `com.posthog` object (the legacy top-level
+ * `posthog_verification_token` field still works as a fallback). When PostHog fetches
+ * the metadata, matching the token links the partner app to this organization and
+ * grants a higher default rate limit for account provisioning.
+ *
+ * Each token is scoped at creation to the one `cimd_url` it will be published at,
+ * and verifies nowhere else. Two organizations may name the same URL; only the one
+ * whose token is actually served there verifies, so claiming a URL cannot be used
+ * to block a partner from verifying theirs.
+ *
+ * The plaintext value is only available on creation; we store a hash.
+ */
+export const cimdVerificationTokensRetrieve = async (
+    organizationId: string,
+    id: string,
+    options?: RequestInit
+): Promise<CIMDVerificationTokenApi> => {
+    return apiMutator<CIMDVerificationTokenApi>(getCimdVerificationTokensRetrieveUrl(organizationId, id), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getCimdVerificationTokensPartialUpdateUrl = (organizationId: string, id: string) => {
+    return `/api/organizations/${organizationId}/cimd_verification_tokens/${id}/`
+}
+
+/**
+ * Manage CIMD verification tokens for an organization.
+ *
+ * A partner embeds the plaintext token in their CIMD metadata document as
+ * `verification_token` inside the `com.posthog` object (the legacy top-level
+ * `posthog_verification_token` field still works as a fallback). When PostHog fetches
+ * the metadata, matching the token links the partner app to this organization and
+ * grants a higher default rate limit for account provisioning.
+ *
+ * Each token is scoped at creation to the one `cimd_url` it will be published at,
+ * and verifies nowhere else. Two organizations may name the same URL; only the one
+ * whose token is actually served there verifies, so claiming a URL cannot be used
+ * to block a partner from verifying theirs.
+ *
+ * The plaintext value is only available on creation; we store a hash.
+ */
+export const cimdVerificationTokensPartialUpdate = async (
+    organizationId: string,
+    id: string,
+    patchedCIMDVerificationTokenUpdateApi?: PatchedCIMDVerificationTokenUpdateApi,
+    options?: RequestInit
+): Promise<CIMDVerificationTokenApi> => {
+    return apiMutator<CIMDVerificationTokenApi>(getCimdVerificationTokensPartialUpdateUrl(organizationId, id), {
+        ...options,
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(patchedCIMDVerificationTokenUpdateApi),
+    })
+}
+
+export const getCimdVerificationTokensDestroyUrl = (organizationId: string, id: string) => {
+    return `/api/organizations/${organizationId}/cimd_verification_tokens/${id}/`
+}
+
+/**
+ * Manage CIMD verification tokens for an organization.
+ *
+ * A partner embeds the plaintext token in their CIMD metadata document as
+ * `verification_token` inside the `com.posthog` object (the legacy top-level
+ * `posthog_verification_token` field still works as a fallback). When PostHog fetches
+ * the metadata, matching the token links the partner app to this organization and
+ * grants a higher default rate limit for account provisioning.
+ *
+ * Each token is scoped at creation to the one `cimd_url` it will be published at,
+ * and verifies nowhere else. Two organizations may name the same URL; only the one
+ * whose token is actually served there verifies, so claiming a URL cannot be used
+ * to block a partner from verifying theirs.
+ *
+ * The plaintext value is only available on creation; we store a hash.
+ */
+export const cimdVerificationTokensDestroy = async (
+    organizationId: string,
+    id: string,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getCimdVerificationTokensDestroyUrl(organizationId, id), {
+        ...options,
+        method: 'DELETE',
+    })
+}
+
 export const getDomainsListUrl = (organizationId: string, params?: DomainsListParams) => {
     const normalizedParams = new URLSearchParams()
 
     Object.entries(params || {}).forEach(([key, value]) => {
         if (value !== undefined) {
-            normalizedParams.append(key, value === null ? 'null' : value.toString())
+            normalizedParams.append(key, value === null ? 'null' : String(value))
         }
     })
 
@@ -179,7 +380,7 @@ export const getDomainsPartialUpdateUrl = (organizationId: string, id: string) =
 export const domainsPartialUpdate = async (
     organizationId: string,
     id: string,
-    patchedOrganizationDomainApi: NonReadonly<PatchedOrganizationDomainApi>,
+    patchedOrganizationDomainApi?: NonReadonly<PatchedOrganizationDomainApi>,
     options?: RequestInit
 ): Promise<OrganizationDomainApi> => {
     return apiMutator<OrganizationDomainApi>(getDomainsPartialUpdateUrl(organizationId, id), {
@@ -201,24 +402,35 @@ export const domainsDestroy = async (organizationId: string, id: string, options
     })
 }
 
-/**
- * Regenerate SCIM bearer token.
- */
-export const getDomainsScimTokenCreateUrl = (organizationId: string, id: string) => {
-    return `/api/organizations/${organizationId}/domains/${id}/scim/token/`
-}
-
-export const domainsScimTokenCreate = async (
+export const getDomainsScimLogsRetrieveUrl = (
     organizationId: string,
     id: string,
-    organizationDomainApi: NonReadonly<OrganizationDomainApi>,
+    params?: DomainsScimLogsRetrieveParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/organizations/${organizationId}/domains/${id}/scim/logs/?${stringifiedParams}`
+        : `/api/organizations/${organizationId}/domains/${id}/scim/logs/`
+}
+
+export const domainsScimLogsRetrieve = async (
+    organizationId: string,
+    id: string,
+    params?: DomainsScimLogsRetrieveParams,
     options?: RequestInit
-): Promise<void> => {
-    return apiMutator<void>(getDomainsScimTokenCreateUrl(organizationId, id), {
+): Promise<PaginatedSCIMRequestLogApi> => {
+    return apiMutator<PaginatedSCIMRequestLogApi>(getDomainsScimLogsRetrieveUrl(organizationId, id, params), {
         ...options,
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(organizationDomainApi),
+        method: 'GET',
     })
 }
 
@@ -240,12 +452,181 @@ export const domainsVerifyCreate = async (
     })
 }
 
+export const getIdentityProviderConfigsListUrl = (
+    organizationId: string,
+    params?: IdentityProviderConfigsListParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/organizations/${organizationId}/identity_provider_configs/?${stringifiedParams}`
+        : `/api/organizations/${organizationId}/identity_provider_configs/`
+}
+
+export const identityProviderConfigsList = async (
+    organizationId: string,
+    params?: IdentityProviderConfigsListParams,
+    options?: RequestInit
+): Promise<PaginatedIdentityProviderConfigListApi> => {
+    return apiMutator<PaginatedIdentityProviderConfigListApi>(
+        getIdentityProviderConfigsListUrl(organizationId, params),
+        {
+            ...options,
+            method: 'GET',
+        }
+    )
+}
+
+export const getIdentityProviderConfigsCreateUrl = (organizationId: string) => {
+    return `/api/organizations/${organizationId}/identity_provider_configs/`
+}
+
+export const identityProviderConfigsCreate = async (
+    organizationId: string,
+    identityProviderConfigApi?: NonReadonly<IdentityProviderConfigApi>,
+    options?: RequestInit
+): Promise<IdentityProviderConfigApi> => {
+    return apiMutator<IdentityProviderConfigApi>(getIdentityProviderConfigsCreateUrl(organizationId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(identityProviderConfigApi),
+    })
+}
+
+export const getIdentityProviderConfigsRetrieveUrl = (organizationId: string, id: string) => {
+    return `/api/organizations/${organizationId}/identity_provider_configs/${id}/`
+}
+
+export const identityProviderConfigsRetrieve = async (
+    organizationId: string,
+    id: string,
+    options?: RequestInit
+): Promise<IdentityProviderConfigApi> => {
+    return apiMutator<IdentityProviderConfigApi>(getIdentityProviderConfigsRetrieveUrl(organizationId, id), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getIdentityProviderConfigsUpdateUrl = (organizationId: string, id: string) => {
+    return `/api/organizations/${organizationId}/identity_provider_configs/${id}/`
+}
+
+export const identityProviderConfigsUpdate = async (
+    organizationId: string,
+    id: string,
+    identityProviderConfigApi?: NonReadonly<IdentityProviderConfigApi>,
+    options?: RequestInit
+): Promise<IdentityProviderConfigApi> => {
+    return apiMutator<IdentityProviderConfigApi>(getIdentityProviderConfigsUpdateUrl(organizationId, id), {
+        ...options,
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(identityProviderConfigApi),
+    })
+}
+
+export const getIdentityProviderConfigsPartialUpdateUrl = (organizationId: string, id: string) => {
+    return `/api/organizations/${organizationId}/identity_provider_configs/${id}/`
+}
+
+export const identityProviderConfigsPartialUpdate = async (
+    organizationId: string,
+    id: string,
+    patchedIdentityProviderConfigApi?: NonReadonly<PatchedIdentityProviderConfigApi>,
+    options?: RequestInit
+): Promise<IdentityProviderConfigApi> => {
+    return apiMutator<IdentityProviderConfigApi>(getIdentityProviderConfigsPartialUpdateUrl(organizationId, id), {
+        ...options,
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(patchedIdentityProviderConfigApi),
+    })
+}
+
+export const getIdentityProviderConfigsDestroyUrl = (organizationId: string, id: string) => {
+    return `/api/organizations/${organizationId}/identity_provider_configs/${id}/`
+}
+
+export const identityProviderConfigsDestroy = async (
+    organizationId: string,
+    id: string,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getIdentityProviderConfigsDestroyUrl(organizationId, id), {
+        ...options,
+        method: 'DELETE',
+    })
+}
+
+export const getIdentityProviderConfigsScimLogsRetrieveUrl = (
+    organizationId: string,
+    id: string,
+    params?: IdentityProviderConfigsScimLogsRetrieveParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/organizations/${organizationId}/identity_provider_configs/${id}/scim/logs/?${stringifiedParams}`
+        : `/api/organizations/${organizationId}/identity_provider_configs/${id}/scim/logs/`
+}
+
+export const identityProviderConfigsScimLogsRetrieve = async (
+    organizationId: string,
+    id: string,
+    params?: IdentityProviderConfigsScimLogsRetrieveParams,
+    options?: RequestInit
+): Promise<PaginatedSCIMRequestLogApi> => {
+    return apiMutator<PaginatedSCIMRequestLogApi>(
+        getIdentityProviderConfigsScimLogsRetrieveUrl(organizationId, id, params),
+        {
+            ...options,
+            method: 'GET',
+        }
+    )
+}
+
+export const getIdentityProviderConfigsScimTokenCreateUrl = (organizationId: string, id: string) => {
+    return `/api/organizations/${organizationId}/identity_provider_configs/${id}/scim/token/`
+}
+
+/**
+ * Regenerate the SCIM bearer token for this IdP config.
+ */
+export const identityProviderConfigsScimTokenCreate = async (
+    organizationId: string,
+    id: string,
+    options?: RequestInit
+): Promise<SCIMTokenResponseApi> => {
+    return apiMutator<SCIMTokenResponseApi>(getIdentityProviderConfigsScimTokenCreateUrl(organizationId, id), {
+        ...options,
+        method: 'POST',
+    })
+}
+
 export const getInvitesListUrl = (organizationId: string, params?: InvitesListParams) => {
     const normalizedParams = new URLSearchParams()
 
     Object.entries(params || {}).forEach(([key, value]) => {
         if (value !== undefined) {
-            normalizedParams.append(key, value === null ? 'null' : value.toString())
+            normalizedParams.append(key, value === null ? 'null' : String(value))
         }
     })
 
@@ -312,108 +693,103 @@ export const invitesBulkCreate = async (
     })
 }
 
-export const getMembersListUrl = (organizationId: string, params?: MembersListParams) => {
+export const getInvitesDelegateCreateUrl = (organizationId: string) => {
+    return `/api/organizations/${organizationId}/invites/delegate/`
+}
+
+/**
+ * Create an onboarding delegation invite: an admin-level invite flagged as a setup delegation.
+ * Sends a single dedicated delegation email and records the inviting user as having delegated.
+ */
+export const invitesDelegateCreate = async (
+    organizationId: string,
+    organizationInviteDelegateApi: OrganizationInviteDelegateApi,
+    options?: RequestInit
+): Promise<OrganizationInviteApi> => {
+    return apiMutator<OrganizationInviteApi>(getInvitesDelegateCreateUrl(organizationId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(organizationInviteDelegateApi),
+    })
+}
+
+export const getNotificationLocksListUrl = (organizationId: string) => {
+    return `/api/organizations/${organizationId}/notification_locks/`
+}
+
+/**
+ * List the organization's members with their own notification settings and the locks in force for each.
+ */
+export const notificationLocksList = async (
+    organizationId: string,
+    options?: RequestInit
+): Promise<OrganizationNotificationMemberApi[]> => {
+    return apiMutator<OrganizationNotificationMemberApi[]>(getNotificationLocksListUrl(organizationId), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getNotificationLocksBulkUpdateCreateUrl = (organizationId: string) => {
+    return `/api/organizations/${organizationId}/notification_locks/bulk_update/`
+}
+
+/**
+ * Lock or unlock notification settings for members of this organization. Each affected member is notified in the app.
+ */
+export const notificationLocksBulkUpdateCreate = async (
+    organizationId: string,
+    organizationNotificationLockBulkUpdateApi: OrganizationNotificationLockBulkUpdateApi,
+    options?: RequestInit
+): Promise<OrganizationNotificationMemberApi[]> => {
+    return apiMutator<OrganizationNotificationMemberApi[]>(getNotificationLocksBulkUpdateCreateUrl(organizationId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(organizationNotificationLockBulkUpdateApi),
+    })
+}
+
+export const getOauthApplicationsListUrl = (organizationId: string, params?: OauthApplicationsListParams) => {
     const normalizedParams = new URLSearchParams()
 
     Object.entries(params || {}).forEach(([key, value]) => {
         if (value !== undefined) {
-            normalizedParams.append(key, value === null ? 'null' : value.toString())
+            normalizedParams.append(key, value === null ? 'null' : String(value))
         }
     })
 
     const stringifiedParams = normalizedParams.toString()
 
     return stringifiedParams.length > 0
-        ? `/api/organizations/${organizationId}/members/?${stringifiedParams}`
-        : `/api/organizations/${organizationId}/members/`
-}
-
-export const membersList = async (
-    organizationId: string,
-    params?: MembersListParams,
-    options?: RequestInit
-): Promise<PaginatedOrganizationMemberListApi> => {
-    return apiMutator<PaginatedOrganizationMemberListApi>(getMembersListUrl(organizationId, params), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getMembersUpdateUrl = (organizationId: string, userUuid: string) => {
-    return `/api/organizations/${organizationId}/members/${userUuid}/`
-}
-
-export const membersUpdate = async (
-    organizationId: string,
-    userUuid: string,
-    organizationMemberApi: NonReadonly<OrganizationMemberApi>,
-    options?: RequestInit
-): Promise<OrganizationMemberApi> => {
-    return apiMutator<OrganizationMemberApi>(getMembersUpdateUrl(organizationId, userUuid), {
-        ...options,
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(organizationMemberApi),
-    })
-}
-
-export const getMembersPartialUpdateUrl = (organizationId: string, userUuid: string) => {
-    return `/api/organizations/${organizationId}/members/${userUuid}/`
-}
-
-export const membersPartialUpdate = async (
-    organizationId: string,
-    userUuid: string,
-    patchedOrganizationMemberApi: NonReadonly<PatchedOrganizationMemberApi>,
-    options?: RequestInit
-): Promise<OrganizationMemberApi> => {
-    return apiMutator<OrganizationMemberApi>(getMembersPartialUpdateUrl(organizationId, userUuid), {
-        ...options,
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(patchedOrganizationMemberApi),
-    })
-}
-
-export const getMembersDestroyUrl = (organizationId: string, userUuid: string) => {
-    return `/api/organizations/${organizationId}/members/${userUuid}/`
-}
-
-export const membersDestroy = async (
-    organizationId: string,
-    userUuid: string,
-    options?: RequestInit
-): Promise<void> => {
-    return apiMutator<void>(getMembersDestroyUrl(organizationId, userUuid), {
-        ...options,
-        method: 'DELETE',
-    })
-}
-
-export const getMembersScopedApiKeysRetrieveUrl = (organizationId: string, userUuid: string) => {
-    return `/api/organizations/${organizationId}/members/${userUuid}/scoped_api_keys/`
-}
-
-export const membersScopedApiKeysRetrieve = async (
-    organizationId: string,
-    userUuid: string,
-    options?: RequestInit
-): Promise<OrganizationMemberApi> => {
-    return apiMutator<OrganizationMemberApi>(getMembersScopedApiKeysRetrieveUrl(organizationId, userUuid), {
-        ...options,
-        method: 'GET',
-    })
+        ? `/api/organizations/${organizationId}/oauth_applications/?${stringifiedParams}`
+        : `/api/organizations/${organizationId}/oauth_applications/`
 }
 
 /**
- * Projects for the current organization.
+ * ViewSet for listing OAuth applications at the organization level (read-only).
  */
-export const getList2Url = (organizationId: string, params?: List2Params) => {
+export const oauthApplicationsList = async (
+    organizationId: string,
+    params?: OauthApplicationsListParams,
+    options?: RequestInit
+): Promise<PaginatedOrganizationOAuthApplicationListApi> => {
+    return apiMutator<PaginatedOrganizationOAuthApplicationListApi>(
+        getOauthApplicationsListUrl(organizationId, params),
+        {
+            ...options,
+            method: 'GET',
+        }
+    )
+}
+
+export const getOrganizationsProjectsListUrl = (organizationId: string, params?: OrganizationsProjectsListParams) => {
     const normalizedParams = new URLSearchParams()
 
     Object.entries(params || {}).forEach(([key, value]) => {
         if (value !== undefined) {
-            normalizedParams.append(key, value === null ? 'null' : value.toString())
+            normalizedParams.append(key, value === null ? 'null' : String(value))
         }
     })
 
@@ -424,30 +800,36 @@ export const getList2Url = (organizationId: string, params?: List2Params) => {
         : `/api/organizations/${organizationId}/projects/`
 }
 
-export const list2 = async (
-    organizationId: string,
-    params?: List2Params,
-    options?: RequestInit
-): Promise<PaginatedProjectBackwardCompatBasicListApi> => {
-    return apiMutator<PaginatedProjectBackwardCompatBasicListApi>(getList2Url(organizationId, params), {
-        ...options,
-        method: 'GET',
-    })
-}
-
 /**
  * Projects for the current organization.
  */
-export const getCreate2Url = (organizationId: string) => {
+export const organizationsProjectsList = async (
+    organizationId: string,
+    params?: OrganizationsProjectsListParams,
+    options?: RequestInit
+): Promise<PaginatedProjectBackwardCompatBasicListApi> => {
+    return apiMutator<PaginatedProjectBackwardCompatBasicListApi>(
+        getOrganizationsProjectsListUrl(organizationId, params),
+        {
+            ...options,
+            method: 'GET',
+        }
+    )
+}
+
+export const getOrganizationsProjectsCreateUrl = (organizationId: string) => {
     return `/api/organizations/${organizationId}/projects/`
 }
 
-export const create2 = async (
+/**
+ * Projects for the current organization.
+ */
+export const organizationsProjectsCreate = async (
     organizationId: string,
-    projectBackwardCompatApi: NonReadonly<ProjectBackwardCompatApi>,
+    projectBackwardCompatApi?: NonReadonly<ProjectBackwardCompatApi>,
     options?: RequestInit
 ): Promise<ProjectBackwardCompatApi> => {
-    return apiMutator<ProjectBackwardCompatApi>(getCreate2Url(organizationId), {
+    return apiMutator<ProjectBackwardCompatApi>(getOrganizationsProjectsCreateUrl(organizationId), {
         ...options,
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...options?.headers },
@@ -455,38 +837,38 @@ export const create2 = async (
     })
 }
 
-/**
- * Projects for the current organization.
- */
-export const getRetrieve2Url = (organizationId: string, id: number) => {
+export const getOrganizationsProjectsRetrieveUrl = (organizationId: string, id: number) => {
     return `/api/organizations/${organizationId}/projects/${id}/`
 }
 
-export const retrieve2 = async (
+/**
+ * Retrieve a project and its settings.
+ */
+export const organizationsProjectsRetrieve = async (
     organizationId: string,
     id: number,
     options?: RequestInit
 ): Promise<ProjectBackwardCompatApi> => {
-    return apiMutator<ProjectBackwardCompatApi>(getRetrieve2Url(organizationId, id), {
+    return apiMutator<ProjectBackwardCompatApi>(getOrganizationsProjectsRetrieveUrl(organizationId, id), {
         ...options,
         method: 'GET',
     })
 }
 
-/**
- * Projects for the current organization.
- */
-export const getUpdate2Url = (organizationId: string, id: number) => {
+export const getOrganizationsProjectsUpdateUrl = (organizationId: string, id: number) => {
     return `/api/organizations/${organizationId}/projects/${id}/`
 }
 
-export const update2 = async (
+/**
+ * Replace a project and its settings. Prefer the PATCH endpoint for partial updates — PUT requires every writable field to be provided.
+ */
+export const organizationsProjectsUpdate = async (
     organizationId: string,
     id: number,
-    projectBackwardCompatApi: NonReadonly<ProjectBackwardCompatApi>,
+    projectBackwardCompatApi?: NonReadonly<ProjectBackwardCompatApi>,
     options?: RequestInit
 ): Promise<ProjectBackwardCompatApi> => {
-    return apiMutator<ProjectBackwardCompatApi>(getUpdate2Url(organizationId, id), {
+    return apiMutator<ProjectBackwardCompatApi>(getOrganizationsProjectsUpdateUrl(organizationId, id), {
         ...options,
         method: 'PUT',
         headers: { 'Content-Type': 'application/json', ...options?.headers },
@@ -494,20 +876,20 @@ export const update2 = async (
     })
 }
 
-/**
- * Projects for the current organization.
- */
-export const getPartialUpdate2Url = (organizationId: string, id: number) => {
+export const getOrganizationsProjectsPartialUpdateUrl = (organizationId: string, id: number) => {
     return `/api/organizations/${organizationId}/projects/${id}/`
 }
 
-export const partialUpdate2 = async (
+/**
+ * Update one or more of a project's settings. Only the fields included in the request body are changed.
+ */
+export const organizationsProjectsPartialUpdate = async (
     organizationId: string,
     id: number,
-    patchedProjectBackwardCompatApi: NonReadonly<PatchedProjectBackwardCompatApi>,
+    patchedProjectBackwardCompatApi?: NonReadonly<PatchedProjectBackwardCompatApi>,
     options?: RequestInit
 ): Promise<ProjectBackwardCompatApi> => {
-    return apiMutator<ProjectBackwardCompatApi>(getPartialUpdate2Url(organizationId, id), {
+    return apiMutator<ProjectBackwardCompatApi>(getOrganizationsProjectsPartialUpdateUrl(organizationId, id), {
         ...options,
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json', ...options?.headers },
@@ -515,864 +897,572 @@ export const partialUpdate2 = async (
     })
 }
 
-/**
- * Projects for the current organization.
- */
-export const getDestroy2Url = (organizationId: string, id: number) => {
+export const getOrganizationsProjectsDestroyUrl = (organizationId: string, id: number) => {
     return `/api/organizations/${organizationId}/projects/${id}/`
 }
 
-export const destroy2 = async (organizationId: string, id: number, options?: RequestInit): Promise<void> => {
-    return apiMutator<void>(getDestroy2Url(organizationId, id), {
+/**
+ * Projects for the current organization.
+ */
+export const organizationsProjectsDestroy = async (
+    organizationId: string,
+    id: number,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getOrganizationsProjectsDestroyUrl(organizationId, id), {
         ...options,
         method: 'DELETE',
     })
 }
 
-/**
- * Projects for the current organization.
- */
-export const getActivityRetrieveUrl = (organizationId: string, id: number) => {
+export const getOrganizationsProjectsActivityRetrieveUrl = (organizationId: string, id: number) => {
     return `/api/organizations/${organizationId}/projects/${id}/activity/`
 }
 
-export const activityRetrieve = async (
+/**
+ * Projects for the current organization.
+ */
+export const organizationsProjectsActivityRetrieve = async (
     organizationId: string,
     id: number,
     options?: RequestInit
 ): Promise<ProjectBackwardCompatApi> => {
-    return apiMutator<ProjectBackwardCompatApi>(getActivityRetrieveUrl(organizationId, id), {
+    return apiMutator<ProjectBackwardCompatApi>(getOrganizationsProjectsActivityRetrieveUrl(organizationId, id), {
         ...options,
         method: 'GET',
     })
 }
 
-/**
- * Projects for the current organization.
- */
-export const getAddProductIntentPartialUpdateUrl = (organizationId: string, id: number) => {
+export const getOrganizationsProjectsAddProductIntentPartialUpdateUrl = (organizationId: string, id: number) => {
     return `/api/organizations/${organizationId}/projects/${id}/add_product_intent/`
 }
 
-export const addProductIntentPartialUpdate = async (
-    organizationId: string,
-    id: number,
-    patchedProjectBackwardCompatApi: NonReadonly<PatchedProjectBackwardCompatApi>,
-    options?: RequestInit
-): Promise<ProjectBackwardCompatApi> => {
-    return apiMutator<ProjectBackwardCompatApi>(getAddProductIntentPartialUpdateUrl(organizationId, id), {
-        ...options,
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(patchedProjectBackwardCompatApi),
-    })
-}
-
 /**
  * Projects for the current organization.
  */
-export const getChangeOrganizationCreateUrl = (organizationId: string, id: number) => {
+export const organizationsProjectsAddProductIntentPartialUpdate = async (
+    organizationId: string,
+    id: number,
+    patchedProjectBackwardCompatApi?: NonReadonly<PatchedProjectBackwardCompatApi>,
+    options?: RequestInit
+): Promise<ProjectBackwardCompatApi> => {
+    return apiMutator<ProjectBackwardCompatApi>(
+        getOrganizationsProjectsAddProductIntentPartialUpdateUrl(organizationId, id),
+        {
+            ...options,
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json', ...options?.headers },
+            body: JSON.stringify(patchedProjectBackwardCompatApi),
+        }
+    )
+}
+
+export const getOrganizationsProjectsChangeOrganizationCreateUrl = (organizationId: string, id: number) => {
     return `/api/organizations/${organizationId}/projects/${id}/change_organization/`
 }
 
-export const changeOrganizationCreate = async (
-    organizationId: string,
-    id: number,
-    projectBackwardCompatApi: NonReadonly<ProjectBackwardCompatApi>,
-    options?: RequestInit
-): Promise<ProjectBackwardCompatApi> => {
-    return apiMutator<ProjectBackwardCompatApi>(getChangeOrganizationCreateUrl(organizationId, id), {
-        ...options,
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(projectBackwardCompatApi),
-    })
-}
-
 /**
  * Projects for the current organization.
  */
-export const getCompleteProductOnboardingPartialUpdateUrl = (organizationId: string, id: number) => {
+export const organizationsProjectsChangeOrganizationCreate = async (
+    organizationId: string,
+    id: number,
+    projectBackwardCompatApi?: NonReadonly<ProjectBackwardCompatApi>,
+    options?: RequestInit
+): Promise<ProjectBackwardCompatApi> => {
+    return apiMutator<ProjectBackwardCompatApi>(
+        getOrganizationsProjectsChangeOrganizationCreateUrl(organizationId, id),
+        {
+            ...options,
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...options?.headers },
+            body: JSON.stringify(projectBackwardCompatApi),
+        }
+    )
+}
+
+export const getOrganizationsProjectsCompleteProductOnboardingPartialUpdateUrl = (
+    organizationId: string,
+    id: number
+) => {
     return `/api/organizations/${organizationId}/projects/${id}/complete_product_onboarding/`
 }
 
-export const completeProductOnboardingPartialUpdate = async (
-    organizationId: string,
-    id: number,
-    patchedProjectBackwardCompatApi: NonReadonly<PatchedProjectBackwardCompatApi>,
-    options?: RequestInit
-): Promise<ProjectBackwardCompatApi> => {
-    return apiMutator<ProjectBackwardCompatApi>(getCompleteProductOnboardingPartialUpdateUrl(organizationId, id), {
-        ...options,
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(patchedProjectBackwardCompatApi),
-    })
-}
-
 /**
  * Projects for the current organization.
  */
-export const getDeleteSecretTokenBackupPartialUpdateUrl = (organizationId: string, id: number) => {
+export const organizationsProjectsCompleteProductOnboardingPartialUpdate = async (
+    organizationId: string,
+    id: number,
+    patchedProjectBackwardCompatApi?: NonReadonly<PatchedProjectBackwardCompatApi>,
+    options?: RequestInit
+): Promise<ProjectBackwardCompatApi> => {
+    return apiMutator<ProjectBackwardCompatApi>(
+        getOrganizationsProjectsCompleteProductOnboardingPartialUpdateUrl(organizationId, id),
+        {
+            ...options,
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json', ...options?.headers },
+            body: JSON.stringify(patchedProjectBackwardCompatApi),
+        }
+    )
+}
+
+export const getOrganizationsProjectsDefaultEvaluationContextsRetrieveUrl = (organizationId: string, id: number) => {
+    return `/api/organizations/${organizationId}/projects/${id}/default_evaluation_contexts/`
+}
+
+/**
+ * Manage default evaluation contexts for a project. Members can read; writing requires
+ * project admin, matching the admin-only settings UI.
+ */
+export const organizationsProjectsDefaultEvaluationContextsRetrieve = async (
+    organizationId: string,
+    id: number,
+    options?: RequestInit
+): Promise<ProjectBackwardCompatApi> => {
+    return apiMutator<ProjectBackwardCompatApi>(
+        getOrganizationsProjectsDefaultEvaluationContextsRetrieveUrl(organizationId, id),
+        {
+            ...options,
+            method: 'GET',
+        }
+    )
+}
+
+export const getOrganizationsProjectsDefaultEvaluationContextsCreateUrl = (organizationId: string, id: number) => {
+    return `/api/organizations/${organizationId}/projects/${id}/default_evaluation_contexts/`
+}
+
+/**
+ * Manage default evaluation contexts for a project. Members can read; writing requires
+ * project admin, matching the admin-only settings UI.
+ */
+export const organizationsProjectsDefaultEvaluationContextsCreate = async (
+    organizationId: string,
+    id: number,
+    projectBackwardCompatApi?: NonReadonly<ProjectBackwardCompatApi>,
+    options?: RequestInit
+): Promise<ProjectBackwardCompatApi> => {
+    return apiMutator<ProjectBackwardCompatApi>(
+        getOrganizationsProjectsDefaultEvaluationContextsCreateUrl(organizationId, id),
+        {
+            ...options,
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...options?.headers },
+            body: JSON.stringify(projectBackwardCompatApi),
+        }
+    )
+}
+
+export const getOrganizationsProjectsDefaultEvaluationContextsDestroyUrl = (organizationId: string, id: number) => {
+    return `/api/organizations/${organizationId}/projects/${id}/default_evaluation_contexts/`
+}
+
+/**
+ * Manage default evaluation contexts for a project. Members can read; writing requires
+ * project admin, matching the admin-only settings UI.
+ */
+export const organizationsProjectsDefaultEvaluationContextsDestroy = async (
+    organizationId: string,
+    id: number,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getOrganizationsProjectsDefaultEvaluationContextsDestroyUrl(organizationId, id), {
+        ...options,
+        method: 'DELETE',
+    })
+}
+
+export const getOrganizationsProjectsDefaultReleaseConditionsRetrieveUrl = (organizationId: string, id: number) => {
+    return `/api/organizations/${organizationId}/projects/${id}/default_release_conditions/`
+}
+
+/**
+ * Manage default release conditions for new feature flags in this project. Members can read;
+ * writing requires project admin, matching the admin-only settings UI.
+ */
+export const organizationsProjectsDefaultReleaseConditionsRetrieve = async (
+    organizationId: string,
+    id: number,
+    options?: RequestInit
+): Promise<ProjectBackwardCompatApi> => {
+    return apiMutator<ProjectBackwardCompatApi>(
+        getOrganizationsProjectsDefaultReleaseConditionsRetrieveUrl(organizationId, id),
+        {
+            ...options,
+            method: 'GET',
+        }
+    )
+}
+
+export const getOrganizationsProjectsDefaultReleaseConditionsUpdateUrl = (organizationId: string, id: number) => {
+    return `/api/organizations/${organizationId}/projects/${id}/default_release_conditions/`
+}
+
+/**
+ * Manage default release conditions for new feature flags in this project. Members can read;
+ * writing requires project admin, matching the admin-only settings UI.
+ */
+export const organizationsProjectsDefaultReleaseConditionsUpdate = async (
+    organizationId: string,
+    id: number,
+    projectBackwardCompatApi?: NonReadonly<ProjectBackwardCompatApi>,
+    options?: RequestInit
+): Promise<ProjectBackwardCompatApi> => {
+    return apiMutator<ProjectBackwardCompatApi>(
+        getOrganizationsProjectsDefaultReleaseConditionsUpdateUrl(organizationId, id),
+        {
+            ...options,
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', ...options?.headers },
+            body: JSON.stringify(projectBackwardCompatApi),
+        }
+    )
+}
+
+export const getOrganizationsProjectsDeleteSecretTokenBackupPartialUpdateUrl = (organizationId: string, id: number) => {
     return `/api/organizations/${organizationId}/projects/${id}/delete_secret_token_backup/`
 }
 
-export const deleteSecretTokenBackupPartialUpdate = async (
-    organizationId: string,
-    id: number,
-    patchedProjectBackwardCompatApi: NonReadonly<PatchedProjectBackwardCompatApi>,
-    options?: RequestInit
-): Promise<ProjectBackwardCompatApi> => {
-    return apiMutator<ProjectBackwardCompatApi>(getDeleteSecretTokenBackupPartialUpdateUrl(organizationId, id), {
-        ...options,
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(patchedProjectBackwardCompatApi),
-    })
-}
-
 /**
  * Projects for the current organization.
  */
-export const getGenerateConversationsPublicTokenCreateUrl = (organizationId: string, id: number) => {
-    return `/api/organizations/${organizationId}/projects/${id}/generate_conversations_public_token/`
-}
-
-export const generateConversationsPublicTokenCreate = async (
+export const organizationsProjectsDeleteSecretTokenBackupPartialUpdate = async (
     organizationId: string,
     id: number,
-    projectBackwardCompatApi: NonReadonly<ProjectBackwardCompatApi>,
+    patchedProjectBackwardCompatApi?: NonReadonly<PatchedProjectBackwardCompatApi>,
     options?: RequestInit
 ): Promise<ProjectBackwardCompatApi> => {
-    return apiMutator<ProjectBackwardCompatApi>(getGenerateConversationsPublicTokenCreateUrl(organizationId, id), {
-        ...options,
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(projectBackwardCompatApi),
-    })
-}
-
-/**
- * Projects for the current organization.
- */
-export const getIsGeneratingDemoDataRetrieveUrl = (organizationId: string, id: number) => {
-    return `/api/organizations/${organizationId}/projects/${id}/is_generating_demo_data/`
-}
-
-export const isGeneratingDemoDataRetrieve = async (
-    organizationId: string,
-    id: number,
-    options?: RequestInit
-): Promise<ProjectBackwardCompatApi> => {
-    return apiMutator<ProjectBackwardCompatApi>(getIsGeneratingDemoDataRetrieveUrl(organizationId, id), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-/**
- * Projects for the current organization.
- */
-export const getResetTokenPartialUpdateUrl = (organizationId: string, id: number) => {
-    return `/api/organizations/${organizationId}/projects/${id}/reset_token/`
-}
-
-export const resetTokenPartialUpdate = async (
-    organizationId: string,
-    id: number,
-    patchedProjectBackwardCompatApi: NonReadonly<PatchedProjectBackwardCompatApi>,
-    options?: RequestInit
-): Promise<ProjectBackwardCompatApi> => {
-    return apiMutator<ProjectBackwardCompatApi>(getResetTokenPartialUpdateUrl(organizationId, id), {
-        ...options,
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(patchedProjectBackwardCompatApi),
-    })
-}
-
-/**
- * Projects for the current organization.
- */
-export const getRotateSecretTokenPartialUpdateUrl = (organizationId: string, id: number) => {
-    return `/api/organizations/${organizationId}/projects/${id}/rotate_secret_token/`
-}
-
-export const rotateSecretTokenPartialUpdate = async (
-    organizationId: string,
-    id: number,
-    patchedProjectBackwardCompatApi: NonReadonly<PatchedProjectBackwardCompatApi>,
-    options?: RequestInit
-): Promise<ProjectBackwardCompatApi> => {
-    return apiMutator<ProjectBackwardCompatApi>(getRotateSecretTokenPartialUpdateUrl(organizationId, id), {
-        ...options,
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(patchedProjectBackwardCompatApi),
-    })
-}
-
-export const getRolesListUrl = (organizationId: string, params?: RolesListParams) => {
-    const normalizedParams = new URLSearchParams()
-
-    Object.entries(params || {}).forEach(([key, value]) => {
-        if (value !== undefined) {
-            normalizedParams.append(key, value === null ? 'null' : value.toString())
+    return apiMutator<ProjectBackwardCompatApi>(
+        getOrganizationsProjectsDeleteSecretTokenBackupPartialUpdateUrl(organizationId, id),
+        {
+            ...options,
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json', ...options?.headers },
+            body: JSON.stringify(patchedProjectBackwardCompatApi),
         }
-    })
-
-    const stringifiedParams = normalizedParams.toString()
-
-    return stringifiedParams.length > 0
-        ? `/api/organizations/${organizationId}/roles/?${stringifiedParams}`
-        : `/api/organizations/${organizationId}/roles/`
+    )
 }
 
-export const rolesList = async (
+export const getOrganizationsProjectsEventIngestionRestrictionsListUrl = (
     organizationId: string,
-    params?: RolesListParams,
-    options?: RequestInit
-): Promise<PaginatedRoleListApi> => {
-    return apiMutator<PaginatedRoleListApi>(getRolesListUrl(organizationId, params), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getRolesCreateUrl = (organizationId: string) => {
-    return `/api/organizations/${organizationId}/roles/`
-}
-
-export const rolesCreate = async (
-    organizationId: string,
-    roleApi: NonReadonly<RoleApi>,
-    options?: RequestInit
-): Promise<RoleApi> => {
-    return apiMutator<RoleApi>(getRolesCreateUrl(organizationId), {
-        ...options,
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(roleApi),
-    })
-}
-
-export const getRolesRetrieveUrl = (organizationId: string, id: string) => {
-    return `/api/organizations/${organizationId}/roles/${id}/`
-}
-
-export const rolesRetrieve = async (organizationId: string, id: string, options?: RequestInit): Promise<RoleApi> => {
-    return apiMutator<RoleApi>(getRolesRetrieveUrl(organizationId, id), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getRolesUpdateUrl = (organizationId: string, id: string) => {
-    return `/api/organizations/${organizationId}/roles/${id}/`
-}
-
-export const rolesUpdate = async (
-    organizationId: string,
-    id: string,
-    roleApi: NonReadonly<RoleApi>,
-    options?: RequestInit
-): Promise<RoleApi> => {
-    return apiMutator<RoleApi>(getRolesUpdateUrl(organizationId, id), {
-        ...options,
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(roleApi),
-    })
-}
-
-export const getRolesPartialUpdateUrl = (organizationId: string, id: string) => {
-    return `/api/organizations/${organizationId}/roles/${id}/`
-}
-
-export const rolesPartialUpdate = async (
-    organizationId: string,
-    id: string,
-    patchedRoleApi: NonReadonly<PatchedRoleApi>,
-    options?: RequestInit
-): Promise<RoleApi> => {
-    return apiMutator<RoleApi>(getRolesPartialUpdateUrl(organizationId, id), {
-        ...options,
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(patchedRoleApi),
-    })
-}
-
-export const getRolesDestroyUrl = (organizationId: string, id: string) => {
-    return `/api/organizations/${organizationId}/roles/${id}/`
-}
-
-export const rolesDestroy = async (organizationId: string, id: string, options?: RequestInit): Promise<void> => {
-    return apiMutator<void>(getRolesDestroyUrl(organizationId, id), {
-        ...options,
-        method: 'DELETE',
-    })
-}
-
-/**
- * Create, Read, Update and Delete annotations. [See docs](https://posthog.com/docs/data/annotations) for more information on annotations.
- */
-export const getAnnotationsListUrl = (projectId: string, params?: AnnotationsListParams) => {
-    const normalizedParams = new URLSearchParams()
-
-    Object.entries(params || {}).forEach(([key, value]) => {
-        if (value !== undefined) {
-            normalizedParams.append(key, value === null ? 'null' : value.toString())
-        }
-    })
-
-    const stringifiedParams = normalizedParams.toString()
-
-    return stringifiedParams.length > 0
-        ? `/api/projects/${projectId}/annotations/?${stringifiedParams}`
-        : `/api/projects/${projectId}/annotations/`
-}
-
-export const annotationsList = async (
-    projectId: string,
-    params?: AnnotationsListParams,
-    options?: RequestInit
-): Promise<PaginatedAnnotationListApi> => {
-    return apiMutator<PaginatedAnnotationListApi>(getAnnotationsListUrl(projectId, params), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-/**
- * Create, Read, Update and Delete annotations. [See docs](https://posthog.com/docs/data/annotations) for more information on annotations.
- */
-export const getAnnotationsCreateUrl = (projectId: string) => {
-    return `/api/projects/${projectId}/annotations/`
-}
-
-export const annotationsCreate = async (
-    projectId: string,
-    annotationApi: NonReadonly<AnnotationApi>,
-    options?: RequestInit
-): Promise<AnnotationApi> => {
-    return apiMutator<AnnotationApi>(getAnnotationsCreateUrl(projectId), {
-        ...options,
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(annotationApi),
-    })
-}
-
-/**
- * Create, Read, Update and Delete annotations. [See docs](https://posthog.com/docs/data/annotations) for more information on annotations.
- */
-export const getAnnotationsRetrieveUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/annotations/${id}/`
-}
-
-export const annotationsRetrieve = async (
-    projectId: string,
     id: number,
-    options?: RequestInit
-): Promise<AnnotationApi> => {
-    return apiMutator<AnnotationApi>(getAnnotationsRetrieveUrl(projectId, id), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-/**
- * Create, Read, Update and Delete annotations. [See docs](https://posthog.com/docs/data/annotations) for more information on annotations.
- */
-export const getAnnotationsUpdateUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/annotations/${id}/`
-}
-
-export const annotationsUpdate = async (
-    projectId: string,
-    id: number,
-    annotationApi: NonReadonly<AnnotationApi>,
-    options?: RequestInit
-): Promise<AnnotationApi> => {
-    return apiMutator<AnnotationApi>(getAnnotationsUpdateUrl(projectId, id), {
-        ...options,
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(annotationApi),
-    })
-}
-
-/**
- * Create, Read, Update and Delete annotations. [See docs](https://posthog.com/docs/data/annotations) for more information on annotations.
- */
-export const getAnnotationsPartialUpdateUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/annotations/${id}/`
-}
-
-export const annotationsPartialUpdate = async (
-    projectId: string,
-    id: number,
-    patchedAnnotationApi: NonReadonly<PatchedAnnotationApi>,
-    options?: RequestInit
-): Promise<AnnotationApi> => {
-    return apiMutator<AnnotationApi>(getAnnotationsPartialUpdateUrl(projectId, id), {
-        ...options,
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(patchedAnnotationApi),
-    })
-}
-
-/**
- * Hard delete of this model is not allowed. Use a patch API call to set "deleted" to true
- */
-export const getAnnotationsDestroyUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/annotations/${id}/`
-}
-
-export const annotationsDestroy = async (projectId: string, id: number, options?: RequestInit): Promise<unknown> => {
-    return apiMutator<unknown>(getAnnotationsDestroyUrl(projectId, id), {
-        ...options,
-        method: 'DELETE',
-    })
-}
-
-export const getCommentsListUrl = (projectId: string, params?: CommentsListParams) => {
-    const normalizedParams = new URLSearchParams()
-
-    Object.entries(params || {}).forEach(([key, value]) => {
-        if (value !== undefined) {
-            normalizedParams.append(key, value === null ? 'null' : value.toString())
-        }
-    })
-
-    const stringifiedParams = normalizedParams.toString()
-
-    return stringifiedParams.length > 0
-        ? `/api/projects/${projectId}/comments/?${stringifiedParams}`
-        : `/api/projects/${projectId}/comments/`
-}
-
-export const commentsList = async (
-    projectId: string,
-    params?: CommentsListParams,
-    options?: RequestInit
-): Promise<PaginatedCommentListApi> => {
-    return apiMutator<PaginatedCommentListApi>(getCommentsListUrl(projectId, params), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getCommentsCreateUrl = (projectId: string) => {
-    return `/api/projects/${projectId}/comments/`
-}
-
-export const commentsCreate = async (
-    projectId: string,
-    commentApi: NonReadonly<CommentApi>,
-    options?: RequestInit
-): Promise<CommentApi> => {
-    return apiMutator<CommentApi>(getCommentsCreateUrl(projectId), {
-        ...options,
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(commentApi),
-    })
-}
-
-export const getCommentsRetrieveUrl = (projectId: string, id: string) => {
-    return `/api/projects/${projectId}/comments/${id}/`
-}
-
-export const commentsRetrieve = async (projectId: string, id: string, options?: RequestInit): Promise<CommentApi> => {
-    return apiMutator<CommentApi>(getCommentsRetrieveUrl(projectId, id), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getCommentsUpdateUrl = (projectId: string, id: string) => {
-    return `/api/projects/${projectId}/comments/${id}/`
-}
-
-export const commentsUpdate = async (
-    projectId: string,
-    id: string,
-    commentApi: NonReadonly<CommentApi>,
-    options?: RequestInit
-): Promise<CommentApi> => {
-    return apiMutator<CommentApi>(getCommentsUpdateUrl(projectId, id), {
-        ...options,
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(commentApi),
-    })
-}
-
-export const getCommentsPartialUpdateUrl = (projectId: string, id: string) => {
-    return `/api/projects/${projectId}/comments/${id}/`
-}
-
-export const commentsPartialUpdate = async (
-    projectId: string,
-    id: string,
-    patchedCommentApi: NonReadonly<PatchedCommentApi>,
-    options?: RequestInit
-): Promise<CommentApi> => {
-    return apiMutator<CommentApi>(getCommentsPartialUpdateUrl(projectId, id), {
-        ...options,
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(patchedCommentApi),
-    })
-}
-
-/**
- * Hard delete of this model is not allowed. Use a patch API call to set "deleted" to true
- */
-export const getCommentsDestroyUrl = (projectId: string, id: string) => {
-    return `/api/projects/${projectId}/comments/${id}/`
-}
-
-export const commentsDestroy = async (projectId: string, id: string, options?: RequestInit): Promise<unknown> => {
-    return apiMutator<unknown>(getCommentsDestroyUrl(projectId, id), {
-        ...options,
-        method: 'DELETE',
-    })
-}
-
-export const getCommentsThreadRetrieveUrl = (projectId: string, id: string) => {
-    return `/api/projects/${projectId}/comments/${id}/thread/`
-}
-
-export const commentsThreadRetrieve = async (projectId: string, id: string, options?: RequestInit): Promise<void> => {
-    return apiMutator<void>(getCommentsThreadRetrieveUrl(projectId, id), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getCommentsCountRetrieveUrl = (projectId: string) => {
-    return `/api/projects/${projectId}/comments/count/`
-}
-
-export const commentsCountRetrieve = async (projectId: string, options?: RequestInit): Promise<void> => {
-    return apiMutator<void>(getCommentsCountRetrieveUrl(projectId), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getDashboardTemplatesListUrl = (projectId: string, params?: DashboardTemplatesListParams) => {
-    const normalizedParams = new URLSearchParams()
-
-    Object.entries(params || {}).forEach(([key, value]) => {
-        if (value !== undefined) {
-            normalizedParams.append(key, value === null ? 'null' : value.toString())
-        }
-    })
-
-    const stringifiedParams = normalizedParams.toString()
-
-    return stringifiedParams.length > 0
-        ? `/api/projects/${projectId}/dashboard_templates/?${stringifiedParams}`
-        : `/api/projects/${projectId}/dashboard_templates/`
-}
-
-export const dashboardTemplatesList = async (
-    projectId: string,
-    params?: DashboardTemplatesListParams,
-    options?: RequestInit
-): Promise<PaginatedDashboardTemplateListApi> => {
-    return apiMutator<PaginatedDashboardTemplateListApi>(getDashboardTemplatesListUrl(projectId, params), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getDashboardTemplatesCreateUrl = (projectId: string) => {
-    return `/api/projects/${projectId}/dashboard_templates/`
-}
-
-export const dashboardTemplatesCreate = async (
-    projectId: string,
-    dashboardTemplateApi: NonReadonly<DashboardTemplateApi>,
-    options?: RequestInit
-): Promise<DashboardTemplateApi> => {
-    return apiMutator<DashboardTemplateApi>(getDashboardTemplatesCreateUrl(projectId), {
-        ...options,
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(dashboardTemplateApi),
-    })
-}
-
-export const getDashboardTemplatesRetrieveUrl = (projectId: string, id: string) => {
-    return `/api/projects/${projectId}/dashboard_templates/${id}/`
-}
-
-export const dashboardTemplatesRetrieve = async (
-    projectId: string,
-    id: string,
-    options?: RequestInit
-): Promise<DashboardTemplateApi> => {
-    return apiMutator<DashboardTemplateApi>(getDashboardTemplatesRetrieveUrl(projectId, id), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getDashboardTemplatesUpdateUrl = (projectId: string, id: string) => {
-    return `/api/projects/${projectId}/dashboard_templates/${id}/`
-}
-
-export const dashboardTemplatesUpdate = async (
-    projectId: string,
-    id: string,
-    dashboardTemplateApi: NonReadonly<DashboardTemplateApi>,
-    options?: RequestInit
-): Promise<DashboardTemplateApi> => {
-    return apiMutator<DashboardTemplateApi>(getDashboardTemplatesUpdateUrl(projectId, id), {
-        ...options,
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(dashboardTemplateApi),
-    })
-}
-
-export const getDashboardTemplatesPartialUpdateUrl = (projectId: string, id: string) => {
-    return `/api/projects/${projectId}/dashboard_templates/${id}/`
-}
-
-export const dashboardTemplatesPartialUpdate = async (
-    projectId: string,
-    id: string,
-    patchedDashboardTemplateApi: NonReadonly<PatchedDashboardTemplateApi>,
-    options?: RequestInit
-): Promise<DashboardTemplateApi> => {
-    return apiMutator<DashboardTemplateApi>(getDashboardTemplatesPartialUpdateUrl(projectId, id), {
-        ...options,
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(patchedDashboardTemplateApi),
-    })
-}
-
-/**
- * Hard delete of this model is not allowed. Use a patch API call to set "deleted" to true
- */
-export const getDashboardTemplatesDestroyUrl = (projectId: string, id: string) => {
-    return `/api/projects/${projectId}/dashboard_templates/${id}/`
-}
-
-export const dashboardTemplatesDestroy = async (
-    projectId: string,
-    id: string,
-    options?: RequestInit
-): Promise<unknown> => {
-    return apiMutator<unknown>(getDashboardTemplatesDestroyUrl(projectId, id), {
-        ...options,
-        method: 'DELETE',
-    })
-}
-
-export const getDashboardTemplatesJsonSchemaRetrieveUrl = (projectId: string) => {
-    return `/api/projects/${projectId}/dashboard_templates/json_schema/`
-}
-
-export const dashboardTemplatesJsonSchemaRetrieve = async (projectId: string, options?: RequestInit): Promise<void> => {
-    return apiMutator<void>(getDashboardTemplatesJsonSchemaRetrieveUrl(projectId), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getEventDefinitionsListUrl = (projectId: string, params?: EventDefinitionsListParams) => {
-    const normalizedParams = new URLSearchParams()
-
-    Object.entries(params || {}).forEach(([key, value]) => {
-        if (value !== undefined) {
-            normalizedParams.append(key, value === null ? 'null' : value.toString())
-        }
-    })
-
-    const stringifiedParams = normalizedParams.toString()
-
-    return stringifiedParams.length > 0
-        ? `/api/projects/${projectId}/event_definitions/?${stringifiedParams}`
-        : `/api/projects/${projectId}/event_definitions/`
-}
-
-export const eventDefinitionsList = async (
-    projectId: string,
-    params?: EventDefinitionsListParams,
-    options?: RequestInit
-): Promise<PaginatedEnterpriseEventDefinitionListApi> => {
-    return apiMutator<PaginatedEnterpriseEventDefinitionListApi>(getEventDefinitionsListUrl(projectId, params), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getEventDefinitionsCreateUrl = (projectId: string) => {
-    return `/api/projects/${projectId}/event_definitions/`
-}
-
-export const eventDefinitionsCreate = async (
-    projectId: string,
-    enterpriseEventDefinitionApi: NonReadonly<EnterpriseEventDefinitionApi>,
-    options?: RequestInit
-): Promise<EnterpriseEventDefinitionApi> => {
-    return apiMutator<EnterpriseEventDefinitionApi>(getEventDefinitionsCreateUrl(projectId), {
-        ...options,
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(enterpriseEventDefinitionApi),
-    })
-}
-
-export const getEventDefinitionsRetrieveUrl = (projectId: string, id: string) => {
-    return `/api/projects/${projectId}/event_definitions/${id}/`
-}
-
-export const eventDefinitionsRetrieve = async (
-    projectId: string,
-    id: string,
-    options?: RequestInit
-): Promise<EnterpriseEventDefinitionApi> => {
-    return apiMutator<EnterpriseEventDefinitionApi>(getEventDefinitionsRetrieveUrl(projectId, id), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getEventDefinitionsUpdateUrl = (projectId: string, id: string) => {
-    return `/api/projects/${projectId}/event_definitions/${id}/`
-}
-
-export const eventDefinitionsUpdate = async (
-    projectId: string,
-    id: string,
-    enterpriseEventDefinitionApi: NonReadonly<EnterpriseEventDefinitionApi>,
-    options?: RequestInit
-): Promise<EnterpriseEventDefinitionApi> => {
-    return apiMutator<EnterpriseEventDefinitionApi>(getEventDefinitionsUpdateUrl(projectId, id), {
-        ...options,
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(enterpriseEventDefinitionApi),
-    })
-}
-
-export const getEventDefinitionsPartialUpdateUrl = (projectId: string, id: string) => {
-    return `/api/projects/${projectId}/event_definitions/${id}/`
-}
-
-export const eventDefinitionsPartialUpdate = async (
-    projectId: string,
-    id: string,
-    patchedEnterpriseEventDefinitionApi: NonReadonly<PatchedEnterpriseEventDefinitionApi>,
-    options?: RequestInit
-): Promise<EnterpriseEventDefinitionApi> => {
-    return apiMutator<EnterpriseEventDefinitionApi>(getEventDefinitionsPartialUpdateUrl(projectId, id), {
-        ...options,
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(patchedEnterpriseEventDefinitionApi),
-    })
-}
-
-export const getEventDefinitionsDestroyUrl = (projectId: string, id: string) => {
-    return `/api/projects/${projectId}/event_definitions/${id}/`
-}
-
-export const eventDefinitionsDestroy = async (projectId: string, id: string, options?: RequestInit): Promise<void> => {
-    return apiMutator<void>(getEventDefinitionsDestroyUrl(projectId, id), {
-        ...options,
-        method: 'DELETE',
-    })
-}
-
-export const getEventDefinitionsMetricsRetrieveUrl = (projectId: string, id: string) => {
-    return `/api/projects/${projectId}/event_definitions/${id}/metrics/`
-}
-
-export const eventDefinitionsMetricsRetrieve = async (
-    projectId: string,
-    id: string,
-    options?: RequestInit
-): Promise<void> => {
-    return apiMutator<void>(getEventDefinitionsMetricsRetrieveUrl(projectId, id), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-/**
- * Get event definition by exact name
- */
-export const getEventDefinitionsByNameRetrieveUrl = (
-    projectId: string,
-    params: EventDefinitionsByNameRetrieveParams
+    params?: OrganizationsProjectsEventIngestionRestrictionsListParams
 ) => {
     const normalizedParams = new URLSearchParams()
 
     Object.entries(params || {}).forEach(([key, value]) => {
         if (value !== undefined) {
-            normalizedParams.append(key, value === null ? 'null' : value.toString())
+            normalizedParams.append(key, value === null ? 'null' : String(value))
         }
     })
 
     const stringifiedParams = normalizedParams.toString()
 
     return stringifiedParams.length > 0
-        ? `/api/projects/${projectId}/event_definitions/by_name/?${stringifiedParams}`
-        : `/api/projects/${projectId}/event_definitions/by_name/`
+        ? `/api/organizations/${organizationId}/projects/${id}/event_ingestion_restrictions/?${stringifiedParams}`
+        : `/api/organizations/${organizationId}/projects/${id}/event_ingestion_restrictions/`
 }
 
-export const eventDefinitionsByNameRetrieve = async (
-    projectId: string,
-    params: EventDefinitionsByNameRetrieveParams,
+/**
+ * Projects for the current organization.
+ */
+export const organizationsProjectsEventIngestionRestrictionsList = async (
+    organizationId: string,
+    id: number,
+    params?: OrganizationsProjectsEventIngestionRestrictionsListParams,
     options?: RequestInit
-): Promise<EventDefinitionApi> => {
-    return apiMutator<EventDefinitionApi>(getEventDefinitionsByNameRetrieveUrl(projectId, params), {
+): Promise<EventIngestionRestrictionApi[]> => {
+    return apiMutator<EventIngestionRestrictionApi[]>(
+        getOrganizationsProjectsEventIngestionRestrictionsListUrl(organizationId, id, params),
+        {
+            ...options,
+            method: 'GET',
+        }
+    )
+}
+
+export const getOrganizationsProjectsExperimentsConfigRetrieveUrl = (organizationId: string, id: number) => {
+    return `/api/organizations/${organizationId}/projects/${id}/experiments_config/`
+}
+
+/**
+ * Manage experiment configuration for this project.
+ */
+export const organizationsProjectsExperimentsConfigRetrieve = async (
+    organizationId: string,
+    id: number,
+    options?: RequestInit
+): Promise<ProjectBackwardCompatApi> => {
+    return apiMutator<ProjectBackwardCompatApi>(
+        getOrganizationsProjectsExperimentsConfigRetrieveUrl(organizationId, id),
+        {
+            ...options,
+            method: 'GET',
+        }
+    )
+}
+
+export const getOrganizationsProjectsExperimentsConfigPartialUpdateUrl = (organizationId: string, id: number) => {
+    return `/api/organizations/${organizationId}/projects/${id}/experiments_config/`
+}
+
+/**
+ * Manage experiment configuration for this project.
+ */
+export const organizationsProjectsExperimentsConfigPartialUpdate = async (
+    organizationId: string,
+    id: number,
+    patchedProjectBackwardCompatApi?: NonReadonly<PatchedProjectBackwardCompatApi>,
+    options?: RequestInit
+): Promise<ProjectBackwardCompatApi> => {
+    return apiMutator<ProjectBackwardCompatApi>(
+        getOrganizationsProjectsExperimentsConfigPartialUpdateUrl(organizationId, id),
+        {
+            ...options,
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json', ...options?.headers },
+            body: JSON.stringify(patchedProjectBackwardCompatApi),
+        }
+    )
+}
+
+export const getOrganizationsProjectsGenerateConversationsPublicTokenCreateUrl = (
+    organizationId: string,
+    id: number
+) => {
+    return `/api/organizations/${organizationId}/projects/${id}/generate_conversations_public_token/`
+}
+
+/**
+ * Projects for the current organization.
+ */
+export const organizationsProjectsGenerateConversationsPublicTokenCreate = async (
+    organizationId: string,
+    id: number,
+    projectBackwardCompatApi?: NonReadonly<ProjectBackwardCompatApi>,
+    options?: RequestInit
+): Promise<ProjectBackwardCompatApi> => {
+    return apiMutator<ProjectBackwardCompatApi>(
+        getOrganizationsProjectsGenerateConversationsPublicTokenCreateUrl(organizationId, id),
+        {
+            ...options,
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...options?.headers },
+            body: JSON.stringify(projectBackwardCompatApi),
+        }
+    )
+}
+
+export const getOrganizationsProjectsIsGeneratingDemoDataRetrieveUrl = (organizationId: string, id: number) => {
+    return `/api/organizations/${organizationId}/projects/${id}/is_generating_demo_data/`
+}
+
+/**
+ * Projects for the current organization.
+ */
+export const organizationsProjectsIsGeneratingDemoDataRetrieve = async (
+    organizationId: string,
+    id: number,
+    options?: RequestInit
+): Promise<ProjectBackwardCompatApi> => {
+    return apiMutator<ProjectBackwardCompatApi>(
+        getOrganizationsProjectsIsGeneratingDemoDataRetrieveUrl(organizationId, id),
+        {
+            ...options,
+            method: 'GET',
+        }
+    )
+}
+
+export const getOrganizationsProjectsLogsConfigRetrieveUrl = (organizationId: string, id: number) => {
+    return `/api/organizations/${organizationId}/projects/${id}/logs_config/`
+}
+
+/**
+ * Manage logs product configuration for this project's canonical environment.
+ * Members can read; writing requires project admin, matching the admin-only
+ * settings UI. Mirrors the env-router action so /api/projects/:id/logs_config/
+ * resolves alongside the legacy /api/environments/:id/logs_config/ alias.
+ */
+export const organizationsProjectsLogsConfigRetrieve = async (
+    organizationId: string,
+    id: number,
+    options?: RequestInit
+): Promise<ProjectBackwardCompatApi> => {
+    return apiMutator<ProjectBackwardCompatApi>(getOrganizationsProjectsLogsConfigRetrieveUrl(organizationId, id), {
         ...options,
         method: 'GET',
     })
 }
 
-export const getEventDefinitionsGolangRetrieveUrl = (projectId: string) => {
-    return `/api/projects/${projectId}/event_definitions/golang/`
+export const getOrganizationsProjectsLogsConfigPartialUpdateUrl = (organizationId: string, id: number) => {
+    return `/api/organizations/${organizationId}/projects/${id}/logs_config/`
 }
 
-export const eventDefinitionsGolangRetrieve = async (projectId: string, options?: RequestInit): Promise<void> => {
-    return apiMutator<void>(getEventDefinitionsGolangRetrieveUrl(projectId), {
+/**
+ * Manage logs product configuration for this project's canonical environment.
+ * Members can read; writing requires project admin, matching the admin-only
+ * settings UI. Mirrors the env-router action so /api/projects/:id/logs_config/
+ * resolves alongside the legacy /api/environments/:id/logs_config/ alias.
+ */
+export const organizationsProjectsLogsConfigPartialUpdate = async (
+    organizationId: string,
+    id: number,
+    patchedProjectBackwardCompatApi?: NonReadonly<PatchedProjectBackwardCompatApi>,
+    options?: RequestInit
+): Promise<ProjectBackwardCompatApi> => {
+    return apiMutator<ProjectBackwardCompatApi>(
+        getOrganizationsProjectsLogsConfigPartialUpdateUrl(organizationId, id),
+        {
+            ...options,
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json', ...options?.headers },
+            body: JSON.stringify(patchedProjectBackwardCompatApi),
+        }
+    )
+}
+
+export const getOrganizationsProjectsResetTokenPartialUpdateUrl = (organizationId: string, id: number) => {
+    return `/api/organizations/${organizationId}/projects/${id}/reset_token/`
+}
+
+/**
+ * Projects for the current organization.
+ */
+export const organizationsProjectsResetTokenPartialUpdate = async (
+    organizationId: string,
+    id: number,
+    patchedProjectBackwardCompatApi?: NonReadonly<PatchedProjectBackwardCompatApi>,
+    options?: RequestInit
+): Promise<ProjectBackwardCompatApi> => {
+    return apiMutator<ProjectBackwardCompatApi>(
+        getOrganizationsProjectsResetTokenPartialUpdateUrl(organizationId, id),
+        {
+            ...options,
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json', ...options?.headers },
+            body: JSON.stringify(patchedProjectBackwardCompatApi),
+        }
+    )
+}
+
+export const getOrganizationsProjectsRotateSecretTokenPartialUpdateUrl = (organizationId: string, id: number) => {
+    return `/api/organizations/${organizationId}/projects/${id}/rotate_secret_token/`
+}
+
+/**
+ * Projects for the current organization.
+ */
+export const organizationsProjectsRotateSecretTokenPartialUpdate = async (
+    organizationId: string,
+    id: number,
+    patchedProjectBackwardCompatApi?: NonReadonly<PatchedProjectBackwardCompatApi>,
+    options?: RequestInit
+): Promise<ProjectBackwardCompatApi> => {
+    return apiMutator<ProjectBackwardCompatApi>(
+        getOrganizationsProjectsRotateSecretTokenPartialUpdateUrl(organizationId, id),
+        {
+            ...options,
+            method: 'PATCH',
+            headers: { 'Content-Type': 'application/json', ...options?.headers },
+            body: JSON.stringify(patchedProjectBackwardCompatApi),
+        }
+    )
+}
+
+export const getOrganizationsProjectsSettingsAsOfRetrieveUrl = (organizationId: string, id: number) => {
+    return `/api/organizations/${organizationId}/projects/${id}/settings_as_of/`
+}
+
+/**
+ * Return the project settings as of the provided timestamp.
+ * Query params:
+ * - at: ISO8601 datetime (required)
+ * - scope: optional, one or multiple keys to filter the returned settings
+ */
+export const organizationsProjectsSettingsAsOfRetrieve = async (
+    organizationId: string,
+    id: number,
+    options?: RequestInit
+): Promise<ProjectBackwardCompatApi> => {
+    return apiMutator<ProjectBackwardCompatApi>(getOrganizationsProjectsSettingsAsOfRetrieveUrl(organizationId, id), {
         ...options,
         method: 'GET',
     })
 }
 
-export const getEventDefinitionsPythonRetrieveUrl = (projectId: string) => {
-    return `/api/projects/${projectId}/event_definitions/python/`
+export const getDashboardsSharingListUrl = (projectId: string, dashboardId: number) => {
+    return `/api/projects/${projectId}/dashboards/${dashboardId}/sharing/`
 }
 
-export const eventDefinitionsPythonRetrieve = async (projectId: string, options?: RequestInit): Promise<void> => {
-    return apiMutator<void>(getEventDefinitionsPythonRetrieveUrl(projectId), {
+export const dashboardsSharingList = async (
+    projectId: string,
+    dashboardId: number,
+    options?: RequestInit
+): Promise<SharingConfigurationApi[]> => {
+    return apiMutator<SharingConfigurationApi[]>(getDashboardsSharingListUrl(projectId, dashboardId), {
         ...options,
         method: 'GET',
     })
 }
 
-export const getEventDefinitionsTypescriptRetrieveUrl = (projectId: string) => {
-    return `/api/projects/${projectId}/event_definitions/typescript/`
+export const getDashboardsSharingPasswordsCreateUrl = (projectId: string, dashboardId: number) => {
+    return `/api/projects/${projectId}/dashboards/${dashboardId}/sharing/passwords/`
 }
 
-export const eventDefinitionsTypescriptRetrieve = async (projectId: string, options?: RequestInit): Promise<void> => {
-    return apiMutator<void>(getEventDefinitionsTypescriptRetrieveUrl(projectId), {
+/**
+ * Create a new password for the sharing configuration.
+ */
+export const dashboardsSharingPasswordsCreate = async (
+    projectId: string,
+    dashboardId: number,
+    sharingConfigurationApi?: NonReadonly<SharingConfigurationApi>,
+    options?: RequestInit
+): Promise<SharingConfigurationApi> => {
+    return apiMutator<SharingConfigurationApi>(getDashboardsSharingPasswordsCreateUrl(projectId, dashboardId), {
         ...options,
-        method: 'GET',
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(sharingConfigurationApi),
+    })
+}
+
+export const getDashboardsSharingPasswordsDestroyUrl = (projectId: string, dashboardId: number, passwordId: string) => {
+    return `/api/projects/${projectId}/dashboards/${dashboardId}/sharing/passwords/${passwordId}/`
+}
+
+/**
+ * Delete a password from the sharing configuration.
+ */
+export const dashboardsSharingPasswordsDestroy = async (
+    projectId: string,
+    dashboardId: number,
+    passwordId: string,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getDashboardsSharingPasswordsDestroyUrl(projectId, dashboardId, passwordId), {
+        ...options,
+        method: 'DELETE',
+    })
+}
+
+export const getDashboardsSharingRefreshCreateUrl = (projectId: string, dashboardId: number) => {
+    return `/api/projects/${projectId}/dashboards/${dashboardId}/sharing/refresh/`
+}
+
+export const dashboardsSharingRefreshCreate = async (
+    projectId: string,
+    dashboardId: number,
+    sharingConfigurationApi?: NonReadonly<SharingConfigurationApi>,
+    options?: RequestInit
+): Promise<SharingConfigurationApi> => {
+    return apiMutator<SharingConfigurationApi>(getDashboardsSharingRefreshCreateUrl(projectId, dashboardId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(sharingConfigurationApi),
     })
 }
 
@@ -1381,7 +1471,7 @@ export const getExportsListUrl = (projectId: string, params?: ExportsListParams)
 
     Object.entries(params || {}).forEach(([key, value]) => {
         if (value !== undefined) {
-            normalizedParams.append(key, value === null ? 'null' : value.toString())
+            normalizedParams.append(key, value === null ? 'null' : String(value))
         }
     })
 
@@ -1409,14 +1499,14 @@ export const getExportsCreateUrl = (projectId: string) => {
 
 export const exportsCreate = async (
     projectId: string,
-    exportedAssetApi: NonReadonly<ExportedAssetApi>,
+    exportedAssetCreateApi: NonReadonly<ExportedAssetCreateApi>,
     options?: RequestInit
-): Promise<ExportedAssetApi> => {
-    return apiMutator<ExportedAssetApi>(getExportsCreateUrl(projectId), {
+): Promise<ExportedAssetCreateApi> => {
+    return apiMutator<ExportedAssetCreateApi>(getExportsCreateUrl(projectId), {
         ...options,
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(exportedAssetApi),
+        body: JSON.stringify(exportedAssetCreateApi),
     })
 }
 
@@ -1451,7 +1541,7 @@ export const getFileSystemListUrl = (projectId: string, params?: FileSystemListP
 
     Object.entries(params || {}).forEach(([key, value]) => {
         if (value !== undefined) {
-            normalizedParams.append(key, value === null ? 'null' : value.toString())
+            normalizedParams.append(key, value === null ? 'null' : String(value))
         }
     })
 
@@ -1530,7 +1620,7 @@ export const getFileSystemPartialUpdateUrl = (projectId: string, id: string) => 
 export const fileSystemPartialUpdate = async (
     projectId: string,
     id: string,
-    patchedFileSystemApi: NonReadonly<PatchedFileSystemApi>,
+    patchedFileSystemApi?: NonReadonly<PatchedFileSystemApi>,
     options?: RequestInit
 ): Promise<FileSystemApi> => {
     return apiMutator<FileSystemApi>(getFileSystemPartialUpdateUrl(projectId, id), {
@@ -1552,13 +1642,13 @@ export const fileSystemDestroy = async (projectId: string, id: string, options?:
     })
 }
 
-/**
- * Get count of all files in a folder.
- */
 export const getFileSystemCountCreateUrl = (projectId: string, id: string) => {
     return `/api/projects/${projectId}/file_system/${id}/count/`
 }
 
+/**
+ * Get count of all files in a folder.
+ */
 export const fileSystemCountCreate = async (
     projectId: string,
     id: string,
@@ -1609,13 +1699,13 @@ export const fileSystemMoveCreate = async (
     })
 }
 
-/**
- * Get count of all files in a folder.
- */
 export const getFileSystemCountByPathCreateUrl = (projectId: string) => {
     return `/api/projects/${projectId}/file_system/count_by_path/`
 }
 
+/**
+ * Get count of all files in a folder.
+ */
 export const fileSystemCountByPathCreate = async (
     projectId: string,
     fileSystemApi: NonReadonly<FileSystemApi>,
@@ -1685,39 +1775,133 @@ export const fileSystemUnfiledRetrieve = async (projectId: string, options?: Req
     })
 }
 
-/**
- * Get possible values for a feature flag.
-
-Query parameters:
-- key: The flag ID (required)
-Returns:
-
-- Array of objects with 'name' field containing possible values
- */
-export const getFlagValueValuesRetrieveUrl = (projectId: string, params?: FlagValueValuesRetrieveParams) => {
+export const getFileSystemShortcutListUrl = (projectId: string, params?: FileSystemShortcutListParams) => {
     const normalizedParams = new URLSearchParams()
 
     Object.entries(params || {}).forEach(([key, value]) => {
         if (value !== undefined) {
-            normalizedParams.append(key, value === null ? 'null' : value.toString())
+            normalizedParams.append(key, value === null ? 'null' : String(value))
         }
     })
 
     const stringifiedParams = normalizedParams.toString()
 
     return stringifiedParams.length > 0
-        ? `/api/projects/${projectId}/flag_value/values/?${stringifiedParams}`
-        : `/api/projects/${projectId}/flag_value/values/`
+        ? `/api/projects/${projectId}/file_system_shortcut/?${stringifiedParams}`
+        : `/api/projects/${projectId}/file_system_shortcut/`
 }
 
-export const flagValueValuesRetrieve = async (
+export const fileSystemShortcutList = async (
     projectId: string,
-    params?: FlagValueValuesRetrieveParams,
+    params?: FileSystemShortcutListParams,
     options?: RequestInit
-): Promise<FlagValueValuesRetrieve200Item[]> => {
-    return apiMutator<FlagValueValuesRetrieve200Item[]>(getFlagValueValuesRetrieveUrl(projectId, params), {
+): Promise<PaginatedFileSystemShortcutListApi> => {
+    return apiMutator<PaginatedFileSystemShortcutListApi>(getFileSystemShortcutListUrl(projectId, params), {
         ...options,
         method: 'GET',
+    })
+}
+
+export const getFileSystemShortcutCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/file_system_shortcut/`
+}
+
+export const fileSystemShortcutCreate = async (
+    projectId: string,
+    fileSystemShortcutApi: NonReadonly<FileSystemShortcutApi>,
+    options?: RequestInit
+): Promise<FileSystemShortcutApi> => {
+    return apiMutator<FileSystemShortcutApi>(getFileSystemShortcutCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(fileSystemShortcutApi),
+    })
+}
+
+export const getFileSystemShortcutRetrieveUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/file_system_shortcut/${id}/`
+}
+
+export const fileSystemShortcutRetrieve = async (
+    projectId: string,
+    id: string,
+    options?: RequestInit
+): Promise<FileSystemShortcutApi> => {
+    return apiMutator<FileSystemShortcutApi>(getFileSystemShortcutRetrieveUrl(projectId, id), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getFileSystemShortcutUpdateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/file_system_shortcut/${id}/`
+}
+
+export const fileSystemShortcutUpdate = async (
+    projectId: string,
+    id: string,
+    fileSystemShortcutApi: NonReadonly<FileSystemShortcutApi>,
+    options?: RequestInit
+): Promise<FileSystemShortcutApi> => {
+    return apiMutator<FileSystemShortcutApi>(getFileSystemShortcutUpdateUrl(projectId, id), {
+        ...options,
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(fileSystemShortcutApi),
+    })
+}
+
+export const getFileSystemShortcutPartialUpdateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/file_system_shortcut/${id}/`
+}
+
+export const fileSystemShortcutPartialUpdate = async (
+    projectId: string,
+    id: string,
+    patchedFileSystemShortcutApi?: NonReadonly<PatchedFileSystemShortcutApi>,
+    options?: RequestInit
+): Promise<FileSystemShortcutApi> => {
+    return apiMutator<FileSystemShortcutApi>(getFileSystemShortcutPartialUpdateUrl(projectId, id), {
+        ...options,
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(patchedFileSystemShortcutApi),
+    })
+}
+
+export const getFileSystemShortcutDestroyUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/file_system_shortcut/${id}/`
+}
+
+export const fileSystemShortcutDestroy = async (
+    projectId: string,
+    id: string,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getFileSystemShortcutDestroyUrl(projectId, id), {
+        ...options,
+        method: 'DELETE',
+    })
+}
+
+export const getFileSystemShortcutReorderCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/file_system_shortcut/reorder/`
+}
+
+/**
+ * Set the display order of the current user's shortcuts. `ordered_ids` becomes the new top-to-bottom order; any unknown IDs are rejected.
+ */
+export const fileSystemShortcutReorderCreate = async (
+    projectId: string,
+    fileSystemShortcutReorderApi: FileSystemShortcutReorderApi,
+    options?: RequestInit
+): Promise<PaginatedFileSystemShortcutListApi> => {
+    return apiMutator<PaginatedFileSystemShortcutListApi>(getFileSystemShortcutReorderCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(fileSystemShortcutReorderApi),
     })
 }
 
@@ -1736,17 +1920,17 @@ export const insightsSharingList = async (
     })
 }
 
-/**
- * Create a new password for the sharing configuration.
- */
 export const getInsightsSharingPasswordsCreateUrl = (projectId: string, insightId: number) => {
     return `/api/projects/${projectId}/insights/${insightId}/sharing/passwords/`
 }
 
+/**
+ * Create a new password for the sharing configuration.
+ */
 export const insightsSharingPasswordsCreate = async (
     projectId: string,
     insightId: number,
-    sharingConfigurationApi: NonReadonly<SharingConfigurationApi>,
+    sharingConfigurationApi?: NonReadonly<SharingConfigurationApi>,
     options?: RequestInit
 ): Promise<SharingConfigurationApi> => {
     return apiMutator<SharingConfigurationApi>(getInsightsSharingPasswordsCreateUrl(projectId, insightId), {
@@ -1757,13 +1941,13 @@ export const insightsSharingPasswordsCreate = async (
     })
 }
 
-/**
- * Delete a password from the sharing configuration.
- */
 export const getInsightsSharingPasswordsDestroyUrl = (projectId: string, insightId: number, passwordId: string) => {
     return `/api/projects/${projectId}/insights/${insightId}/sharing/passwords/${passwordId}/`
 }
 
+/**
+ * Delete a password from the sharing configuration.
+ */
 export const insightsSharingPasswordsDestroy = async (
     projectId: string,
     insightId: number,
@@ -1783,7 +1967,7 @@ export const getInsightsSharingRefreshCreateUrl = (projectId: string, insightId:
 export const insightsSharingRefreshCreate = async (
     projectId: string,
     insightId: number,
-    sharingConfigurationApi: NonReadonly<SharingConfigurationApi>,
+    sharingConfigurationApi?: NonReadonly<SharingConfigurationApi>,
     options?: RequestInit
 ): Promise<SharingConfigurationApi> => {
     return apiMutator<SharingConfigurationApi>(getInsightsSharingRefreshCreateUrl(projectId, insightId), {
@@ -1794,338 +1978,221 @@ export const insightsSharingRefreshCreate = async (
     })
 }
 
-export const getIntegrationsList2Url = (projectId: string, params?: IntegrationsList2Params) => {
+export const getNotebooksSharingListUrl = (projectId: string, notebookId: string) => {
+    return `/api/projects/${projectId}/notebooks/${notebookId}/sharing/`
+}
+
+export const notebooksSharingList = async (
+    projectId: string,
+    notebookId: string,
+    options?: RequestInit
+): Promise<SharingConfigurationApi[]> => {
+    return apiMutator<SharingConfigurationApi[]>(getNotebooksSharingListUrl(projectId, notebookId), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getNotebooksSharingPasswordsCreateUrl = (projectId: string, notebookId: string) => {
+    return `/api/projects/${projectId}/notebooks/${notebookId}/sharing/passwords/`
+}
+
+/**
+ * Create a new password for the sharing configuration.
+ */
+export const notebooksSharingPasswordsCreate = async (
+    projectId: string,
+    notebookId: string,
+    sharingConfigurationApi?: NonReadonly<SharingConfigurationApi>,
+    options?: RequestInit
+): Promise<SharingConfigurationApi> => {
+    return apiMutator<SharingConfigurationApi>(getNotebooksSharingPasswordsCreateUrl(projectId, notebookId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(sharingConfigurationApi),
+    })
+}
+
+export const getNotebooksSharingPasswordsDestroyUrl = (projectId: string, notebookId: string, passwordId: string) => {
+    return `/api/projects/${projectId}/notebooks/${notebookId}/sharing/passwords/${passwordId}/`
+}
+
+/**
+ * Delete a password from the sharing configuration.
+ */
+export const notebooksSharingPasswordsDestroy = async (
+    projectId: string,
+    notebookId: string,
+    passwordId: string,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getNotebooksSharingPasswordsDestroyUrl(projectId, notebookId, passwordId), {
+        ...options,
+        method: 'DELETE',
+    })
+}
+
+export const getNotebooksSharingRefreshCreateUrl = (projectId: string, notebookId: string) => {
+    return `/api/projects/${projectId}/notebooks/${notebookId}/sharing/refresh/`
+}
+
+export const notebooksSharingRefreshCreate = async (
+    projectId: string,
+    notebookId: string,
+    sharingConfigurationApi?: NonReadonly<SharingConfigurationApi>,
+    options?: RequestInit
+): Promise<SharingConfigurationApi> => {
+    return apiMutator<SharingConfigurationApi>(getNotebooksSharingRefreshCreateUrl(projectId, notebookId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(sharingConfigurationApi),
+    })
+}
+
+export const getProductEnablementCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/product_enablement/`
+}
+
+export const productEnablementCreate = async (
+    projectId: string,
+    productEnablementApi: ProductEnablementApi,
+    options?: RequestInit
+): Promise<ProductEnablementResultApi> => {
+    return apiMutator<ProductEnablementResultApi>(getProductEnablementCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(productEnablementApi),
+    })
+}
+
+export const getProjectSecretApiKeysListUrl = (projectId: string, params?: ProjectSecretApiKeysListParams) => {
     const normalizedParams = new URLSearchParams()
 
     Object.entries(params || {}).forEach(([key, value]) => {
         if (value !== undefined) {
-            normalizedParams.append(key, value === null ? 'null' : value.toString())
+            normalizedParams.append(key, value === null ? 'null' : String(value))
         }
     })
 
     const stringifiedParams = normalizedParams.toString()
 
     return stringifiedParams.length > 0
-        ? `/api/projects/${projectId}/integrations/?${stringifiedParams}`
-        : `/api/projects/${projectId}/integrations/`
+        ? `/api/projects/${projectId}/project_secret_api_keys/?${stringifiedParams}`
+        : `/api/projects/${projectId}/project_secret_api_keys/`
 }
 
-export const integrationsList2 = async (
+export const projectSecretApiKeysList = async (
     projectId: string,
-    params?: IntegrationsList2Params,
+    params?: ProjectSecretApiKeysListParams,
     options?: RequestInit
-): Promise<PaginatedIntegrationListApi> => {
-    return apiMutator<PaginatedIntegrationListApi>(getIntegrationsList2Url(projectId, params), {
+): Promise<PaginatedProjectSecretAPIKeyListApi> => {
+    return apiMutator<PaginatedProjectSecretAPIKeyListApi>(getProjectSecretApiKeysListUrl(projectId, params), {
         ...options,
         method: 'GET',
     })
 }
 
-export const getIntegrationsCreateUrl = (projectId: string) => {
-    return `/api/projects/${projectId}/integrations/`
+export const getProjectSecretApiKeysCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/project_secret_api_keys/`
 }
 
-export const integrationsCreate = async (
+export const projectSecretApiKeysCreate = async (
     projectId: string,
-    integrationApi: NonReadonly<IntegrationApi>,
+    projectSecretAPIKeyApi: NonReadonly<ProjectSecretAPIKeyApi>,
     options?: RequestInit
-): Promise<IntegrationApi> => {
-    return apiMutator<IntegrationApi>(getIntegrationsCreateUrl(projectId), {
+): Promise<ProjectSecretAPIKeyApi> => {
+    return apiMutator<ProjectSecretAPIKeyApi>(getProjectSecretApiKeysCreateUrl(projectId), {
         ...options,
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(integrationApi),
+        body: JSON.stringify(projectSecretAPIKeyApi),
     })
 }
 
-export const getIntegrationsRetrieve2Url = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/integrations/${id}/`
+export const getProjectSecretApiKeysRetrieveUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/project_secret_api_keys/${id}/`
 }
 
-export const integrationsRetrieve2 = async (
+export const projectSecretApiKeysRetrieve = async (
     projectId: string,
-    id: number,
+    id: string,
     options?: RequestInit
-): Promise<IntegrationApi> => {
-    return apiMutator<IntegrationApi>(getIntegrationsRetrieve2Url(projectId, id), {
+): Promise<ProjectSecretAPIKeyApi> => {
+    return apiMutator<ProjectSecretAPIKeyApi>(getProjectSecretApiKeysRetrieveUrl(projectId, id), {
         ...options,
         method: 'GET',
     })
 }
 
-export const getIntegrationsDestroyUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/integrations/${id}/`
+export const getProjectSecretApiKeysUpdateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/project_secret_api_keys/${id}/`
 }
 
-export const integrationsDestroy = async (projectId: string, id: number, options?: RequestInit): Promise<void> => {
-    return apiMutator<void>(getIntegrationsDestroyUrl(projectId, id), {
+export const projectSecretApiKeysUpdate = async (
+    projectId: string,
+    id: string,
+    projectSecretAPIKeyApi: NonReadonly<ProjectSecretAPIKeyApi>,
+    options?: RequestInit
+): Promise<ProjectSecretAPIKeyApi> => {
+    return apiMutator<ProjectSecretAPIKeyApi>(getProjectSecretApiKeysUpdateUrl(projectId, id), {
+        ...options,
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(projectSecretAPIKeyApi),
+    })
+}
+
+export const getProjectSecretApiKeysPartialUpdateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/project_secret_api_keys/${id}/`
+}
+
+export const projectSecretApiKeysPartialUpdate = async (
+    projectId: string,
+    id: string,
+    patchedProjectSecretAPIKeyApi?: NonReadonly<PatchedProjectSecretAPIKeyApi>,
+    options?: RequestInit
+): Promise<ProjectSecretAPIKeyApi> => {
+    return apiMutator<ProjectSecretAPIKeyApi>(getProjectSecretApiKeysPartialUpdateUrl(projectId, id), {
+        ...options,
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(patchedProjectSecretAPIKeyApi),
+    })
+}
+
+export const getProjectSecretApiKeysDestroyUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/project_secret_api_keys/${id}/`
+}
+
+export const projectSecretApiKeysDestroy = async (
+    projectId: string,
+    id: string,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getProjectSecretApiKeysDestroyUrl(projectId, id), {
         ...options,
         method: 'DELETE',
     })
 }
 
-export const getIntegrationsChannelsRetrieveUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/integrations/${id}/channels/`
-}
-
-export const integrationsChannelsRetrieve = async (
-    projectId: string,
-    id: number,
-    options?: RequestInit
-): Promise<void> => {
-    return apiMutator<void>(getIntegrationsChannelsRetrieveUrl(projectId, id), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getIntegrationsClickupListsRetrieveUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/integrations/${id}/clickup_lists/`
-}
-
-export const integrationsClickupListsRetrieve = async (
-    projectId: string,
-    id: number,
-    options?: RequestInit
-): Promise<void> => {
-    return apiMutator<void>(getIntegrationsClickupListsRetrieveUrl(projectId, id), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getIntegrationsClickupSpacesRetrieveUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/integrations/${id}/clickup_spaces/`
-}
-
-export const integrationsClickupSpacesRetrieve = async (
-    projectId: string,
-    id: number,
-    options?: RequestInit
-): Promise<void> => {
-    return apiMutator<void>(getIntegrationsClickupSpacesRetrieveUrl(projectId, id), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getIntegrationsClickupWorkspacesRetrieveUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/integrations/${id}/clickup_workspaces/`
-}
-
-export const integrationsClickupWorkspacesRetrieve = async (
-    projectId: string,
-    id: number,
-    options?: RequestInit
-): Promise<void> => {
-    return apiMutator<void>(getIntegrationsClickupWorkspacesRetrieveUrl(projectId, id), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getIntegrationsEmailPartialUpdateUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/integrations/${id}/email/`
-}
-
-export const integrationsEmailPartialUpdate = async (
-    projectId: string,
-    id: number,
-    patchedIntegrationApi: NonReadonly<PatchedIntegrationApi>,
-    options?: RequestInit
-): Promise<IntegrationApi> => {
-    return apiMutator<IntegrationApi>(getIntegrationsEmailPartialUpdateUrl(projectId, id), {
-        ...options,
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(patchedIntegrationApi),
-    })
-}
-
-export const getIntegrationsEmailVerifyCreateUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/integrations/${id}/email/verify/`
-}
-
-export const integrationsEmailVerifyCreate = async (
-    projectId: string,
-    id: number,
-    integrationApi: NonReadonly<IntegrationApi>,
-    options?: RequestInit
-): Promise<void> => {
-    return apiMutator<void>(getIntegrationsEmailVerifyCreateUrl(projectId, id), {
-        ...options,
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(integrationApi),
-    })
-}
-
-export const getIntegrationsGithubReposRetrieveUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/integrations/${id}/github_repos/`
-}
-
-export const integrationsGithubReposRetrieve = async (
-    projectId: string,
-    id: number,
-    options?: RequestInit
-): Promise<void> => {
-    return apiMutator<void>(getIntegrationsGithubReposRetrieveUrl(projectId, id), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getIntegrationsGoogleAccessibleAccountsRetrieveUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/integrations/${id}/google_accessible_accounts/`
-}
-
-export const integrationsGoogleAccessibleAccountsRetrieve = async (
-    projectId: string,
-    id: number,
-    options?: RequestInit
-): Promise<void> => {
-    return apiMutator<void>(getIntegrationsGoogleAccessibleAccountsRetrieveUrl(projectId, id), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getIntegrationsGoogleConversionActionsRetrieveUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/integrations/${id}/google_conversion_actions/`
-}
-
-export const integrationsGoogleConversionActionsRetrieve = async (
-    projectId: string,
-    id: number,
-    options?: RequestInit
-): Promise<void> => {
-    return apiMutator<void>(getIntegrationsGoogleConversionActionsRetrieveUrl(projectId, id), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getIntegrationsJiraProjectsRetrieveUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/integrations/${id}/jira_projects/`
-}
-
-export const integrationsJiraProjectsRetrieve = async (
-    projectId: string,
-    id: number,
-    options?: RequestInit
-): Promise<void> => {
-    return apiMutator<void>(getIntegrationsJiraProjectsRetrieveUrl(projectId, id), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getIntegrationsLinearTeamsRetrieveUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/integrations/${id}/linear_teams/`
-}
-
-export const integrationsLinearTeamsRetrieve = async (
-    projectId: string,
-    id: number,
-    options?: RequestInit
-): Promise<void> => {
-    return apiMutator<void>(getIntegrationsLinearTeamsRetrieveUrl(projectId, id), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getIntegrationsLinkedinAdsAccountsRetrieveUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/integrations/${id}/linkedin_ads_accounts/`
-}
-
-export const integrationsLinkedinAdsAccountsRetrieve = async (
-    projectId: string,
-    id: number,
-    options?: RequestInit
-): Promise<void> => {
-    return apiMutator<void>(getIntegrationsLinkedinAdsAccountsRetrieveUrl(projectId, id), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getIntegrationsLinkedinAdsConversionRulesRetrieveUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/integrations/${id}/linkedin_ads_conversion_rules/`
-}
-
-export const integrationsLinkedinAdsConversionRulesRetrieve = async (
-    projectId: string,
-    id: number,
-    options?: RequestInit
-): Promise<void> => {
-    return apiMutator<void>(getIntegrationsLinkedinAdsConversionRulesRetrieveUrl(projectId, id), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getIntegrationsTwilioPhoneNumbersRetrieveUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/integrations/${id}/twilio_phone_numbers/`
-}
-
-export const integrationsTwilioPhoneNumbersRetrieve = async (
-    projectId: string,
-    id: number,
-    options?: RequestInit
-): Promise<void> => {
-    return apiMutator<void>(getIntegrationsTwilioPhoneNumbersRetrieveUrl(projectId, id), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getIntegrationsAuthorizeRetrieveUrl = (projectId: string) => {
-    return `/api/projects/${projectId}/integrations/authorize/`
-}
-
-export const integrationsAuthorizeRetrieve = async (projectId: string, options?: RequestInit): Promise<void> => {
-    return apiMutator<void>(getIntegrationsAuthorizeRetrieveUrl(projectId), {
-        ...options,
-        method: 'GET',
-    })
+export const getProjectSecretApiKeysRollCreateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/project_secret_api_keys/${id}/roll/`
 }
 
 /**
- * Unified endpoint for generating Domain Connect apply URLs.
-
-Accepts a context ("email" or "proxy") and the relevant resource ID.
-The backend resolves the domain, template variables, and service ID
-based on context, then builds the signed apply URL.
+ * Roll a project secret API key
  */
-export const getIntegrationsDomainConnectApplyUrlCreateUrl = (projectId: string) => {
-    return `/api/projects/${projectId}/integrations/domain-connect/apply-url/`
-}
-
-export const integrationsDomainConnectApplyUrlCreate = async (
+export const projectSecretApiKeysRollCreate = async (
     projectId: string,
-    integrationApi: NonReadonly<IntegrationApi>,
+    id: string,
     options?: RequestInit
-): Promise<void> => {
-    return apiMutator<void>(getIntegrationsDomainConnectApplyUrlCreateUrl(projectId), {
+): Promise<ProjectSecretAPIKeyApi> => {
+    return apiMutator<ProjectSecretAPIKeyApi>(getProjectSecretApiKeysRollCreateUrl(projectId, id), {
         ...options,
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(integrationApi),
-    })
-}
-
-export const getIntegrationsDomainConnectCheckRetrieveUrl = (projectId: string) => {
-    return `/api/projects/${projectId}/integrations/domain-connect/check/`
-}
-
-export const integrationsDomainConnectCheckRetrieve = async (
-    projectId: string,
-    options?: RequestInit
-): Promise<void> => {
-    return apiMutator<void>(getIntegrationsDomainConnectCheckRetrieveUrl(projectId), {
-        ...options,
-        method: 'GET',
     })
 }
 
@@ -2134,7 +2201,7 @@ export const getPropertyDefinitionsListUrl = (projectId: string, params?: Proper
 
     Object.entries(params || {}).forEach(([key, value]) => {
         if (value !== undefined) {
-            normalizedParams.append(key, value === null ? 'null' : value.toString())
+            normalizedParams.append(key, value === null ? 'null' : String(value))
         }
     })
 
@@ -2178,7 +2245,7 @@ export const getPropertyDefinitionsUpdateUrl = (projectId: string, id: string) =
 export const propertyDefinitionsUpdate = async (
     projectId: string,
     id: string,
-    enterprisePropertyDefinitionApi: NonReadonly<EnterprisePropertyDefinitionApi>,
+    enterprisePropertyDefinitionApi?: NonReadonly<EnterprisePropertyDefinitionApi>,
     options?: RequestInit
 ): Promise<EnterprisePropertyDefinitionApi> => {
     return apiMutator<EnterprisePropertyDefinitionApi>(getPropertyDefinitionsUpdateUrl(projectId, id), {
@@ -2196,7 +2263,7 @@ export const getPropertyDefinitionsPartialUpdateUrl = (projectId: string, id: st
 export const propertyDefinitionsPartialUpdate = async (
     projectId: string,
     id: string,
-    patchedEnterprisePropertyDefinitionApi: NonReadonly<PatchedEnterprisePropertyDefinitionApi>,
+    patchedEnterprisePropertyDefinitionApi?: NonReadonly<PatchedEnterprisePropertyDefinitionApi>,
     options?: RequestInit
 ): Promise<EnterprisePropertyDefinitionApi> => {
     return apiMutator<EnterprisePropertyDefinitionApi>(getPropertyDefinitionsPartialUpdateUrl(projectId, id), {
@@ -2222,14 +2289,50 @@ export const propertyDefinitionsDestroy = async (
     })
 }
 
+export const getPropertyDefinitionsBulkUpdateTagsCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/property_definitions/bulk_update_tags/`
+}
+
 /**
- * Allows a caller to provide a list of event names and a single property name
-Returns a map of the event names to a boolean representing whether that property has ever been seen with that event_name
+ * Bulk update tags on multiple objects.
+ *
+ * PAT access: this action has no ``required_scopes=`` on the decorator —
+ * inheriting viewsets must add ``"bulk_update_tags"`` to their
+ * ``scope_object_write_actions`` list to accept personal API keys.
+ * Without that opt-in, ``APIScopePermission`` rejects PAT requests with
+ * "This action does not support personal API key access". Done per-viewset
+ * so granting ``<scope>:write`` for one resource doesn't leak access to
+ * sibling resources that share this mixin.
+ *
+ * Accepts:
+ * - {"ids": [...], "action": "add"|"remove"|"set", "tags": ["tag1", "tag2"]}
+ *
+ * Actions:
+ * - "add": Add tags to existing tags on each object
+ * - "remove": Remove specific tags from each object
+ * - "set": Replace all tags on each object with the provided list
  */
+export const propertyDefinitionsBulkUpdateTagsCreate = async (
+    projectId: string,
+    bulkUpdateTagsRequestApi: BulkUpdateTagsRequestApi,
+    options?: RequestInit
+): Promise<BulkUpdateTagsResponseApi> => {
+    return apiMutator<BulkUpdateTagsResponseApi>(getPropertyDefinitionsBulkUpdateTagsCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(bulkUpdateTagsRequestApi),
+    })
+}
+
 export const getPropertyDefinitionsSeenTogetherRetrieveUrl = (projectId: string) => {
     return `/api/projects/${projectId}/property_definitions/seen_together/`
 }
 
+/**
+ * Allows a caller to provide a list of event names and a single property name
+ * Returns a map of the event names to a boolean representing whether that property has ever been seen with that event_name
+ */
 export const propertyDefinitionsSeenTogetherRetrieve = async (
     projectId: string,
     options?: RequestInit
@@ -2237,130 +2340,6 @@ export const propertyDefinitionsSeenTogetherRetrieve = async (
     return apiMutator<void>(getPropertyDefinitionsSeenTogetherRetrieveUrl(projectId), {
         ...options,
         method: 'GET',
-    })
-}
-
-/**
- * Create, read, update and delete scheduled changes.
- */
-export const getScheduledChangesListUrl = (projectId: string, params?: ScheduledChangesListParams) => {
-    const normalizedParams = new URLSearchParams()
-
-    Object.entries(params || {}).forEach(([key, value]) => {
-        if (value !== undefined) {
-            normalizedParams.append(key, value === null ? 'null' : value.toString())
-        }
-    })
-
-    const stringifiedParams = normalizedParams.toString()
-
-    return stringifiedParams.length > 0
-        ? `/api/projects/${projectId}/scheduled_changes/?${stringifiedParams}`
-        : `/api/projects/${projectId}/scheduled_changes/`
-}
-
-export const scheduledChangesList = async (
-    projectId: string,
-    params?: ScheduledChangesListParams,
-    options?: RequestInit
-): Promise<PaginatedScheduledChangeListApi> => {
-    return apiMutator<PaginatedScheduledChangeListApi>(getScheduledChangesListUrl(projectId, params), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-/**
- * Create, read, update and delete scheduled changes.
- */
-export const getScheduledChangesCreateUrl = (projectId: string) => {
-    return `/api/projects/${projectId}/scheduled_changes/`
-}
-
-export const scheduledChangesCreate = async (
-    projectId: string,
-    scheduledChangeApi: NonReadonly<ScheduledChangeApi>,
-    options?: RequestInit
-): Promise<ScheduledChangeApi> => {
-    return apiMutator<ScheduledChangeApi>(getScheduledChangesCreateUrl(projectId), {
-        ...options,
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(scheduledChangeApi),
-    })
-}
-
-/**
- * Create, read, update and delete scheduled changes.
- */
-export const getScheduledChangesRetrieveUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/scheduled_changes/${id}/`
-}
-
-export const scheduledChangesRetrieve = async (
-    projectId: string,
-    id: number,
-    options?: RequestInit
-): Promise<ScheduledChangeApi> => {
-    return apiMutator<ScheduledChangeApi>(getScheduledChangesRetrieveUrl(projectId, id), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-/**
- * Create, read, update and delete scheduled changes.
- */
-export const getScheduledChangesUpdateUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/scheduled_changes/${id}/`
-}
-
-export const scheduledChangesUpdate = async (
-    projectId: string,
-    id: number,
-    scheduledChangeApi: NonReadonly<ScheduledChangeApi>,
-    options?: RequestInit
-): Promise<ScheduledChangeApi> => {
-    return apiMutator<ScheduledChangeApi>(getScheduledChangesUpdateUrl(projectId, id), {
-        ...options,
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(scheduledChangeApi),
-    })
-}
-
-/**
- * Create, read, update and delete scheduled changes.
- */
-export const getScheduledChangesPartialUpdateUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/scheduled_changes/${id}/`
-}
-
-export const scheduledChangesPartialUpdate = async (
-    projectId: string,
-    id: number,
-    patchedScheduledChangeApi: NonReadonly<PatchedScheduledChangeApi>,
-    options?: RequestInit
-): Promise<ScheduledChangeApi> => {
-    return apiMutator<ScheduledChangeApi>(getScheduledChangesPartialUpdateUrl(projectId, id), {
-        ...options,
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(patchedScheduledChangeApi),
-    })
-}
-
-/**
- * Create, read, update and delete scheduled changes.
- */
-export const getScheduledChangesDestroyUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/scheduled_changes/${id}/`
-}
-
-export const scheduledChangesDestroy = async (projectId: string, id: number, options?: RequestInit): Promise<void> => {
-    return apiMutator<void>(getScheduledChangesDestroyUrl(projectId, id), {
-        ...options,
-        method: 'DELETE',
     })
 }
 
@@ -2379,17 +2358,17 @@ export const sessionRecordingsSharingList = async (
     })
 }
 
-/**
- * Create a new password for the sharing configuration.
- */
 export const getSessionRecordingsSharingPasswordsCreateUrl = (projectId: string, recordingId: string) => {
     return `/api/projects/${projectId}/session_recordings/${recordingId}/sharing/passwords/`
 }
 
+/**
+ * Create a new password for the sharing configuration.
+ */
 export const sessionRecordingsSharingPasswordsCreate = async (
     projectId: string,
     recordingId: string,
-    sharingConfigurationApi: NonReadonly<SharingConfigurationApi>,
+    sharingConfigurationApi?: NonReadonly<SharingConfigurationApi>,
     options?: RequestInit
 ): Promise<SharingConfigurationApi> => {
     return apiMutator<SharingConfigurationApi>(getSessionRecordingsSharingPasswordsCreateUrl(projectId, recordingId), {
@@ -2400,9 +2379,6 @@ export const sessionRecordingsSharingPasswordsCreate = async (
     })
 }
 
-/**
- * Delete a password from the sharing configuration.
- */
 export const getSessionRecordingsSharingPasswordsDestroyUrl = (
     projectId: string,
     recordingId: string,
@@ -2411,6 +2387,9 @@ export const getSessionRecordingsSharingPasswordsDestroyUrl = (
     return `/api/projects/${projectId}/session_recordings/${recordingId}/sharing/passwords/${passwordId}/`
 }
 
+/**
+ * Delete a password from the sharing configuration.
+ */
 export const sessionRecordingsSharingPasswordsDestroy = async (
     projectId: string,
     recordingId: string,
@@ -2430,7 +2409,7 @@ export const getSessionRecordingsSharingRefreshCreateUrl = (projectId: string, r
 export const sessionRecordingsSharingRefreshCreate = async (
     projectId: string,
     recordingId: string,
-    sharingConfigurationApi: NonReadonly<SharingConfigurationApi>,
+    sharingConfigurationApi?: NonReadonly<SharingConfigurationApi>,
     options?: RequestInit
 ): Promise<SharingConfigurationApi> => {
     return apiMutator<SharingConfigurationApi>(getSessionRecordingsSharingRefreshCreateUrl(projectId, recordingId), {
@@ -2441,112 +2420,126 @@ export const sessionRecordingsSharingRefreshCreate = async (
     })
 }
 
-export const getSubscriptionsListUrl = (projectId: string, params?: SubscriptionsListParams) => {
+export const getUploadedMediaListUrl = (projectId: string, params: UploadedMediaListParams) => {
     const normalizedParams = new URLSearchParams()
 
     Object.entries(params || {}).forEach(([key, value]) => {
         if (value !== undefined) {
-            normalizedParams.append(key, value === null ? 'null' : value.toString())
+            normalizedParams.append(key, value === null ? 'null' : String(value))
         }
     })
 
     const stringifiedParams = normalizedParams.toString()
 
     return stringifiedParams.length > 0
-        ? `/api/projects/${projectId}/subscriptions/?${stringifiedParams}`
-        : `/api/projects/${projectId}/subscriptions/`
-}
-
-export const subscriptionsList = async (
-    projectId: string,
-    params?: SubscriptionsListParams,
-    options?: RequestInit
-): Promise<PaginatedSubscriptionListApi> => {
-    return apiMutator<PaginatedSubscriptionListApi>(getSubscriptionsListUrl(projectId, params), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getSubscriptionsCreateUrl = (projectId: string) => {
-    return `/api/projects/${projectId}/subscriptions/`
-}
-
-export const subscriptionsCreate = async (
-    projectId: string,
-    subscriptionApi: NonReadonly<SubscriptionApi>,
-    options?: RequestInit
-): Promise<SubscriptionApi> => {
-    return apiMutator<SubscriptionApi>(getSubscriptionsCreateUrl(projectId), {
-        ...options,
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(subscriptionApi),
-    })
-}
-
-export const getSubscriptionsRetrieveUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/subscriptions/${id}/`
-}
-
-export const subscriptionsRetrieve = async (
-    projectId: string,
-    id: number,
-    options?: RequestInit
-): Promise<SubscriptionApi> => {
-    return apiMutator<SubscriptionApi>(getSubscriptionsRetrieveUrl(projectId, id), {
-        ...options,
-        method: 'GET',
-    })
-}
-
-export const getSubscriptionsUpdateUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/subscriptions/${id}/`
-}
-
-export const subscriptionsUpdate = async (
-    projectId: string,
-    id: number,
-    subscriptionApi: NonReadonly<SubscriptionApi>,
-    options?: RequestInit
-): Promise<SubscriptionApi> => {
-    return apiMutator<SubscriptionApi>(getSubscriptionsUpdateUrl(projectId, id), {
-        ...options,
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(subscriptionApi),
-    })
-}
-
-export const getSubscriptionsPartialUpdateUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/subscriptions/${id}/`
-}
-
-export const subscriptionsPartialUpdate = async (
-    projectId: string,
-    id: number,
-    patchedSubscriptionApi: NonReadonly<PatchedSubscriptionApi>,
-    options?: RequestInit
-): Promise<SubscriptionApi> => {
-    return apiMutator<SubscriptionApi>(getSubscriptionsPartialUpdateUrl(projectId, id), {
-        ...options,
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(patchedSubscriptionApi),
-    })
+        ? `/api/projects/${projectId}/uploaded_media/?${stringifiedParams}`
+        : `/api/projects/${projectId}/uploaded_media/`
 }
 
 /**
- * Hard delete of this model is not allowed. Use a patch API call to set "deleted" to true
+ * List images in the media library. Requires a `purpose` filter — the library is scoped per consumer (e.g. `email`), so browsing without one would mix in unrelated uploads (dashboard images, toolbar screenshots, ...).
  */
-export const getSubscriptionsDestroyUrl = (projectId: string, id: number) => {
-    return `/api/projects/${projectId}/subscriptions/${id}/`
+export const uploadedMediaList = async (
+    projectId: string,
+    params: UploadedMediaListParams,
+    options?: RequestInit
+): Promise<PaginatedUploadedMediaListApi> => {
+    return apiMutator<PaginatedUploadedMediaListApi>(getUploadedMediaListUrl(projectId, params), {
+        ...options,
+        method: 'GET',
+    })
 }
 
-export const subscriptionsDestroy = async (projectId: string, id: number, options?: RequestInit): Promise<unknown> => {
-    return apiMutator<unknown>(getSubscriptionsDestroyUrl(projectId, id), {
+export const getUploadedMediaCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/uploaded_media/`
+}
+
+/**
+ *
+ *     When object storage is available this API allows upload of media which can be used, for example, in text cards on dashboards.
+ *
+ *     Uploaded media must be less than 4MB and decode as a PNG, JPEG, GIF, WebP, AVIF or BMP image — the formats
+ *     the download route will serve inline. Pass `purpose` to also add the image to a library, making it visible
+ *     to `GET ?purpose=...`.
+ *
+ */
+export const uploadedMediaCreate = async (
+    projectId: string,
+    uploadedMediaCreateBody?: UploadedMediaCreateBody,
+    options?: RequestInit
+): Promise<UploadedMediaCreate201> => {
+    const formData = new FormData()
+    if (uploadedMediaCreateBody?.image !== undefined) {
+        formData.append(`image`, uploadedMediaCreateBody.image)
+    }
+    if (uploadedMediaCreateBody?.purpose !== undefined) {
+        formData.append(`purpose`, uploadedMediaCreateBody.purpose)
+    }
+
+    return apiMutator<UploadedMediaCreate201>(getUploadedMediaCreateUrl(projectId), {
         ...options,
-        method: 'DELETE',
+        method: 'POST',
+        body: formData,
+    })
+}
+
+export const getUploadedMediaCompleteUploadCreateUrl = (projectId: string, id: string) => {
+    return `/api/projects/${projectId}/uploaded_media/${id}/complete_upload/`
+}
+
+/**
+ * Step 2 of the presigned upload flow: verifies the object POSTed to the upload_url, sniffs its real content type, and activates it — after this it appears in the library and is publicly servable.
+ */
+export const uploadedMediaCompleteUploadCreate = async (
+    projectId: string,
+    id: string,
+    options?: RequestInit
+): Promise<UploadedMediaApi> => {
+    return apiMutator<UploadedMediaApi>(getUploadedMediaCompleteUploadCreateUrl(projectId, id), {
+        ...options,
+        method: 'POST',
+    })
+}
+
+export const getUploadedMediaStartUploadCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/uploaded_media/start_upload/`
+}
+
+/**
+ * Step 1 of the presigned upload flow: reserves a pending image and returns a presigned URL to POST the file to directly, bytes never pass through this API. Call complete_upload with the returned id once the upload finishes.
+ */
+export const uploadedMediaStartUploadCreate = async (
+    projectId: string,
+    uploadedMediaStartUploadApi: UploadedMediaStartUploadApi,
+    options?: RequestInit
+): Promise<UploadedMediaUploadStartedApi> => {
+    return apiMutator<UploadedMediaUploadStartedApi>(getUploadedMediaStartUploadCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(uploadedMediaStartUploadApi),
+    })
+}
+
+export const getRevokeLeakedKeyCreateUrl = () => {
+    return `/api/revoke_leaked_key/`
+}
+
+/**
+ * Public, unauthenticated endpoint for self-service revocation of a leaked PostHog personal API key, project secret API key, or OAuth access/refresh token. If the token matches a real credential, it is revoked immediately and the owner is notified by email. This includes an expired OAuth access token: the paired refresh token it protects may still be live.
+ *
+ * This endpoint only checks the region it is running on. `"found": false` does not guarantee the token is safe. If you're not sure which region issued it, check both: https://app.posthog.com/api/revoke_leaked_key and https://eu.posthog.com/api/revoke_leaked_key.
+ * @summary Report and revoke a leaked PostHog API key or token
+ */
+export const revokeLeakedKeyCreate = async (
+    leakedKeyReportApi: LeakedKeyReportApi,
+    options?: RequestInit
+): Promise<LeakedKeyReportResponseApi> => {
+    return apiMutator<LeakedKeyReportResponseApi>(getRevokeLeakedKeyCreateUrl(), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(leakedKeyReportApi),
     })
 }
 
@@ -2555,7 +2548,7 @@ export const getUsersListUrl = (params?: UsersListParams) => {
 
     Object.entries(params || {}).forEach(([key, value]) => {
         if (value !== undefined) {
-            normalizedParams.append(key, value === null ? 'null' : value.toString())
+            normalizedParams.append(key, value === null ? 'null' : String(value))
         }
     })
 
@@ -2575,6 +2568,9 @@ export const getUsersRetrieveUrl = (uuid: string) => {
     return `/api/users/${uuid}/`
 }
 
+/**
+ * Retrieve a user's profile and settings. Pass `@me` as the UUID to fetch the authenticated user; non-staff callers may only access their own account.
+ */
 export const usersRetrieve = async (uuid: string, options?: RequestInit): Promise<UserApi> => {
     return apiMutator<UserApi>(getUsersRetrieveUrl(uuid), {
         ...options,
@@ -2586,6 +2582,9 @@ export const getUsersUpdateUrl = (uuid: string) => {
     return `/api/users/${uuid}/`
 }
 
+/**
+ * Replace the authenticated user's profile and settings. Pass `@me` as the UUID to update the authenticated user. Prefer the PATCH endpoint for partial updates — PUT requires every writable field to be provided.
+ */
 export const usersUpdate = async (
     uuid: string,
     userApi: NonReadonly<UserApi>,
@@ -2603,9 +2602,12 @@ export const getUsersPartialUpdateUrl = (uuid: string) => {
     return `/api/users/${uuid}/`
 }
 
+/**
+ * Update one or more of the authenticated user's profile fields or settings.
+ */
 export const usersPartialUpdate = async (
     uuid: string,
-    patchedUserApi: NonReadonly<PatchedUserApi>,
+    patchedUserApi?: NonReadonly<PatchedUserApi>,
     options?: RequestInit
 ): Promise<UserApi> => {
     return apiMutator<UserApi>(getUsersPartialUpdateUrl(uuid), {
@@ -2627,6 +2629,31 @@ export const usersDestroy = async (uuid: string, options?: RequestInit): Promise
     })
 }
 
+export const getUsersCredentialsReviewCompleteCreateUrl = (uuid: string) => {
+    return `/api/users/${uuid}/credentials_review_complete/`
+}
+
+/**
+ * Mark the user as having reviewed their existing credentials. Idempotent. Flips `requires_credential_review` to False so the post-login interstitial isn't shown again. Does not modify any credentials; the user revokes individual Personal API Keys and passkeys via their existing endpoints from the same screen.
+ */
+export const usersCredentialsReviewCompleteCreate = async (uuid: string, options?: RequestInit): Promise<void> => {
+    return apiMutator<void>(getUsersCredentialsReviewCompleteCreateUrl(uuid), {
+        ...options,
+        method: 'POST',
+    })
+}
+
+export const getUsersGithubLoginRetrieveUrl = (uuid: string) => {
+    return `/api/users/${uuid}/github_login/`
+}
+
+export const usersGithubLoginRetrieve = async (uuid: string, options?: RequestInit): Promise<UserGithubLoginApi> => {
+    return apiMutator<UserGithubLoginApi>(getUsersGithubLoginRetrieveUrl(uuid), {
+        ...options,
+        method: 'GET',
+    })
+}
+
 export const getUsersHedgehogConfigRetrieveUrl = (uuid: string) => {
     return `/api/users/${uuid}/hedgehog_config/`
 }
@@ -2644,7 +2671,7 @@ export const getUsersHedgehogConfigPartialUpdateUrl = (uuid: string) => {
 
 export const usersHedgehogConfigPartialUpdate = async (
     uuid: string,
-    patchedUserApi: NonReadonly<PatchedUserApi>,
+    patchedUserApi?: NonReadonly<PatchedUserApi>,
     options?: RequestInit
 ): Promise<void> => {
     return apiMutator<void>(getUsersHedgehogConfigPartialUpdateUrl(uuid), {
@@ -2652,6 +2679,516 @@ export const usersHedgehogConfigPartialUpdate = async (
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json', ...options?.headers },
         body: JSON.stringify(patchedUserApi),
+    })
+}
+
+export const getUsersIntegrationsListUrl = (uuid: string, params?: UsersIntegrationsListParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/users/${uuid}/integrations/?${stringifiedParams}`
+        : `/api/users/${uuid}/integrations/`
+}
+
+/**
+ * Return the authenticated user's personal integrations of a given
+ * ``kind`` (``github`` or ``slack``).
+ *
+ * The response shape varies per kind because the underlying ``UserIntegration``
+ * rows carry different identity fields — GitHub rows expose
+ * ``installation_id`` / ``account`` / ``uses_shared_installation``; Slack
+ * rows expose ``slack_user_id`` / ``slack_team_id`` / ``slack_team_name``.
+ * Kind-specific destroy and start actions remain split so their distinct
+ * semantics (e.g. Slack's lack of "uninstall on last reference") stay
+ * explicit at the URL layer.
+ *
+ * Default of ``kind=github`` is load-bearing: mobile (``apps/mobile/...``)
+ * and the Code SDK (``packages/api-client/...``) both call this endpoint
+ * without a query param today and rely on receiving GitHub rows.
+ * @summary List the user's personal integrations of a given kind
+ */
+export const usersIntegrationsList = async (
+    uuid: string,
+    params?: UsersIntegrationsListParams,
+    options?: RequestInit
+): Promise<PaginatedUserGitHubIntegrationListResponseListApi> => {
+    return apiMutator<PaginatedUserGitHubIntegrationListResponseListApi>(getUsersIntegrationsListUrl(uuid, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getUsersIntegrationsGithubDestroyUrl = (uuid: string, installationId: string) => {
+    return `/api/users/${uuid}/integrations/github/${installationId}/`
+}
+
+/**
+ * Remove a specific GitHub installation by its installation_id.
+ * @summary Disconnect a personal GitHub integration
+ */
+export const usersIntegrationsGithubDestroy = async (
+    uuid: string,
+    installationId: string,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getUsersIntegrationsGithubDestroyUrl(uuid, installationId), {
+        ...options,
+        method: 'DELETE',
+    })
+}
+
+export const getUsersIntegrationsGithubBranchesRetrieveUrl = (
+    uuid: string,
+    installationId: string,
+    params: UsersIntegrationsGithubBranchesRetrieveParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/users/${uuid}/integrations/github/${installationId}/branches/?${stringifiedParams}`
+        : `/api/users/${uuid}/integrations/github/${installationId}/branches/`
+}
+
+/**
+ * List branches for a repository accessible to a personal GitHub installation.
+ * @summary List branches for a personal GitHub installation repository
+ */
+export const usersIntegrationsGithubBranchesRetrieve = async (
+    uuid: string,
+    installationId: string,
+    params: UsersIntegrationsGithubBranchesRetrieveParams,
+    options?: RequestInit
+): Promise<GitHubBranchesResponseApi> => {
+    return apiMutator<GitHubBranchesResponseApi>(
+        getUsersIntegrationsGithubBranchesRetrieveUrl(uuid, installationId, params),
+        {
+            ...options,
+            method: 'GET',
+        }
+    )
+}
+
+export const getUsersIntegrationsGithubReposRetrieveUrl = (
+    uuid: string,
+    installationId: string,
+    params?: UsersIntegrationsGithubReposRetrieveParams
+) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/users/${uuid}/integrations/github/${installationId}/repos/?${stringifiedParams}`
+        : `/api/users/${uuid}/integrations/github/${installationId}/repos/`
+}
+
+/**
+ * List repositories accessible to a specific GitHub installation (paginated, cached).
+ * @summary List repositories for a personal GitHub installation
+ */
+export const usersIntegrationsGithubReposRetrieve = async (
+    uuid: string,
+    installationId: string,
+    params?: UsersIntegrationsGithubReposRetrieveParams,
+    options?: RequestInit
+): Promise<GitHubReposResponseApi> => {
+    return apiMutator<GitHubReposResponseApi>(
+        getUsersIntegrationsGithubReposRetrieveUrl(uuid, installationId, params),
+        {
+            ...options,
+            method: 'GET',
+        }
+    )
+}
+
+export const getUsersIntegrationsGithubReposRefreshCreateUrl = (uuid: string, installationId: string) => {
+    return `/api/users/${uuid}/integrations/github/${installationId}/repos/refresh/`
+}
+
+/**
+ * Refresh repositories accessible to a specific GitHub installation.
+ * @summary Refresh repositories for a personal GitHub installation
+ */
+export const usersIntegrationsGithubReposRefreshCreate = async (
+    uuid: string,
+    installationId: string,
+    options?: RequestInit
+): Promise<GitHubReposRefreshResponseApi> => {
+    return apiMutator<GitHubReposRefreshResponseApi>(
+        getUsersIntegrationsGithubReposRefreshCreateUrl(uuid, installationId),
+        {
+            ...options,
+            method: 'POST',
+        }
+    )
+}
+
+export const getUsersIntegrationsGithubInstallRequestsRetrieveUrl = (uuid: string) => {
+    return `/api/users/${uuid}/integrations/github/install_requests/`
+}
+
+/**
+ * Return the requesting user's GitHub App install-approval requests, newest first.
+ *
+ * This is the durable server-side "awaiting org owner approval" state (see
+ * ``posthog.models.user_integration.GitHubInstallRequest``), distinct from the in-flight
+ * connect spinner, which never touches this table.
+ * @summary List the user's GitHub install-approval requests
+ */
+export const usersIntegrationsGithubInstallRequestsRetrieve = async (
+    uuid: string,
+    options?: RequestInit
+): Promise<GitHubInstallRequestListResponseApi> => {
+    return apiMutator<GitHubInstallRequestListResponseApi>(getUsersIntegrationsGithubInstallRequestsRetrieveUrl(uuid), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getUsersIntegrationsGithubInstallRequestsDestroyUrl = (uuid: string, requestId: string) => {
+    return `/api/users/${uuid}/integrations/github/install_requests/${requestId}/`
+}
+
+/**
+ * Delete one of the requesting user's install-approval requests, whatever its status.
+ *
+ * User-facing bookkeeping only: a later connect attempt records a fresh row.
+ * @summary Dismiss a GitHub install-approval request
+ */
+export const usersIntegrationsGithubInstallRequestsDestroy = async (
+    uuid: string,
+    requestId: string,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getUsersIntegrationsGithubInstallRequestsDestroyUrl(uuid, requestId), {
+        ...options,
+        method: 'DELETE',
+    })
+}
+
+export const getUsersIntegrationsGithubPrepareCallbackCreateUrl = (uuid: string) => {
+    return `/api/users/${uuid}/integrations/github/prepare_callback/`
+}
+
+/**
+ * Seed personal GitHub manage callback state before opening installation settings on GitHub.
+ */
+export const usersIntegrationsGithubPrepareCallbackCreate = async (
+    uuid: string,
+    userGitHubPrepareCallbackRequestApi: UserGitHubPrepareCallbackRequestApi,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getUsersIntegrationsGithubPrepareCallbackCreateUrl(uuid), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(userGitHubPrepareCallbackRequestApi),
+    })
+}
+
+export const getUsersIntegrationsGithubStartCreateUrl = (uuid: string) => {
+    return `/api/users/${uuid}/integrations/github/start/`
+}
+
+/**
+ * Start GitHub linking: either full App install or OAuth-only (user-to-server).
+ *
+ * ``**_kwargs`` absorbs ``parent_lookup_uuid`` from the nested
+ * ``/api/users/{uuid}/integrations/`` router (same pattern as ``local_evaluation``
+ * under projects).
+ *
+ * Usually returns ``install_url`` pointing at ``/installations/new`` so the
+ * user can pick any GitHub org (new or already connected).  GitHub's install
+ * page handles both cases: orgs where the app is installed show "Configure"
+ * (no admin needed), orgs where it isn't show "Install" (needs admin).
+ *
+ * **OAuth fast path:** when the current project already has a team-level
+ * GitHub installation, and the user has no ``UserIntegration`` for that
+ * installation yet, we skip the org picker and redirect straight to
+ * ``/login/oauth/authorize`` so the user only authorizes themselves.
+ * ``connect_from`` is preserved for first-party clients so they return to
+ * the originating client immediately.
+ *
+ * In both cases the response key is ``install_url`` for compatibility with callers.
+ * @summary Start GitHub personal integration linking
+ */
+export const usersIntegrationsGithubStartCreate = async (
+    uuid: string,
+    userGitHubLinkStartRequestApi?: UserGitHubLinkStartRequestApi,
+    options?: RequestInit
+): Promise<UserGitHubLinkStartResponseApi> => {
+    return apiMutator<UserGitHubLinkStartResponseApi>(getUsersIntegrationsGithubStartCreateUrl(uuid), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(userGitHubLinkStartRequestApi),
+    })
+}
+
+export const getUsersIntegrationsSlackDestroyUrl = (uuid: string, slackUserId: string) => {
+    return `/api/users/${uuid}/integrations/slack/${slackUserId}/`
+}
+
+/**
+ * Remove a Slack identity link by Slack user id. Idempotent and
+ * flag-agnostic — users must always be able to unlink even after the
+ * feature flag is turned off.
+ * @summary Unlink a Slack identity
+ */
+export const usersIntegrationsSlackDestroy = async (
+    uuid: string,
+    slackUserId: string,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getUsersIntegrationsSlackDestroyUrl(uuid, slackUserId), {
+        ...options,
+        method: 'DELETE',
+    })
+}
+
+export const getUsersIntegrationsSlackLinkableWorkspacesRetrieveUrl = (uuid: string) => {
+    return `/api/users/${uuid}/integrations/slack/linkable_workspaces/`
+}
+
+/**
+ * Return Slack workspaces in the user's organizations that they have
+ * not yet linked. The settings UI uses this list to decide whether to
+ * show a "Link my Slack account" button (non-empty list) and what to
+ * offer in the picker when several are connectable.
+ * @summary List Slack workspaces this user could link to
+ */
+export const usersIntegrationsSlackLinkableWorkspacesRetrieve = async (
+    uuid: string,
+    options?: RequestInit
+): Promise<UserSlackLinkableWorkspaceListResponseApi> => {
+    return apiMutator<UserSlackLinkableWorkspaceListResponseApi>(
+        getUsersIntegrationsSlackLinkableWorkspacesRetrieveUrl(uuid),
+        {
+            ...options,
+            method: 'GET',
+        }
+    )
+}
+
+export const getUsersIntegrationsSlackStartCreateUrl = (uuid: string) => {
+    return `/api/users/${uuid}/integrations/slack/start/`
+}
+
+/**
+ * Mint a Sign-in-with-Slack invite URL initiated from settings, without
+ * Slack-DM context. The returned URL takes the user through PostHog login
+ * (already satisfied here), then to Slack OAuth, then back to our callback
+ * which writes the ``UserIntegration`` row.
+ *
+ * Without body params, falls back to the user's ``current_team`` and that
+ * team's first Slack ``Integration`` — works when there's exactly one
+ * linkable workspace. With ``team_id`` + ``slack_team_id``, links against
+ * the exact pair (what the frontend uses when a picker is shown).
+ *
+ * Refuses if the target team has no matching Slack workspace, if the
+ * feature flag is off for the workspace, or if the user is already linked
+ * to it.
+ * @summary Start Slack identity link from settings
+ */
+export const usersIntegrationsSlackStartCreate = async (
+    uuid: string,
+    userSlackLinkStartRequestApi?: UserSlackLinkStartRequestApi,
+    options?: RequestInit
+): Promise<UserSlackLinkStartResponseApi> => {
+    return apiMutator<UserSlackLinkStartResponseApi>(getUsersIntegrationsSlackStartCreateUrl(uuid), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(userSlackLinkStartRequestApi),
+    })
+}
+
+export const getUsersLoginSessionsListUrl = (uuid: string, params?: UsersLoginSessionsListParams) => {
+    const normalizedParams = new URLSearchParams()
+
+    Object.entries(params || {}).forEach(([key, value]) => {
+        if (value !== undefined) {
+            normalizedParams.append(key, value === null ? 'null' : String(value))
+        }
+    })
+
+    const stringifiedParams = normalizedParams.toString()
+
+    return stringifiedParams.length > 0
+        ? `/api/users/${uuid}/login_sessions/?${stringifiedParams}`
+        : `/api/users/${uuid}/login_sessions/`
+}
+
+/**
+ * List the cookie-auth login sessions for the current user. Self-only — never another user.
+ */
+export const usersLoginSessionsList = async (
+    uuid: string,
+    params?: UsersLoginSessionsListParams,
+    options?: RequestInit
+): Promise<UserAuthSessionApi[]> => {
+    return apiMutator<UserAuthSessionApi[]>(getUsersLoginSessionsListUrl(uuid, params), {
+        ...options,
+        method: 'GET',
+    })
+}
+
+export const getUsersLoginSessionsDestroyUrl = (uuid: string, sessionId: string) => {
+    return `/api/users/${uuid}/login_sessions/${sessionId}/`
+}
+
+/**
+ * Revoke a single login session belonging to the current user. Self-only.
+ *
+ * Requires recent auth (TimeSensitiveActionPermission) so a stolen cookie can't weaponize
+ * revocation, and is blocked while impersonating via ImpersonationBlockedPathsMiddleware.
+ */
+export const usersLoginSessionsDestroy = async (
+    uuid: string,
+    sessionId: string,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getUsersLoginSessionsDestroyUrl(uuid, sessionId), {
+        ...options,
+        method: 'DELETE',
+    })
+}
+
+export const getUsersLoginSessionsRevokeOthersCreateUrl = (uuid: string) => {
+    return `/api/users/${uuid}/login_sessions/revoke_others/`
+}
+
+/**
+ * Revoke every login session for the current user except the one making this request. Self-only.
+ *
+ * Requires recent auth (TimeSensitiveActionPermission) so a stolen cookie can't weaponize the
+ * "log out everywhere else" lock-out, and is blocked while impersonating.
+ */
+export const usersLoginSessionsRevokeOthersCreate = async (
+    uuid: string,
+    options?: RequestInit
+): Promise<RevokeOtherSessionsResponseApi> => {
+    return apiMutator<RevokeOtherSessionsResponseApi>(getUsersLoginSessionsRevokeOthersCreateUrl(uuid), {
+        ...options,
+        method: 'POST',
+    })
+}
+
+export const getUsersOnboardingSkipCreateUrl = (uuid: string) => {
+    return `/api/users/${uuid}/onboarding/skip/`
+}
+
+/**
+ * Mark the current user as having exited onboarding with a non-delegated reason.
+ * Idempotent: the skip timestamp is only set on the first successful call.
+ *
+ * Callers wanting to delegate setup to a teammate must use the dedicated
+ * /organizations/{id}/invites/delegate/ endpoint, which atomically creates the
+ * invite and sets reason="delegated". This endpoint rejects that reason so state
+ * can't be faked without a real invite.
+ */
+export const usersOnboardingSkipCreate = async (
+    uuid: string,
+    onboardingSkipRequestApi: OnboardingSkipRequestApi,
+    options?: RequestInit
+): Promise<UserApi> => {
+    return apiMutator<UserApi>(getUsersOnboardingSkipCreateUrl(uuid), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(onboardingSkipRequestApi),
+    })
+}
+
+export const getUsersProductIntroSeenPartialUpdateUrl = (uuid: string) => {
+    return `/api/users/${uuid}/product_intro_seen/`
+}
+
+/**
+ * Record that this user has seen one product intro.
+ *
+ * Separate from the `has_seen_product_intro_for` field on the main user PATCH, which requires a
+ * recently authenticated session. Dismissing an intro must not depend on that: a re-auth prompt
+ * would cover the intro it interrupts, and the dismissal would never persist. Nothing reachable
+ * here changes an account, an organization, or a profile.
+ *
+ * Merging server-side also keeps two intros dismissed from separate tabs from dropping each
+ * other's key, which a read-modify-write of the whole map cannot avoid.
+ */
+export const usersProductIntroSeenPartialUpdate = async (
+    uuid: string,
+    patchedProductIntroSeenApi?: PatchedProductIntroSeenApi,
+    options?: RequestInit
+): Promise<UsersProductIntroSeenPartialUpdate200> => {
+    return apiMutator<UsersProductIntroSeenPartialUpdate200>(getUsersProductIntroSeenPartialUpdateUrl(uuid), {
+        ...options,
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(patchedProductIntroSeenApi),
+    })
+}
+
+export const getUsersPushTokensCreateUrl = (uuid: string) => {
+    return `/api/users/${uuid}/push_tokens/`
+}
+
+/**
+ * Idempotent upsert: if the (user, token) pair already exists, `platform` and `last_seen_at` are refreshed. Otherwise a new row is created.
+ * @summary Register a push notification token
+ */
+export const usersPushTokensCreate = async (
+    uuid: string,
+    userPushTokenRegisterRequestApi: UserPushTokenRegisterRequestApi,
+    options?: RequestInit
+): Promise<UserPushTokenItemApi> => {
+    return apiMutator<UserPushTokenItemApi>(getUsersPushTokensCreateUrl(uuid), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(userPushTokenRegisterRequestApi),
+    })
+}
+
+export const getUsersPushTokensUnregisterCreateUrl = (uuid: string) => {
+    return `/api/users/${uuid}/push_tokens/unregister/`
+}
+
+/**
+ * Delete the row matching `(user, token)`. Returns 204 even if no row matches so the mobile client can call this unconditionally when the user opts out.
+ * @summary Unregister a push notification token
+ */
+export const usersPushTokensUnregisterCreate = async (
+    uuid: string,
+    userPushTokenUnregisterRequestApi: UserPushTokenUnregisterRequestApi,
+    options?: RequestInit
+): Promise<void> => {
+    return apiMutator<void>(getUsersPushTokensUnregisterCreateUrl(uuid), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(userPushTokenUnregisterRequestApi),
     })
 }
 
@@ -2683,13 +3220,13 @@ export const usersStart2faSetupRetrieve = async (uuid: string, options?: Request
     })
 }
 
-/**
- * Generate new backup codes, invalidating any existing ones
- */
 export const getUsersTwoFactorBackupCodesCreateUrl = (uuid: string) => {
     return `/api/users/${uuid}/two_factor_backup_codes/`
 }
 
+/**
+ * Generate new backup codes, invalidating any existing ones
+ */
 export const usersTwoFactorBackupCodesCreate = async (
     uuid: string,
     userApi: NonReadonly<UserApi>,
@@ -2703,13 +3240,13 @@ export const usersTwoFactorBackupCodesCreate = async (
     })
 }
 
-/**
- * Disable 2FA and remove all related devices
- */
 export const getUsersTwoFactorDisableCreateUrl = (uuid: string) => {
     return `/api/users/${uuid}/two_factor_disable/`
 }
 
+/**
+ * Disable 2FA and remove all related devices
+ */
 export const usersTwoFactorDisableCreate = async (
     uuid: string,
     userApi: NonReadonly<UserApi>,
@@ -2734,13 +3271,13 @@ export const usersTwoFactorStartSetupRetrieve = async (uuid: string, options?: R
     })
 }
 
-/**
- * Get current 2FA status including backup codes if enabled
- */
 export const getUsersTwoFactorStatusRetrieveUrl = (uuid: string) => {
     return `/api/users/${uuid}/two_factor_status/`
 }
 
+/**
+ * Get current 2FA status including backup codes if enabled
+ */
 export const usersTwoFactorStatusRetrieve = async (uuid: string, options?: RequestInit): Promise<void> => {
     return apiMutator<void>(getUsersTwoFactorStatusRetrieveUrl(uuid), {
         ...options,
@@ -2787,7 +3324,7 @@ export const getUsersCancelEmailChangeRequestPartialUpdateUrl = () => {
 }
 
 export const usersCancelEmailChangeRequestPartialUpdate = async (
-    patchedUserApi: NonReadonly<PatchedUserApi>,
+    patchedUserApi?: NonReadonly<PatchedUserApi>,
     options?: RequestInit
 ): Promise<void> => {
     return apiMutator<void>(getUsersCancelEmailChangeRequestPartialUpdateUrl(), {
@@ -2818,11 +3355,14 @@ export const getUsersVerifyEmailCreateUrl = () => {
     return `/api/users/verify_email/`
 }
 
-export const usersVerifyEmailCreate = async (userApi: NonReadonly<UserApi>, options?: RequestInit): Promise<void> => {
+export const usersVerifyEmailCreate = async (
+    verifyEmailRequestApi: VerifyEmailRequestApi,
+    options?: RequestInit
+): Promise<void> => {
     return apiMutator<void>(getUsersVerifyEmailCreateUrl(), {
         ...options,
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...options?.headers },
-        body: JSON.stringify(userApi),
+        body: JSON.stringify(verifyEmailRequestApi),
     })
 }

@@ -1,9 +1,10 @@
 import { useActions, useValues } from 'kea'
 import posthog from 'posthog-js'
-import { KeyboardEvent, useEffect, useState } from 'react'
+import { KeyboardEvent, useEffect, useRef, useState } from 'react'
 
 import { LemonInput, LemonTag, Tooltip } from '@posthog/lemon-ui'
 
+import { Spinner } from 'lib/lemon-ui/Spinner'
 import { notebookLogic } from 'scenes/notebooks/Notebook/notebookLogic'
 
 import { isHogQLQuery } from '~/queries/utils'
@@ -67,9 +68,11 @@ export const getCellLabel = (nodeIndex: number | undefined, nodeType: NotebookNo
 export function NotebookNodeTitle(): JSX.Element {
     const { isEditable, pythonNodeIndices, sqlNodeIndices, duckSqlNodeIndices, hogqlSqlNodeIndices } =
         useValues(notebookLogic)
-    const { nodeAttributes, title, titlePlaceholder, isEditingTitle, nodeType } = useValues(notebookNodeLogic)
+    const { editableTitle, nodeAttributes, title, titlePlaceholder, titleStatus, isEditingTitle, nodeType } =
+        useValues(notebookNodeLogic)
     const { updateAttributes, toggleEditingTitle } = useActions(notebookNodeLogic)
     const [newValue, setNewValue] = useState('')
+    const initialValueRef = useRef('')
 
     const isPythonNode = nodeType === NotebookNodeType.Python
     const isDuckSqlNode = nodeType === NotebookNodeType.DuckSQL
@@ -95,18 +98,16 @@ export function NotebookNodeTitle(): JSX.Element {
     const cellTitle = cellLabel ? (customTitle ? `${cellLabel} • ${customTitle}` : cellLabel) : title
 
     useEffect(() => {
-        setNewValue(nodeAttributes.title ?? '')
+        const prefill = cellLabel ? (nodeAttributes.title ?? '') : nodeAttributes.title || title || ''
+        setNewValue(prefill)
+        initialValueRef.current = prefill
     }, [isEditingTitle]) // oxlint-disable-line react-hooks/exhaustive-deps
 
     const commitEdit = (): void => {
-        updateAttributes({
-            title: newValue ?? undefined,
-        })
-
-        if (title != newValue) {
+        if (newValue !== initialValueRef.current) {
+            updateAttributes({ title: newValue || undefined })
             posthog.capture('notebook node title updated')
         }
-
         toggleEditingTitle(false)
     }
 
@@ -128,18 +129,40 @@ export function NotebookNodeTitle(): JSX.Element {
         </span>
     )
 
+    const titleStatusTag = titleStatus ? (
+        <LemonTag
+            type={titleStatus.type}
+            size="small"
+            className="uppercase shrink-0"
+            icon={titleStatus.loading ? <Spinner textColored /> : undefined}
+            disabledReason={titleStatus.loading ? 'Updating status' : undefined}
+            title={titleStatus.tooltip}
+            onClick={
+                titleStatus.loading || !titleStatus.onClick
+                    ? undefined
+                    : (event) => {
+                          event.stopPropagation()
+                          titleStatus.onClick?.()
+                      }
+            }
+        >
+            {titleStatus.label}
+        </LemonTag>
+    ) : null
+
     const cellTitleDisplay = cellLabel ? (
         <span title={cellTitle} className="NotebookNodeTitle flex items-center gap-2 truncate">
             <span className="font-semibold">{cellLabel}</span>
             {customTitle ? <span className="text-muted truncate">{customTitle}</span> : null}
         </span>
     ) : (
-        <span title={title} className="NotebookNodeTitle">
-            {title}
+        <span title={title} className="NotebookNodeTitle flex items-center gap-2 min-w-0">
+            <span className="truncate">{title}</span>
+            {titleStatusTag}
         </span>
     )
 
-    return !isEditable ? (
+    return !isEditable || editableTitle === false ? (
         nodeType === NotebookNodeType.TaskCreate ? (
             suggestedTaskTitle
         ) : (

@@ -1,4 +1,4 @@
-import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/OnboardingDocsContentWrapper'
+import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/shared/OnboardingDocsContentWrapper'
 
 import { StepDefinition } from '../steps'
 
@@ -27,14 +27,14 @@ export const getLangfuseSteps = (ctx: OnboardingComponentsContext): StepDefiniti
             badge: 'required',
             content: (
                 <>
-                    <Markdown>Click **Configure** and paste in your PostHog project API key:</Markdown>
+                    <Markdown>Click **Configure** and paste in your PostHog project token:</Markdown>
                     <CodeBlock
                         blocks={[
                             {
                                 language: 'text',
                                 file: 'API Key',
                                 code: dedent`
-                                <ph_project_api_key>
+                                <ph_project_token>
                             `,
                             },
                         ]}

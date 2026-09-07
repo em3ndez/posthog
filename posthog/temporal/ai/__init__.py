@@ -1,58 +1,23 @@
+from posthog.temporal.ai.anomaly_investigation import AnomalyInvestigationWorkflow, investigate_anomaly_activity
 from posthog.temporal.ai.chat_agent import (
     AssistantConversationRunnerWorkflow,
     ChatAgentWorkflow,
     process_chat_agent_activity,
     process_conversation_activity,
 )
+from posthog.temporal.ai.checkpoint_compaction import CHECKPOINT_COMPACTION_ACTIVITIES, CHECKPOINT_COMPACTION_WORKFLOWS
 from posthog.temporal.ai.research_agent import ResearchAgentWorkflow, process_research_agent_activity
-from posthog.temporal.ai.session_summary.activities import (
-    analyze_video_segment_activity,
-    capture_timing_activity,
-    cleanup_gemini_file_activity,
-    consolidate_video_segments_activity,
-    embed_and_store_segments_activity,
-    prep_session_video_asset_activity,
-    store_video_session_summary_activity,
-    upload_video_to_gemini_activity,
-)
-from posthog.temporal.ai.session_summary.activities.patterns import (
-    assign_events_to_patterns_activity,
-    combine_patterns_from_chunks_activity,
-    extract_session_group_patterns_activity,
-    split_session_summaries_into_chunks_for_patterns_extraction_activity,
-)
-from posthog.temporal.ai.session_summary.activities.video_validation import (
-    validate_llm_single_session_summary_with_videos_activity,
-)
-from posthog.temporal.ai.session_summary.types.single import SingleSessionSummaryInputs
-from posthog.temporal.ai.slack_conversation import (
-    SlackConversationRunnerWorkflow,
-    SlackConversationRunnerWorkflowInputs,
-    process_slack_conversation_activity,
-)
-
-from products.signals.backend.temporal import (
-    ACTIVITIES as SIGNALS_PRODUCT_ACTIVITIES,
-    WORKFLOWS as SIGNALS_PRODUCT_WORKFLOWS,
-)
+from posthog.temporal.ai.slack_app import SLACK_APP_ACTIVITIES
+from posthog.temporal.ai.slack_app.posthog_code_slack_mention import PostHogCodeSlackMentionWorkflow
+from posthog.temporal.ai.slack_app.posthog_code_slack_mention_command import PostHogCodeSlackMentionCommandWorkflow
+from posthog.temporal.ai.slack_app.posthog_slack_inbox_onboarding import PostHogSlackInboxOnboardingWorkflow
+from posthog.temporal.ai.slack_app.slack_app_fork import SlackAppForkThreadWorkflow
+from posthog.temporal.ai.slack_app.slack_app_mention import SlackAppMentionWorkflow
 
 from .llm_traces_summaries.summarize_traces import (
     SummarizeLLMTracesInputs,
     SummarizeLLMTracesWorkflow,
     summarize_llm_traces_activity,
-)
-from .session_summary.summarize_session import (
-    SummarizeSingleSessionStreamWorkflow,
-    SummarizeSingleSessionWorkflow,
-    fetch_session_data_activity,
-    get_llm_single_session_summary_activity,
-    stream_llm_single_session_summary_activity,
-)
-from .session_summary.summarize_session_group import (
-    SessionGroupSummaryInputs,
-    SessionGroupSummaryOfSummariesInputs,
-    SummarizeSessionGroupWorkflow,
-    fetch_session_batch_events_activity,
 )
 from .sync_vectors import (
     SyncVectorsInputs,
@@ -61,19 +26,20 @@ from .sync_vectors import (
     batch_summarize_actions,
     get_approximate_actions_count,
 )
-from .video_segment_clustering.activities import (
-    cluster_segments_activity,
-    fetch_segments_activity,
-    get_sessions_to_prime_activity,
-    label_clusters_activity,
-    match_clusters_activity,
-    persist_reports_activity,
-)
-from .video_segment_clustering.clustering_workflow import VideoSegmentClusteringWorkflow
-from .video_segment_clustering.coordinator_workflow import (
-    VideoSegmentClusteringCoordinatorWorkflow,
-    get_proactive_tasks_enabled_team_ids_activity,
-)
+
+# PostHog Desktop Slack workflows live on TASKS_TASK_QUEUE alongside ProcessTaskWorkflow,
+# the worker they hand off to once a repo is picked. The subset is kept exported so
+# start_temporal_worker can register it on that queue without pulling in unrelated AI
+# workflows.
+POSTHOG_CODE_SLACK_WORKFLOWS = [
+    PostHogCodeSlackMentionWorkflow,
+    SlackAppMentionWorkflow,
+    PostHogCodeSlackMentionCommandWorkflow,
+    SlackAppForkThreadWorkflow,
+    PostHogSlackInboxOnboardingWorkflow,
+]
+
+POSTHOG_CODE_SLACK_ACTIVITIES = [*SLACK_APP_ACTIVITIES]
 
 AI_WORKFLOWS = [
     SyncVectorsWorkflow,
@@ -81,7 +47,8 @@ AI_WORKFLOWS = [
     ChatAgentWorkflow,
     ResearchAgentWorkflow,
     SummarizeLLMTracesWorkflow,
-    SlackConversationRunnerWorkflow,
+    AnomalyInvestigationWorkflow,
+    *CHECKPOINT_COMPACTION_WORKFLOWS,
 ]
 
 AI_ACTIVITIES = [
@@ -92,51 +59,11 @@ AI_ACTIVITIES = [
     process_chat_agent_activity,
     process_research_agent_activity,
     summarize_llm_traces_activity,
-    process_slack_conversation_activity,
-]
-
-SIGNALS_WORKFLOWS = [
-    SummarizeSingleSessionStreamWorkflow,
-    SummarizeSingleSessionWorkflow,
-    SummarizeSessionGroupWorkflow,
-    VideoSegmentClusteringWorkflow,
-    VideoSegmentClusteringCoordinatorWorkflow,
-    *SIGNALS_PRODUCT_WORKFLOWS,
-]
-
-SIGNALS_ACTIVITIES = [
-    stream_llm_single_session_summary_activity,
-    get_llm_single_session_summary_activity,
-    fetch_session_batch_events_activity,
-    extract_session_group_patterns_activity,
-    assign_events_to_patterns_activity,
-    fetch_session_data_activity,
-    combine_patterns_from_chunks_activity,
-    split_session_summaries_into_chunks_for_patterns_extraction_activity,
-    validate_llm_single_session_summary_with_videos_activity,
-    prep_session_video_asset_activity,
-    upload_video_to_gemini_activity,
-    analyze_video_segment_activity,
-    embed_and_store_segments_activity,
-    store_video_session_summary_activity,
-    cleanup_gemini_file_activity,
-    consolidate_video_segments_activity,
-    capture_timing_activity,
-    get_sessions_to_prime_activity,
-    fetch_segments_activity,
-    cluster_segments_activity,
-    match_clusters_activity,
-    label_clusters_activity,
-    persist_reports_activity,
-    get_proactive_tasks_enabled_team_ids_activity,
-    *SIGNALS_PRODUCT_ACTIVITIES,
+    investigate_anomaly_activity,
+    *CHECKPOINT_COMPACTION_ACTIVITIES,
 ]
 
 __all__ = [
     "SyncVectorsInputs",
-    "SingleSessionSummaryInputs",
-    "SessionGroupSummaryInputs",
-    "SessionGroupSummaryOfSummariesInputs",
     "SummarizeLLMTracesInputs",
-    "SlackConversationRunnerWorkflowInputs",
 ]

@@ -1,4 +1,4 @@
-import { ComponentType, HTMLProps } from 'react'
+import { CSSProperties, ComponentType, HTMLProps } from 'react'
 
 import { ExpandableConfig } from 'lib/lemon-ui/LemonTable'
 
@@ -20,6 +20,8 @@ import { DataTableRow } from './nodes/DataTable/dataTableLogic'
 export interface QueryContext<Q extends QuerySchema = QuerySchema> {
     /** Column templates for the DataTable */
     columns?: Record<string, QueryContextColumn>
+    tableLayout?: 'auto' | 'fixed'
+    tableStyle?: CSSProperties
     /** used to override the value in the query */
     showOpenEditorButton?: boolean
     showQueryEditor?: boolean
@@ -42,6 +44,11 @@ export interface QueryContext<Q extends QuerySchema = QuerySchema> {
     refresh?: RefreshType
     /** Extra source feature for Data Tables */
     extraDataTableQueryFeatures?: QueryFeature[]
+    /**
+     * Force-show the DataTable "load more" footer even for query kinds that normally hide it
+     * (e.g. Web analytics breakdown tables when expanded in the "Show more" modal).
+     */
+    showLoadNextButton?: boolean
     /** Allow customization of file name when exporting */
     fileNameForExport?: string
     /** Cohort ID to enable cohort-specific features like View Replays button */
@@ -52,6 +59,14 @@ export interface QueryContext<Q extends QuerySchema = QuerySchema> {
     dataNodeLogicKey?: string
     /** Override the maximum pagination limit for Data Tables. */
     dataTableMaxPaginationLimit?: number
+    /** Stop Data Table pagination after this many accumulated rows. */
+    dataTableMaxPaginationRows?: number
+    /** Keep the Data Table toolbar fixed while its table content scrolls. */
+    dataTableAllowContentScroll?: boolean
+    /** Override the nouns used by Data Table counts and pagination. */
+    dataTableNouns?: [string, string]
+    compactDataTableToolbar?: boolean
+    hideRecordingButton?: boolean
     /** Custom expandable config for DataTable rows */
     expandable?: ExpandableConfig<DataTableRow>
     /** Ignore action/event names in series labels (show only breakdown/compare values) */
@@ -60,10 +75,23 @@ export interface QueryContext<Q extends QuerySchema = QuerySchema> {
     dataTableRowsTransformer?: (rows: DataTableRow[]) => DataTableRow[]
     /** Compare filter for Web Analytics queries */
     compareFilter?: any
+    formatCompareLabel?: (label: string, dateLabel?: string) => string
     /** Base currency for formatting monetary values */
     baseCurrency?: CurrencyCode
     /** Limit context sent to the /query endpoint */
     limitContext?: 'posthog_ai'
+    /** Custom action buttons rendered in the DataTable toolbar (second row, right side) */
+    customActions?: JSX.Element | JSX.Element[]
+    /** Callback for drag-to-zoom on time series charts. Enables x-axis drag selection when set. */
+    onDateRangeZoom?: (dateFrom: string, dateTo: string) => void
+    /** Wired by the web analytics scene so a pre-computed tile's badge can offer "always query live data". */
+    onDisableWebAnalyticsPrecompute?: () => void
+    /**
+     * Suppress the generic "Need to speed things up?" optimization tips while a query is loading.
+     * Use this when the embedded chart is built from a fixed query that the viewer cannot edit
+     * (e.g. the Error tracking insights tab) and the suggestions would not be actionable.
+     */
+    suppressSlowQuerySuggestions?: boolean
 }
 
 export type QueryContextColumnTitleComponent = ComponentType<{
@@ -86,7 +114,10 @@ export interface QueryContextColumn {
     renderTitle?: QueryContextColumnTitleComponent
     render?: QueryContextColumnComponent
     align?: 'left' | 'right' | 'center' // default is left
-    width?: string
+    width?: string | number
+    resizable?: boolean
+    onResize?: (width: number) => void
+    onResizeEnd?: () => void
     hidden?: boolean // don't show this column in the table
     isRowFillFraction?: boolean // if true, this row will be filled with a background color based on the value (from 0 to 1)
 }

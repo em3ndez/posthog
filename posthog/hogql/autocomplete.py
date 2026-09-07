@@ -1,6 +1,7 @@
 import json
 from collections.abc import Callable
 from copy import deepcopy
+from functools import lru_cache
 from typing import Optional, cast
 
 from django.db import models
@@ -33,19 +34,33 @@ from posthog.hogql.database.models import (
     Table,
     VirtualTable,
 )
+from posthog.hogql.database.schema.events import EventsGroupSubTable, EventsPersonSubTable, EventsTable
+from posthog.hogql.database.schema.groups import GroupsTable
+from posthog.hogql.database.schema.persons import PersonsTable
 from posthog.hogql.filters import replace_filters
-from posthog.hogql.functions.mapping import ALL_EXPOSED_FUNCTION_NAMES
+from posthog.hogql.functions.mapping import ALL_EXPOSED_FUNCTION_NAMES, find_hogql_aggregation, find_hogql_function
 from posthog.hogql.parser import parse_expr, parse_program, parse_select, parse_string_template
 from posthog.hogql.resolver import resolve_types, resolve_types_from_table
 from posthog.hogql.resolver_utils import extract_select_queries
 from posthog.hogql.timings import HogQLTimings
+from posthog.hogql.type_system import (
+    ComparisonCompatibility,
+    RuntimeType,
+    comparison_compatibility,
+    infer_function_return_type,
+    runtime_type_from_constant_type,
+    runtime_type_from_database_field,
+)
 from posthog.hogql.visitor import TraversingVisitor, clone_expr
 
 from posthog.exceptions_capture import capture_exception
 from posthog.hogql_queries.query_runner import get_query_runner
-from posthog.models.insight_variable import InsightVariable
-from posthog.models.property_definition import PropertyDefinition
 from posthog.models.team.team import Team
+from posthog.models.user import User
+from posthog.taxonomy.taxonomy import QUERY_DEPRECATED_EVENT_PROPERTIES
+
+from products.event_definitions.backend.models.property_definition import PropertyDefinition
+from products.product_analytics.backend.facade.api import insight_variables_for_team
 
 from common.hogvm.python.stl import STL
 from common.hogvm.python.stl.bytecode import BYTECODE_STL
@@ -53,6 +68,146 @@ from common.hogvm.python.stl.bytecode import BYTECODE_STL
 ALL_HOG_FUNCTIONS = sorted(list(STL.keys()) + list(BYTECODE_STL.keys()))
 MATCH_ANY_CHARACTER = "$$_POSTHOG_ANY_$$"
 PROPERTY_DEFINITION_LIMIT = 220
+# The one path through a Hog function's globals that holds an event's own property bag. Other
+# `properties` bags (person, groups, a user-defined input) never carry person property setters.
+EVENT_PROPERTIES_GLOBALS_CHAIN = ["event", "properties"]
+
+
+def _get_direct_connection_metadata(context: HogQLContext) -> Optional[dict]:
+    metadata = context.direct_postgres_connection_metadata
+    if metadata is None and context.database is not None:
+        metadata = getattr(context.database, "_direct_connection_metadata", None)
+
+    return metadata if isinstance(metadata, dict) else None
+
+
+def get_connection_supported_functions(context: HogQLContext) -> list[str]:
+    metadata = _get_direct_connection_metadata(context)
+    if metadata is None:
+        return []
+
+    available_functions = metadata.get("available_functions")
+    if not isinstance(available_functions, list):
+        return []
+
+    return [function_name for function_name in available_functions if isinstance(function_name, str)]
+
+
+def get_available_functions(language: str, context: HogQLContext) -> list[str]:
+    if language == HogLanguage.HOG_QL or language == HogLanguage.HOG_QL_EXPR:
+        return sorted(set(ALL_EXPOSED_FUNCTION_NAMES) | set(get_connection_supported_functions(context)))
+
+    return ALL_HOG_FUNCTIONS
+
+
+def get_direct_table_function_names(context: HogQLContext) -> list[str]:
+    metadata = _get_direct_connection_metadata(context)
+    if metadata is None:
+        return []
+
+    available_table_functions = metadata.get("available_table_functions")
+    if not isinstance(available_table_functions, list):
+        return []
+
+    return sorted({name for name in available_table_functions if isinstance(name, str)})
+
+
+# The editor groups by kind first: variables and fields sort under "1", functions under "2". Ranking
+# has to stay inside the function group, so a ranked function keeps that prefix and adds its bucket
+# after it ("2-0-now"). Sorting a function above the table's own columns is not the trade here.
+_FUNCTION_KIND_SORT_PREFIX = "2"
+
+# Ranking buckets for function suggestions, lowest sorts first. Monaco orders by `sortText`, so the
+# bucket decides position within the group and the name breaks ties inside a bucket.
+_FUNCTION_RANK_BY_COMPATIBILITY: dict[ComparisonCompatibility, str] = {
+    ComparisonCompatibility.DEFINITELY_COMPATIBLE: "0",
+    ComparisonCompatibility.CHEAP_CAST: "1",
+    ComparisonCompatibility.UNKNOWN: "2",
+    ComparisonCompatibility.EXPENSIVE_CAST: "3",
+    ComparisonCompatibility.INCOMPATIBLE: "4",
+}
+_UNRANKED_FUNCTION_PREFIX = "2"
+
+
+@lru_cache(maxsize=2048)
+def _declared_function_return_type(function_name: str) -> ast.ConstantType | None:
+    """The return type a function declares before its arguments are known.
+
+    Completion runs before the user types any arguments, so ask for inference over unknown
+    arguments. Functions whose return type depends on those arguments answer UnknownType, which
+    ranks in the middle rather than being pushed down.
+    """
+    meta = find_hogql_function(function_name) or find_hogql_aggregation(function_name)
+    if meta is None:
+        return None
+    arg_types: list[ast.ConstantType] = [ast.UnknownType(nullable=False) for _ in range(meta.min_args or 0)]
+    try:
+        return infer_function_return_type(function_name, arg_types, meta=meta).return_type
+    except Exception:
+        return None
+
+
+def expected_type_at_position(
+    node: Optional[AST], parent_node: Optional[AST], table: Table, context: HogQLContext
+) -> ast.ConstantType | None:
+    """The type the expression under the cursor is being compared against, when there is one.
+
+    Only handles a comparison with a resolvable other side, which is where a type expectation is
+    unambiguous. Everything else returns None and leaves suggestions unranked.
+    """
+    if not isinstance(parent_node, ast.CompareOperation):
+        return None
+    other_side = parent_node.left if parent_node.right is node else parent_node.right
+    if other_side is node:
+        return None
+    try:
+        table_chain = table.to_printed_hogql().replace("`", "").split(".")
+        resolved = resolve_types_from_table(other_side, table_chain, context, "hogql")
+        if resolved.type is None:
+            return None
+        return resolved.type.resolve_constant_type(context)
+    except Exception:
+        # A half-typed comparison often will not resolve. Ranking is an enhancement, so fall back
+        # to the unranked list rather than failing the completion request.
+        return None
+
+
+def _function_sort_text(function_name: str, expected_type: ast.ConstantType) -> str:
+    return_type = _declared_function_return_type(function_name)
+    if return_type is None:
+        bucket = _UNRANKED_FUNCTION_PREFIX
+    else:
+        bucket = _FUNCTION_RANK_BY_COMPATIBILITY[comparison_compatibility(expected_type, return_type)]
+    return f"{_FUNCTION_KIND_SORT_PREFIX}-{bucket}-{function_name}"
+
+
+def append_function_suggestions(
+    suggestions: list[AutocompleteCompletionItem],
+    language: str,
+    context: HogQLContext,
+    prefix: str = "",
+    expected_type: ast.ConstantType | None = None,
+) -> None:
+    available_functions = get_available_functions(language, context)
+    if prefix:
+        normalized_prefix = prefix.lower()
+        available_functions = [
+            function_name
+            for function_name in available_functions
+            if function_name.lower().startswith(normalized_prefix)
+        ]
+
+    sort_texts: Optional[list[str]] = None
+    if expected_type is not None:
+        sort_texts = [_function_sort_text(function_name, expected_type) for function_name in available_functions]
+
+    extend_responses(
+        available_functions,
+        suggestions,
+        AutocompleteCompletionItemKind.FUNCTION,
+        insert_text=lambda key: f"{key}()",
+        sort_texts=sort_texts,
+    )
 
 
 class GetNodeAtPositionTraverser(TraversingVisitor):
@@ -117,23 +272,32 @@ def constant_type_to_database_field(constant_type: ConstantType, name: str) -> D
     return DatabaseField(name=name)
 
 
+# Shown when the type system has no answer for a field. Deliberately visible rather than blank:
+# an unlabeled completion is indistinguishable from one we chose not to label, and the gap is the
+# thing worth seeing.
+UNKNOWN_TYPE_LABEL = "unknown"
+
+
+def _display_runtime_type(runtime_type: RuntimeType) -> str:
+    """Render a runtime type for a completion detail.
+
+    An unknown family renders as the unknown label rather than `Unknown`/`Nullable(Unknown)`. We do
+    not know the type, so we do not know its nullability either, and claiming it reads as a fact.
+    """
+    if runtime_type.family == "unknown":
+        return UNKNOWN_TYPE_LABEL
+    return runtime_type.display()
+
+
 def convert_field_or_table_to_type_string(
     field_or_table: FieldOrTable, parent_table: str, context: HogQLContext
 ) -> str | None:
-    if isinstance(field_or_table, BooleanDatabaseField):
-        return "Boolean"
-    if isinstance(field_or_table, IntegerDatabaseField):
-        return "Integer"
-    if isinstance(field_or_table, FloatDatabaseField):
-        return "Float"
-    if isinstance(field_or_table, StringDatabaseField):
-        return "String"
-    if isinstance(field_or_table, DateTimeDatabaseField):
-        return "DateTime"
-    if isinstance(field_or_table, DateDatabaseField):
-        return "Date"
-    if isinstance(field_or_table, StringJSONDatabaseField):
-        return "Object"
+    """Render the type the resolver would give this field, in ClickHouse spelling.
+
+    Reads the structured runtime type rather than the DatabaseField subclass, so nullability and
+    parametric detail (`Nullable(Float64)`, `Array(String)`, `DateTime64(6, 'UTC')`) reach the
+    editor instead of being flattened to a family name.
+    """
     if isinstance(field_or_table, ast.ExpressionField):
         parent_table_chain = parent_table.replace("`", "").split(".")
         try:
@@ -141,15 +305,20 @@ def convert_field_or_table_to_type_string(
             assert field_expr.type is not None
             constant_type = field_expr.type.resolve_constant_type(context)
 
-            return constant_type.print_type()
+            return _display_runtime_type(runtime_type_from_constant_type(constant_type))
         except Exception as e:
-            tracking_error = Exception("Cant resolve expression field in autocomplete")
+            tracking_error = Exception("Can't resolve expression field in autocomplete")
             tracking_error.__cause__ = e
             capture_exception(tracking_error)
 
-            return "Expression"
+            return UNKNOWN_TYPE_LABEL
     if isinstance(field_or_table, ast.Table | ast.LazyJoin):
         return "Table"
+    if isinstance(field_or_table, ast.DatabaseField):
+        try:
+            return _display_runtime_type(runtime_type_from_database_field(field_or_table))
+        except Exception:
+            return UNKNOWN_TYPE_LABEL
 
     return None
 
@@ -178,8 +347,11 @@ def get_table(context: HogQLContext, join_expr: ast.JoinExpr, ctes: Optional[dic
                         constant_field = constant_type_to_database_field(field.type, name)
                         new_fields[name] = constant_field
                         continue
-                    elif isinstance(field, ast.FieldType):
-                        underlying_field_name = field.name
+                    # `field` is already narrowed to FieldAliasType, so this elif is
+                    # provably dead — `FieldAliasType` and `FieldType` are sibling Type
+                    # subclasses. Kept as a defensive runtime guard; suppress for mypy.
+                    elif isinstance(field, ast.FieldType):  # type: ignore[unreachable]
+                        underlying_field_name = field.name  # type: ignore[unreachable]
                     else:
                         underlying_field_name = name
                 elif isinstance(field, ast.FieldType):
@@ -284,7 +456,12 @@ def resolve_table_field_traversers(table: Table, context: HogQLContext) -> Table
 
 
 def append_table_field_to_response(
-    table: Table, suggestions: list[AutocompleteCompletionItem], language: str, context: HogQLContext
+    table: Table,
+    suggestions: list[AutocompleteCompletionItem],
+    language: str,
+    context: HogQLContext,
+    node: Optional[AST] = None,
+    parent_node: Optional[AST] = None,
 ) -> None:
     keys: list[str] = []
     details: list[str | None] = []
@@ -304,15 +481,11 @@ def append_table_field_to_response(
         insert_text=lambda key: f"`{key}`" if any(n in key for n in HOGQL_CHARACTERS_TO_BE_WRAPPED) else key,
     )
 
-    if language == HogLanguage.HOG_QL or language == HogLanguage.HOG_QL_EXPR:
-        available_functions = ALL_EXPOSED_FUNCTION_NAMES
-    else:
-        available_functions = ALL_HOG_FUNCTIONS
-    extend_responses(
-        available_functions,
-        suggestions,
-        AutocompleteCompletionItemKind.FUNCTION,
-        insert_text=lambda key: f"{key}()",
+    append_function_suggestions(
+        suggestions=suggestions,
+        language=language,
+        context=context,
+        expected_type=expected_type_at_position(node, parent_node, table, context),
     )
 
 
@@ -322,6 +495,7 @@ def extend_responses(
     kind: AutocompleteCompletionItemKind = AutocompleteCompletionItemKind.VARIABLE,
     insert_text: Optional[Callable[[str], str]] = None,
     details: Optional[list[str | None]] = None,
+    sort_texts: Optional[list[str]] = None,
 ) -> None:
     suggestions.extend(
         [
@@ -330,6 +504,7 @@ def extend_responses(
                 label=key,
                 kind=kind,
                 detail=details[index] if details is not None else None,
+                sortText=sort_texts[index] if sort_texts is not None else None,
             )
             for index, key in enumerate(keys)
         ]
@@ -385,7 +560,10 @@ def gather_hog_variables_in_scope(root_node, node) -> list[str]:
 
 
 def get_hogql_autocomplete(
-    query: HogQLAutocomplete, team: Team, database_arg: Optional[Database] = None
+    query: HogQLAutocomplete,
+    team: Team,
+    user: Optional[User] = None,
+    database_arg: Optional[Database] = None,
 ) -> HogQLAutocompleteResponse:
     response = HogQLAutocompleteResponse(suggestions=[], incomplete_list=False)
     timings = HogQLTimings()
@@ -393,16 +571,21 @@ def get_hogql_autocomplete(
     if database_arg is not None:
         database = database_arg
     else:
-        database = Database.create_for(team=team, timings=timings)
+        database = Database.create_for(team=team, user=user, timings=timings)
 
-    context = HogQLContext(team_id=team.pk, team=team, database=database, timings=timings)
+    context = HogQLContext(team_id=team.pk, team=team, user=user, database=database, timings=timings)
     if query.sourceQuery:
         if query.sourceQuery.kind == "HogQLQuery" and (
             query.sourceQuery.query is None or query.sourceQuery.query == ""
         ):
             source_query = parse_select("select 1")
         else:
-            source_query = get_query_runner(query=query.sourceQuery, team=team).to_query()
+            try:
+                source_query = get_query_runner(query=query.sourceQuery, team=team).to_query()
+            except Exception:
+                # A malformed source query (e.g. an unquoted reserved keyword used as an
+                # identifier) must not break autocomplete — degrade gracefully instead.
+                source_query = parse_select("select 1")
     else:
         source_query = parse_select("select 1")
 
@@ -462,18 +645,27 @@ def get_hogql_autocomplete(
             if isinstance(query.globals, dict):
                 if isinstance(node, ast.Field):
                     loop_globals: dict | None = query.globals
+                    entered_chain: list[str] = []
                     for index, key in enumerate(node.chain):
                         if MATCH_ANY_CHARACTER in str(key):
                             break
                         if loop_globals is not None and str(key) in loop_globals:
                             loop_globals = loop_globals[str(key)]
+                            entered_chain.append(str(key))
                         elif index == len(node.chain) - 1:
                             break
                         else:
                             loop_globals = None
                             break
                     if loop_globals is not None:
-                        add_globals_to_suggestions(loop_globals, response)
+                        # The sample event backing these globals is a real captured event, so its
+                        # property bag can still carry properties we no longer offer for querying.
+                        excluded_keys = (
+                            QUERY_DEPRECATED_EVENT_PROPERTIES
+                            if entered_chain == EVENT_PROPERTIES_GLOBALS_CHAIN
+                            else None
+                        )
+                        add_globals_to_suggestions(loop_globals, response, excluded_keys=excluded_keys)
                         # looking at a nested global object, no need for other suggestions
                         if loop_globals != query.globals:
                             break
@@ -507,7 +699,8 @@ def get_hogql_autocomplete(
             if query.filters:
                 try:
                     select_ast = cast(
-                        ast.SelectQuery, replace_filters(cast(ast.SelectQuery, select_ast), query.filters, team)
+                        ast.SelectQuery,
+                        replace_filters(cast(ast.SelectQuery, select_ast), query.filters, team, database=database),
                     )
                 except Exception:
                     pass
@@ -536,6 +729,14 @@ def get_hogql_autocomplete(
                 with timings.measure("select_field"):
                     table = get_table(context, nearest_select.select_from, ctes)
                     if table is None:
+                        if len(node.chain) == 1:
+                            prefix = "" if str(node.chain[0]) == MATCH_ANY_CHARACTER else str(node.chain[0])
+                            append_function_suggestions(
+                                suggestions=response.suggestions,
+                                language=query.language,
+                                context=context,
+                                prefix=prefix,
+                            )
                         continue
 
                     chain_len = len(node.chain)
@@ -575,20 +776,26 @@ def get_hogql_autocomplete(
                                     suggestions=response.suggestions,
                                     language=query.language,
                                     context=context,
+                                    node=node,
+                                    parent_node=parent_node,
                                 )
                                 break
 
                             field = last_table.fields[str(chain_part)]
 
                             if isinstance(field, StringJSONDatabaseField):
-                                if last_table.to_printed_hogql() == "events":
+                                if isinstance(last_table, EventsPersonSubTable):
+                                    property_type = PropertyDefinition.Type.PERSON
+                                elif isinstance(last_table, EventsGroupSubTable):
+                                    property_type = PropertyDefinition.Type.GROUP
+                                elif isinstance(last_table, EventsTable):
                                     if field.name == "person_properties":
                                         property_type = PropertyDefinition.Type.PERSON
                                     else:
                                         property_type = PropertyDefinition.Type.EVENT
-                                elif last_table.to_printed_hogql() == "persons":
+                                elif isinstance(last_table, PersonsTable):
                                     property_type = PropertyDefinition.Type.PERSON
-                                elif last_table.to_printed_hogql() == "groups":
+                                elif isinstance(last_table, GroupsTable):
                                     property_type = PropertyDefinition.Type.GROUP
                                 else:
                                     property_type = None
@@ -608,21 +815,30 @@ def get_hogql_autocomplete(
                                             name__contains=match_term,
                                             type=property_type,
                                         )
+                                        if property_type == PropertyDefinition.Type.EVENT:
+                                            property_query = property_query.exclude(
+                                                name__in=QUERY_DEPRECATED_EVENT_PROPERTIES
+                                            )
 
-                                    with timings.measure("property_count"):
-                                        total_property_count = property_query.count()
-
+                                    # One row past the limit sets `incomplete_list` without an unbounded COUNT(*):
+                                    # an empty match_term makes the filter `LIKE '%%'`, so that count walked the
+                                    # project's whole taxonomy. `posthog_propdef_proj_uniq` is keyed on (project,
+                                    # name, ...), so ordering by name reads it in index order and stops at the limit.
                                     with timings.measure("property_get_values"):
-                                        properties = property_query[:PROPERTY_DEFINITION_LIMIT].values(
-                                            "name", "property_type"
+                                        properties = list(
+                                            property_query.order_by("name")[: PROPERTY_DEFINITION_LIMIT + 1].values(
+                                                "name", "property_type"
+                                            )
                                         )
+
+                                    response.incomplete_list = len(properties) > PROPERTY_DEFINITION_LIMIT
+                                    properties = properties[:PROPERTY_DEFINITION_LIMIT]
 
                                     extend_responses(
                                         keys=[prop["name"] for prop in properties],
                                         suggestions=response.suggestions,
                                         details=[prop["property_type"] for prop in properties],
                                     )
-                                    response.incomplete_list = total_property_count > PROPERTY_DEFINITION_LIMIT
                             elif isinstance(field, VirtualTable) or isinstance(field, LazyTable):
                                 fields = list(field.fields.items())
                                 extend_responses(
@@ -659,8 +875,10 @@ def get_hogql_autocomplete(
             elif isinstance(node, ast.Field) and isinstance(parent_node, ast.JoinExpr):
                 # Handle table names
                 with timings.measure("table_name"):
-                    table_names = database.get_all_table_names()
-                    posthog_table_names = database.get_posthog_table_names()
+                    table_names = [name for name in database.get_all_table_names() if database.has_table(name)]
+                    posthog_table_names = [
+                        name for name in database.get_posthog_table_names() if database.has_table(name)
+                    ]
 
                     if len(node.chain) == 1:
                         extend_responses(
@@ -669,6 +887,15 @@ def get_hogql_autocomplete(
                             kind=AutocompleteCompletionItemKind.FOLDER,
                             details=["Table"] * len(table_names),
                         )
+                        table_function_names = get_direct_table_function_names(context)
+                        if table_function_names:
+                            extend_responses(
+                                keys=table_function_names,
+                                suggestions=response.suggestions,
+                                kind=AutocompleteCompletionItemKind.FUNCTION,
+                                insert_text=lambda key: f"{key}()",
+                                details=["Table function"] * len(table_function_names),
+                            )
                     elif node.chain[0] in posthog_table_names:
                         pass
                     else:
@@ -686,9 +913,7 @@ def get_hogql_autocomplete(
                 if node.chain[0] == MATCH_ANY_CHARACTER or (
                     "variables".startswith(str(node.chain[0])) and len(node.chain) == 1
                 ):
-                    insight_variables = InsightVariable.objects.filter(
-                        team_id=team.pk,
-                    ).order_by("name")
+                    insight_variables = insight_variables_for_team(team.pk)
                     code_names = [f"variables.{n.code_name}" for n in insight_variables if n.code_name]
                     extend_responses(
                         keys=code_names,
@@ -697,9 +922,7 @@ def get_hogql_autocomplete(
                         details=["Variable"] * len(code_names),
                     )
                 elif len(node.chain) > 1 and node.chain[0] == "variables":
-                    insight_variables = InsightVariable.objects.filter(
-                        team_id=team.pk,
-                    ).order_by("name")
+                    insight_variables = insight_variables_for_team(team.pk)
                     code_names = [n.code_name for n in insight_variables if n.code_name]
                     extend_responses(
                         keys=code_names,
@@ -742,8 +965,12 @@ def extract_json_row(query_to_try, query_start, query_end):
     return query_to_try, query_start, query_end
 
 
-def add_globals_to_suggestions(globalVars: dict, response: HogQLAutocompleteResponse):
+def add_globals_to_suggestions(
+    globalVars: dict, response: HogQLAutocompleteResponse, excluded_keys: set[str] | None = None
+):
     if isinstance(globalVars, dict):
+        if excluded_keys:
+            globalVars = {key: value for key, value in globalVars.items() if key not in excluded_keys}
         existing_values = {item.label for item in response.suggestions}
         values: list[str | None] = []
         for key, value in globalVars.items():

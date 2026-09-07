@@ -4,8 +4,6 @@ from braintrust import EvalCase
 
 from posthog.schema import AssistantRetentionEventsNode, AssistantRetentionFilter, AssistantRetentionQuery, NodeKind
 
-from ee.hogai.chat_agent.retention.toolkit import RETENTION_SCHEMA
-
 from ..base import MaxPublicEval
 from ..scorers import PlanAndQueryOutput, PlanCorrectness, QueryAndPlanAlignment, QueryKindSelection, TimeRangeRelevancy
 
@@ -30,7 +28,7 @@ async def eval_retention(call_root_for_insight_generation, pytestconfig):
             ),
             QueryAndPlanAlignment(
                 query_kind=NodeKind.RETENTION_QUERY,
-                json_schema=RETENTION_SCHEMA,
+                query_model=AssistantRetentionQuery,
                 evaluation_criteria="""
 1. Returning event alignment: Verify that the returning event in `retentionFilter.returningEntity.name` exactly matches the returning event specified in the plan.
 2. Target event alignment: Verify that the target event in `retentionFilter.targetEntity.name` exactly matches the target event specified in the plan.
@@ -81,8 +79,8 @@ Retention:
                         retentionFilter=AssistantRetentionFilter(
                             period="Week",
                             totalIntervals=11,
-                            returningEntity=AssistantRetentionEventsNode(name="$pageview"),
-                            targetEntity=AssistantRetentionEventsNode(name="$pageview"),
+                            returningEntity=AssistantRetentionEventsNode(id="$pageview"),
+                            targetEntity=AssistantRetentionEventsNode(id="$pageview"),
                         ),
                     ),
                 ),
@@ -103,8 +101,8 @@ Retention:
                         retentionFilter=AssistantRetentionFilter(
                             period="Month",
                             totalIntervals=11,
-                            returningEntity=AssistantRetentionEventsNode(name="signed_up"),
-                            targetEntity=AssistantRetentionEventsNode(name="viewed_dashboard"),
+                            returningEntity=AssistantRetentionEventsNode(id="signed_up"),
+                            targetEntity=AssistantRetentionEventsNode(id="viewed_dashboard"),
                         ),
                     ),
                 ),
@@ -134,7 +132,7 @@ Filters:
                             period="Day",
                             totalIntervals=14,
                             returningEntity=AssistantRetentionEventsNode(
-                                name="signed_up",
+                                id="signed_up",
                                 properties=[
                                     {
                                         "key": "$browser",
@@ -144,7 +142,7 @@ Filters:
                                     },
                                 ],
                             ),
-                            targetEntity=AssistantRetentionEventsNode(name="purchased"),
+                            targetEntity=AssistantRetentionEventsNode(id="purchased"),
                         ),
                     ),
                 ),
@@ -172,8 +170,8 @@ Time period: last 3 months
                         retentionFilter=AssistantRetentionFilter(
                             period="Week",
                             totalIntervals=12,
-                            returningEntity=AssistantRetentionEventsNode(name="signed_up"),
-                            targetEntity=AssistantRetentionEventsNode(name="purchased"),
+                            returningEntity=AssistantRetentionEventsNode(id="signed_up"),
+                            targetEntity=AssistantRetentionEventsNode(id="purchased"),
                         ),
                     ),
                 ),
@@ -194,8 +192,8 @@ Retention:
                         retentionFilter=AssistantRetentionFilter(
                             period="Week",
                             totalIntervals=11,
-                            returningEntity=AssistantRetentionEventsNode(name="viewed_pricing_page"),
-                            targetEntity=AssistantRetentionEventsNode(name="upgraded_plan"),
+                            returningEntity=AssistantRetentionEventsNode(id="viewed_pricing_page"),
+                            targetEntity=AssistantRetentionEventsNode(id="upgraded_plan"),
                         ),
                     ),
                 ),

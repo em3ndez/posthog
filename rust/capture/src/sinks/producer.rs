@@ -1,11 +1,11 @@
 use common_types::CapturedEventHeaders;
-use metrics::counter;
+use metrics::{counter, histogram};
 use rdkafka::error::{KafkaError, RDKafkaErrorCode};
 use rdkafka::producer::{DeliveryFuture, FutureProducer, FutureRecord, Producer};
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::error;
 
 use crate::api::CaptureError;
@@ -16,7 +16,7 @@ use crate::prometheus::report_dropped_events;
 pub struct ProduceRecord {
     pub topic: String,
     pub key: Option<String>,
-    pub payload: String,
+    pub payload: Vec<u8>,
     pub headers: CapturedEventHeaders,
 }
 
@@ -32,9 +32,21 @@ pub trait KafkaProducer: Send + Sync {
     fn flush(&self) -> Result<(), KafkaError>;
 }
 
-/// Future that wraps rdkafka's DeliveryFuture and converts the result to CaptureError
+/// Future that wraps rdkafka's DeliveryFuture and converts the result to CaptureError.
+/// Also records the full app-side ack duration (from `send_result()` returning to
+/// broker ack / error / cancellation) as a histogram so we can see the true long
+/// tail that the per-broker rdkafka rtt gauge smears away.
+///
+/// `recorded` flips to true once `poll` observes `Poll::Ready` so the Drop impl
+/// can emit a `capture_kafka_produce_ack_duration_ms{outcome="dropped"}` sample
+/// when the future is cancelled mid-flight (e.g. `JoinSet::abort_all()` fires
+/// after a peer ack fails). Without this, the slowest in-flight acks get
+/// censored out of the histogram precisely when the tail matters most.
 pub struct DeliveryAckFuture {
     inner: DeliveryFuture,
+    started: Instant,
+    topic: String,
+    recorded: bool,
 }
 
 impl Future for DeliveryAckFuture {
@@ -44,34 +56,63 @@ impl Future for DeliveryAckFuture {
         match Pin::new(&mut self.inner).poll(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(result) => {
-                let mapped = match result {
+                // Mark before recording so a panic inside the match still disables Drop.
+                self.recorded = true;
+                let elapsed_ms = self.started.elapsed().as_secs_f64() * 1000.0;
+                let (outcome, mapped) = match result {
                     Err(_) => {
                         // Cancelled due to timeout while retrying
                         metrics::counter!("capture_kafka_produce_errors_total").increment(1);
                         error!("failed to produce to Kafka before write timeout");
-                        Err(CaptureError::RetryableSinkError)
+                        ("cancelled", Err(CaptureError::RetryableSinkError))
                     }
                     Ok(Err((
                         KafkaError::MessageProduction(RDKafkaErrorCode::MessageSizeTooLarge),
                         _,
                     ))) => {
                         report_dropped_events("kafka_message_size", 1);
-                        Err(CaptureError::EventTooBig(
-                            "Event rejected by kafka broker during ack".to_string(),
-                        ))
+                        (
+                            "too_large",
+                            Err(CaptureError::EventTooBig(
+                                "Event rejected by kafka broker during ack".to_string(),
+                            )),
+                        )
                     }
                     Ok(Err((err, _))) => {
                         metrics::counter!("capture_kafka_produce_errors_total").increment(1);
                         error!("failed to produce to Kafka: {err:#}");
-                        Err(CaptureError::RetryableSinkError)
+                        ("broker_err", Err(CaptureError::RetryableSinkError))
                     }
                     Ok(Ok(_)) => {
                         metrics::counter!("capture_events_ingested_total").increment(1);
-                        Ok(())
+                        ("ok", Ok(()))
                     }
                 };
+                histogram!(
+                    "capture_kafka_produce_ack_duration_ms",
+                    "outcome" => outcome,
+                    "topic" => self.topic.clone()
+                )
+                .record(elapsed_ms);
                 Poll::Ready(mapped)
             }
+        }
+    }
+}
+
+impl Drop for DeliveryAckFuture {
+    fn drop(&mut self) {
+        // Only fires when the future is dropped before poll saw Ready
+        // (e.g. JoinSet::abort_all on batch fail-fast). Records the elapsed
+        // wait so tail-latency dashboards don't lose the slowest samples.
+        if !self.recorded {
+            let elapsed_ms = self.started.elapsed().as_secs_f64() * 1000.0;
+            histogram!(
+                "capture_kafka_produce_ack_duration_ms",
+                "outcome" => "dropped",
+                "topic" => self.topic.clone()
+            )
+            .record(elapsed_ms);
         }
     }
 }
@@ -92,10 +133,11 @@ impl<C: rdkafka::ClientContext + Send + Sync + 'static> KafkaProducer for RdKafk
 
     fn send(&self, record: ProduceRecord) -> Result<Self::AckFuture, CaptureError> {
         let headers: rdkafka::message::OwnedHeaders = record.headers.into();
+        let topic = record.topic.clone();
 
         match self.producer.send_result(FutureRecord {
             topic: &record.topic,
-            payload: Some(&record.payload),
+            payload: Some(record.payload.as_slice()),
             partition: None,
             key: record.key.as_deref(),
             timestamp: None,
@@ -103,6 +145,9 @@ impl<C: rdkafka::ClientContext + Send + Sync + 'static> KafkaProducer for RdKafk
         }) {
             Ok(delivery_future) => Ok(DeliveryAckFuture {
                 inner: delivery_future,
+                started: Instant::now(),
+                topic,
+                recorded: false,
             }),
             Err((e, _)) => match e.rdkafka_error_code() {
                 Some(RDKafkaErrorCode::MessageSizeTooLarge) => {
@@ -126,16 +171,43 @@ impl<C: rdkafka::ClientContext + Send + Sync + 'static> KafkaProducer for RdKafk
     }
 }
 
-/// Mock Kafka producer for testing - captures all sent records
+/// Mock Kafka producer for testing - captures all sent records.
+///
+/// Two failure modes, both keyed on the 0-based send index:
+/// - `new_failing_at`: the `idx`-th `send()` itself returns
+///   `CaptureError::RetryableSinkError` (an enqueue failure). Records before
+///   the failing index are still captured; the failing record is not.
+/// - `new_failing_ack_at`: every `send()` succeeds and captures its record,
+///   but the `idx`-th ack future resolves to `RetryableSinkError` — the
+///   producer accepted the record and its delivery report failed.
 #[derive(Clone, Default)]
 pub struct MockKafkaProducer {
     records: std::sync::Arc<std::sync::Mutex<Vec<ProduceRecord>>>,
+    fail_at_index: Option<usize>,
+    fail_ack_at_index: Option<usize>,
+    call_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl MockKafkaProducer {
     pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Build a producer that returns `RetryableSinkError` on the `idx`-th
+    /// `send()` call (0-based). All other calls succeed and capture the record.
+    pub fn new_failing_at(idx: usize) -> Self {
         Self {
-            records: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            fail_at_index: Some(idx),
+            ..Self::default()
+        }
+    }
+
+    /// Build a producer whose `idx`-th (0-based) ack future resolves to
+    /// `RetryableSinkError` after the send itself succeeded.
+    pub fn new_failing_ack_at(idx: usize) -> Self {
+        Self {
+            fail_ack_at_index: Some(idx),
+            ..Self::default()
         }
     }
 
@@ -154,7 +226,16 @@ impl KafkaProducer for MockKafkaProducer {
     type AckFuture = std::future::Ready<Result<(), CaptureError>>;
 
     fn send(&self, record: ProduceRecord) -> Result<Self::AckFuture, CaptureError> {
+        let idx = self
+            .call_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail_at_index == Some(idx) {
+            return Err(CaptureError::RetryableSinkError);
+        }
         self.records.lock().unwrap().push(record);
+        if self.fail_ack_at_index == Some(idx) {
+            return Ok(std::future::ready(Err(CaptureError::RetryableSinkError)));
+        }
         Ok(std::future::ready(Ok(())))
     }
 

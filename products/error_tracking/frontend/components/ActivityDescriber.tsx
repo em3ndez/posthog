@@ -3,7 +3,6 @@ import { useEffect } from 'react'
 
 import { Link } from '@posthog/lemon-ui'
 
-import { SentenceList } from 'lib/components/ActivityLog/SentenceList'
 import {
     ActivityChange,
     ActivityLogItem,
@@ -13,7 +12,8 @@ import {
     defaultDescriber,
     userNameForLogItem,
 } from 'lib/components/ActivityLog/humanizeActivity'
-import { objectsEqual } from 'lib/utils'
+import { SentenceList } from 'lib/components/ActivityLog/SentenceList'
+import { objectsEqual } from 'lib/utils/objects'
 import { urls } from 'scenes/urls'
 
 import { ErrorTrackingIssue, ErrorTrackingRelationalIssue } from '~/queries/schema/schema-general'
@@ -41,6 +41,13 @@ function AssigneeRenderer({ assignee }: { assignee: ErrorTrackingIssueAssignee }
             )}
         </AssigneeResolver>
     )
+}
+
+function relatedIssueIdsForLogItem(logItem: ActivityLogItem): string[] {
+    const change = (logItem.detail.changes || []).find(
+        (candidate) => candidate.field === 'merged_issue_ids' || candidate.field === 'split_issue_ids'
+    )
+    return Array.isArray(change?.after) ? change.after.map(String) : []
 }
 
 function nameAndLink(logItem?: ActivityLogItem): JSX.Element {
@@ -113,6 +120,7 @@ const errorTrackingIssueActionsMapping: Record<
 
     /** readonly / computed fields aren't described */
     id: () => null,
+    severity: () => null,
     name: () => null,
     description: () => null,
     first_seen: () => null,
@@ -124,6 +132,40 @@ export function ActivityDescriber(logItem: ActivityLogItem, asNotification?: boo
     if (logItem.scope !== ActivityScope.ERROR_TRACKING_ISSUE) {
         console.error('describer received a non-error tracking activity')
         return { description: null }
+    }
+
+    if (logItem.activity == 'merged' || logItem.activity == 'split') {
+        const relatedIssueIds = relatedIssueIdsForLogItem(logItem)
+        const count = relatedIssueIds.length
+        return {
+            description: (
+                <SentenceList
+                    listParts={[
+                        logItem.activity == 'merged' ? (
+                            <>
+                                merged {count === 1 ? 'an issue' : `${count} issues`} into {nameAndLink(logItem)}
+                            </>
+                        ) : (
+                            <>
+                                split {nameAndLink(logItem)} into{' '}
+                                {count > 0 ? (
+                                    <SentenceList
+                                        listParts={relatedIssueIds.map((issueId, index) => (
+                                            <Link key={issueId} to={urls.errorTrackingIssue(issueId)}>
+                                                {count === 1 ? 'a new issue' : `new issue ${index + 1}`}
+                                            </Link>
+                                        ))}
+                                    />
+                                ) : (
+                                    'new issues'
+                                )}
+                            </>
+                        ),
+                    ]}
+                    prefix={<strong className="ph-no-capture">{userNameForLogItem(logItem)}</strong>}
+                />
+            ),
+        }
     }
 
     if (logItem.activity == 'updated' || logItem.activity == 'assigned') {

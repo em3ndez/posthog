@@ -6,19 +6,10 @@ import { TaxonomicFilterGroupType } from 'lib/components/TaxonomicFilter/types'
 import UniversalFilters from 'lib/components/UniversalFilters/UniversalFilters'
 import { universalFiltersLogic } from 'lib/components/UniversalFilters/universalFiltersLogic'
 import { isUniversalGroupFilterLike } from 'lib/components/UniversalFilters/utils'
-import { ReplayActiveScreensTable } from 'scenes/session-recordings/components/ReplayActiveScreensTable'
 
 import { actionsModel } from '~/models/actionsModel'
-import {
-    FeaturePropertyFilter,
-    FilterLogicalOperator,
-    ReplayTemplateCategory,
-    ReplayTemplateType,
-    ReplayTemplateVariableType,
-} from '~/types'
+import { FilterLogicalOperator, ReplayTemplateCategory, ReplayTemplateType, ReplayTemplateVariableType } from '~/types'
 
-import { ReplayActiveHoursHeatMap } from '../components/ReplayActiveHoursHeatMap'
-import { ReplayActiveUsersTable } from '../components/ReplayActiveUsersTable'
 import { replayTemplates } from './availableTemplates'
 import { sessionReplayTemplatesLogic } from './sessionRecordingTemplatesLogic'
 
@@ -31,7 +22,7 @@ const allCategories: ReplayTemplateCategory[] = replayTemplates
     .flatMap((template) => template.categories)
     .filter((category, index, self) => self.indexOf(category) === index)
 
-const NestedFilterGroup = ({ buttonTitle, selectOne }: { buttonTitle?: string; selectOne?: boolean }): JSX.Element => {
+const NestedFilterGroup = ({ buttonTitle }: { buttonTitle?: string }): JSX.Element => {
     const { filterGroup } = useValues(universalFiltersLogic)
     const { replaceGroupValue, removeGroupValue } = useActions(universalFiltersLogic)
 
@@ -53,11 +44,9 @@ const NestedFilterGroup = ({ buttonTitle, selectOne }: { buttonTitle?: string; s
                         />
                     )
                 })}
-                {!selectOne || (selectOne && filterGroup.values.length === 0) ? (
-                    <div>
-                        <UniversalFilters.AddFilterButton title={buttonTitle} type="secondary" size="xsmall" />
-                    </div>
-                ) : null}
+                <div>
+                    <UniversalFilters.AddFilterButton title={buttonTitle} type="secondary" size="xsmall" />
+                </div>
             </div>
         </div>
     )
@@ -84,7 +73,7 @@ const SingleTemplateVariable = ({
                 size="small"
             />
         </div>
-    ) : ['event', 'flag', 'person-property'].includes(variable.type) ? (
+    ) : ['event', 'person-property'].includes(variable.type) ? (
         <div>
             <LemonLabel info={variable.description}>{variable.name}</LemonLabel>
             <UniversalFilters
@@ -96,28 +85,17 @@ const SingleTemplateVariable = ({
                 taxonomicGroupTypes={
                     variable.type === 'event'
                         ? [TaxonomicFilterGroupType.Events, TaxonomicFilterGroupType.Actions]
-                        : variable.type === 'flag'
-                          ? [TaxonomicFilterGroupType.FeatureFlags]
-                          : variable.type === 'person-property'
-                            ? [TaxonomicFilterGroupType.PersonProperties]
-                            : []
+                        : [TaxonomicFilterGroupType.PersonProperties]
                 }
                 onChange={(thisFilterGroup) => {
                     if (thisFilterGroup.values.length === 0) {
                         resetVariable({ ...variable, filterGroup: undefined })
-                    } else if (variable.type === 'flag') {
-                        setVariable({ ...variable, value: (thisFilterGroup.values[0] as FeaturePropertyFilter).key })
                     } else {
                         setVariable({ ...variable, filterGroup: thisFilterGroup.values[0] })
                     }
                 }}
             >
-                <NestedFilterGroup
-                    buttonTitle={`Select ${
-                        variable.type === 'event' ? 'event' : variable.type === 'flag' ? 'flag' : 'person property'
-                    }`}
-                    selectOne={variable.type == 'flag'}
-                />
+                <NestedFilterGroup buttonTitle={`Select ${variable.type === 'event' ? 'event' : 'person property'}`} />
             </UniversalFilters>
         </div>
     ) : null
@@ -188,13 +166,6 @@ const SessionRecordingTemplates = (): JSX.Element => {
     return (
         <div>
             <p>To get the most out of session replay, you just need to know where to start. </p>
-            <div className="flex flex-col gap-2 w-full">
-                <div className="flex flex-row gap-2 w-full">
-                    <ReplayActiveUsersTable />
-                    <ReplayActiveScreensTable />
-                </div>
-                <ReplayActiveHoursHeatMap />
-            </div>
             <h2 className="mt-4">Filter templates</h2>
             <p>
                 Use our templates to find a focus area, then watch the filtered replays to see where users struggle,

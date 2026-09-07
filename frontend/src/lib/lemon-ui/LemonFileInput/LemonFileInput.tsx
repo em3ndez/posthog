@@ -12,6 +12,7 @@ import { Spinner } from 'lib/lemon-ui/Spinner/Spinner'
 export interface LemonFileInputProps extends Pick<HTMLInputElement, 'multiple' | 'accept'> {
     value?: File[]
     onChange?: (newValue: File[]) => void
+    inputRef?: RefObject<HTMLInputElement>
     /**
      * are the files currently being uploaded?
      */
@@ -43,18 +44,19 @@ export const LemonFileInput = ({
     disabledReason,
     // e.g. '.json' or 'image/*'
     accept,
+    inputRef,
     alternativeDropTargetRef,
     callToAction,
     showUploadedFiles = true,
 }: LemonFileInputProps): JSX.Element => {
-    const [files, setFiles] = useState(value || value || ([] as File[]))
+    const [files, setFiles] = useState(value || ([] as File[]))
 
     // dragCounter and drag are used to track whether the user is dragging a file over the textarea
     // without drag counter the textarea highlight would flicker when the user drags a file over it
     let dragCounter = 0
     const [drag, setDrag] = useState(false)
     const dropRef = createRef<HTMLDivElement>()
-    const fileInputRef = createRef<HTMLInputElement>()
+    const fileInputRef = inputRef ?? createRef<HTMLInputElement>()
 
     useEffect(() => {
         if (value && value !== files) {
@@ -79,6 +81,7 @@ export const LemonFileInput = ({
             setFiles(localFiles)
             onChange?.(localFiles)
         }
+        e.target.value = ''
     }
 
     const handleDrag = (e: DragEvent): void => {
@@ -89,6 +92,9 @@ export const LemonFileInput = ({
     const handleDragIn = (e: DragEvent): void => {
         e.preventDefault()
         e.stopPropagation()
+        if (disabledReason) {
+            return
+        }
         dragCounter++
         if (e.dataTransfer?.items && e.dataTransfer.items.length > 0) {
             setDrag(true)
@@ -107,6 +113,9 @@ export const LemonFileInput = ({
     const handleDrop = (e: DragEvent): void => {
         e.preventDefault()
         e.stopPropagation()
+        if (disabledReason) {
+            return
+        }
         setDrag(false)
         if (e.dataTransfer?.files && e.dataTransfer.files.length > 0) {
             const filesArr = Array.prototype.slice.call(e.dataTransfer?.files)

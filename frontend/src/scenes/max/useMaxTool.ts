@@ -1,5 +1,5 @@
 import { useActions, useValues } from 'kea'
-import React, { useEffect } from 'react'
+import React, { useEffect, useMemo, useRef } from 'react'
 
 import { IconWrench } from '@posthog/icons'
 
@@ -8,7 +8,7 @@ import { SidePanelTab } from '~/types'
 
 import { ToolDefinition, ToolRegistration, getToolDefinition } from './max-constants'
 import { maxGlobalLogic } from './maxGlobalLogic'
-import { maxLogic } from './maxLogic'
+import { SIDE_PANEL_PANEL_ID, maxLogic } from './maxLogic'
 import { createSuggestionGroup } from './utils'
 
 export interface UseMaxToolOptions extends Omit<ToolRegistration, 'name' | 'description'> {
@@ -38,6 +38,7 @@ export function useMaxTool({
     contextDescription,
     introOverride,
     callback,
+    clientExecution,
     suggestions,
     active = true,
     initialMaxPrompt,
@@ -46,38 +47,61 @@ export function useMaxTool({
     const { registerTool, deregisterTool } = useActions(maxGlobalLogic)
     const { openSidePanel } = useActions(sidePanelLogic)
     const { sidePanelOpen, selectedTab } = useValues(sidePanelLogic)
-    const { setActiveGroup } = useActions(maxLogic({ tabId: 'sidepanel' }))
+    const { setActiveGroup, startNewConversation } = useActions(maxLogic({ panelId: SIDE_PANEL_PANEL_ID }))
 
     const definition = getToolDefinition(identifier)
     const isMaxOpen = sidePanelOpen && selectedTab === SidePanelTab.Max
+    const activeIdentifierRef = useRef<string | null>(null)
+    const contextKey = useMemo(() => JSON.stringify(context), [context])
 
     useEffect(() => {
-        // Register/deregister tool
-        if (active && definition) {
-            registerTool({
-                identifier,
-                name: definition.name,
-                description: definition.description,
-                context,
-                contextDescription,
-                introOverride,
-                suggestions,
-                callback,
-            })
-            return (): void => deregisterTool(identifier)
+        if (!active || !definition) {
+            if (activeIdentifierRef.current) {
+                deregisterTool(activeIdentifierRef.current)
+                activeIdentifierRef.current = null
+            }
+            return
         }
+
+        if (activeIdentifierRef.current && activeIdentifierRef.current !== identifier) {
+            deregisterTool(activeIdentifierRef.current)
+        }
+
+        activeIdentifierRef.current = identifier
+        registerTool({
+            identifier,
+            name: definition.name,
+            description: definition.description,
+            context,
+            contextDescription,
+            introOverride,
+            suggestions,
+            callback,
+            clientExecution,
+        })
+        // oxlint-disable-next-line react-hooks/exhaustive-deps -- context is tracked via contextKey (serialized) so identity churn doesn't re-register the tool
     }, [
         active,
         identifier,
         definition,
-        JSON.stringify(context), // oxlint-disable-line react-hooks/exhaustive-deps
+        contextKey,
         contextDescription,
         introOverride,
         suggestions,
         callback,
+        clientExecution,
         registerTool,
         deregisterTool,
     ])
+
+    useEffect(() => {
+        return (): void => {
+            if (activeIdentifierRef.current) {
+                deregisterTool(activeIdentifierRef.current)
+                activeIdentifierRef.current = null
+            }
+        }
+    }, [deregisterTool])
 
     return {
         definition: active ? definition : null,
@@ -85,6 +109,8 @@ export function useMaxTool({
         openMax: !active
             ? null
             : (): void => {
+                  // Start a new conversation so the prompt doesn't get added to an existing session
+                  startNewConversation()
                   // Show the suggestions from this specific tool
                   if (definition && suggestions && suggestions.length > 0) {
                       setActiveGroup(

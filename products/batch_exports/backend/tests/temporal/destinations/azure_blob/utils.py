@@ -15,9 +15,9 @@ from temporalio.common import RetryPolicy
 from temporalio.testing import WorkflowEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
-from posthog.batch_exports.service import BatchExportModel, BatchExportSchema
 from posthog.temporal.tests.utils.models import afetch_batch_export_runs
 
+from products.batch_exports.backend.service import BatchExportModel, BatchExportSchema
 from products.batch_exports.backend.temporal.batch_exports import finish_batch_export_run, start_batch_export_run
 from products.batch_exports.backend.temporal.destinations.azure_blob_batch_export import (
     AzureBlobBatchExportInputs,
@@ -26,8 +26,9 @@ from products.batch_exports.backend.temporal.destinations.azure_blob_batch_expor
     insert_into_azure_blob_activity_from_stage,
 )
 from products.batch_exports.backend.temporal.pipeline.internal_stage import insert_into_internal_stage_activity
+from products.batch_exports.backend.temporal.queue import RecordBatchQueue
 from products.batch_exports.backend.temporal.record_batch_model import SessionsRecordBatchModel
-from products.batch_exports.backend.temporal.spmc import Producer, RecordBatchQueue
+from products.batch_exports.backend.tests.temporal.utils.clickhouse_test_producer import ClickHouseTestProducer
 from products.batch_exports.backend.tests.temporal.utils.records import get_record_batch_from_queue
 
 
@@ -43,7 +44,9 @@ async def download_blob(container: ContainerClient, name: str) -> bytes:
     """Download blob content as bytes."""
     blob_client = container.get_blob_client(name)
     stream = await blob_client.download_blob()
-    return await stream.readall()
+    data = await stream.readall()
+    assert isinstance(data, bytes)
+    return data
 
 
 def decompress(data: bytes, compression: str | None) -> bytes:
@@ -64,11 +67,13 @@ def parse_jsonl(data: bytes) -> list[dict]:
     return [json.loads(line) for line in data.decode().strip().split("\n") if line]
 
 
-def normalize_record(record: dict, json_columns: tuple[str, ...]) -> dict:
+def normalize_record(record: dict, json_columns: tuple[str, ...], skip_columns: set[str] | None = None) -> dict:
     """Format datetimes as ISO strings and parse JSON columns."""
     normalized = {}
     for key, value in record.items():
-        if isinstance(value, dt.datetime):
+        if skip_columns and key in skip_columns:
+            continue
+        elif isinstance(value, dt.datetime):
             normalized[key] = value.isoformat()
         elif key in json_columns and value is not None:
             normalized[key] = json.loads(value)
@@ -158,19 +163,30 @@ async def assert_clickhouse_records_in_azure_blob(
         compression=compression,
         json_columns=json_columns,
     )
-
     model_name, fields, filters, extra_query_parameters = extract_model_configuration(batch_export_model)
+
+    if model_name == "events":
+        assert all("azure_blob_ingested_timestamp" in record for record in exported_records), (
+            "Export didn't include ingested timestamp when expected"
+        )
+
+        exported_records = [
+            {k: v for k, v in record.items() if k != "azure_blob_ingested_timestamp"} for record in exported_records
+        ]
 
     expected_records = []
     queue = RecordBatchQueue()
-    producer = Producer(model=SessionsRecordBatchModel(team_id)) if model_name == "sessions" else Producer()
+    producer = (
+        ClickHouseTestProducer(model=SessionsRecordBatchModel(team_id))
+        if model_name == "sessions"
+        else ClickHouseTestProducer()
+    )
 
     producer_task = await producer.start(
         queue=queue,
         model_name=model_name,
         team_id=team_id,
         full_range=(data_interval_start, data_interval_end),
-        done_ranges=[],
         fields=fields,
         filters=filters,
         destination_default_fields=azure_blob_default_fields(),
@@ -187,7 +203,9 @@ async def assert_clickhouse_records_in_azure_blob(
         if record_batch is None:
             break
         for record in record_batch.to_pylist():
-            expected_records.append(normalize_record(record, json_columns))
+            expected_records.append(
+                normalize_record(record, json_columns, skip_columns={"azure_blob_ingested_timestamp"})
+            )
 
     assert len(exported_records) > 0, "No records were exported to Azure Blob"
     assert len(expected_records) > 0, "No expected records were produced from Producer"

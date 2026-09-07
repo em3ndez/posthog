@@ -1,14 +1,14 @@
 import { Page } from '@playwright/test'
 
-import { delay } from 'lib/utils'
+import { delay } from 'lib/utils/async'
 
-import { expect } from '../utils/playwright-test-base'
+import { expect } from '../utils/workspace-test-base'
 
 export class CohortPage {
     constructor(private readonly page: Page) {}
 
     async createCohort(name: string): Promise<void> {
-        await this.page.click('[data-attr="new-cohort"]')
+        await this.page.click('[data-attr="create-cohort"]')
         await this.page.click('[data-attr="cohort-selector-field-value"]')
         await this.page.click('[data-attr="cohort-personPropertyBehavioral-have_property-type"]')
         await this.page.click('[data-attr="cohort-taxonomic-field-key"]')

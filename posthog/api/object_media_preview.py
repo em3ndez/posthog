@@ -4,7 +4,6 @@ from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 
 from posthog.api.routing import TeamAndOrgViewSetMixin
-from posthog.auth import TemporaryTokenAuthentication
 from posthog.models import EventDefinition, ObjectMediaPreview, UploadedMedia
 
 
@@ -64,7 +63,7 @@ class ObjectMediaPreviewSerializer(serializers.ModelSerializer):
                 raise ValidationError("Uploaded media not found or does not belong to this team")
 
         if exported_asset_id:
-            from posthog.models.exported_asset import ExportedAsset
+            from products.exports.backend.models.exported_asset import ExportedAsset
 
             try:
                 exported_asset = ExportedAsset.objects.get(id=exported_asset_id, team=team)
@@ -94,7 +93,6 @@ class ObjectMediaPreviewViewSet(
     scope_object = "event_definition"
     serializer_class = ObjectMediaPreviewSerializer
     queryset = ObjectMediaPreview.objects.all()
-    authentication_classes = [TemporaryTokenAuthentication]
 
     def safely_get_queryset(self, queryset):
         # Filter by event_definition if provided

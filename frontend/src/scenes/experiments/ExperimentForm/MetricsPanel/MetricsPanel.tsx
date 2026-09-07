@@ -2,18 +2,20 @@ import { useActions } from 'kea'
 
 import { SharedMetric } from 'scenes/experiments/SharedMetrics/sharedMetricLogic'
 
-import type { ExperimentMetric } from '~/queries/schema/schema-general'
+import type { ExperimentExposureCriteria, ExperimentMetric } from '~/queries/schema/schema-general'
 import { isExperimentMetric } from '~/queries/utils'
-import { ExperimentMetricModal } from '~/scenes/experiments/Metrics/ExperimentMetricModal'
-import { MetricSourceModal } from '~/scenes/experiments/Metrics/MetricSourceModal'
-import { SharedMetricModal } from '~/scenes/experiments/Metrics/SharedMetricModal'
+import { ExposureCriteriaModal } from '~/scenes/experiments/ExperimentView/ExposureCriteria'
+import type { Experiment } from '~/types'
+
+import { ExperimentMetricModal } from 'products/experiments/frontend/modals/ExperimentMetricModal/ExperimentMetricModal'
 import {
     METRIC_CONTEXTS,
     MetricContext,
     experimentMetricModalLogic,
-} from '~/scenes/experiments/Metrics/experimentMetricModalLogic'
-import { sharedMetricModalLogic } from '~/scenes/experiments/Metrics/sharedMetricModalLogic'
-import type { Experiment } from '~/types'
+} from 'products/experiments/frontend/modals/ExperimentMetricModal/experimentMetricModalLogic'
+import { MetricSourceModal } from 'products/experiments/frontend/modals/MetricSourceModal/MetricSourceModal'
+import { SharedMetricModal } from 'products/experiments/frontend/modals/SharedMetricModal/SharedMetricModal'
+import { sharedMetricModalLogic } from 'products/experiments/frontend/modals/SharedMetricModal/sharedMetricModalLogic'
 
 import { EmptyMetricsPanel } from './EmptyMetricsPanel'
 import { MetricList } from './MetricList'
@@ -24,6 +26,8 @@ export type MetricsPanelProps = {
     onSaveMetric: (metric: ExperimentMetric, context: MetricContext) => void
     onDeleteMetric: (metric: ExperimentMetric, context: MetricContext) => void
     onSaveSharedMetrics: (metrics: ExperimentMetric[], context: MetricContext) => void
+    onSaveExposureCriteria: (exposureCriteria: ExperimentExposureCriteria) => void
+    compact?: boolean
 }
 
 const convertSharedMetricToExperimentMetric = ({ id, query, name }: SharedMetric): ExperimentMetric =>
@@ -40,6 +44,8 @@ export const MetricsPanel = ({
     onSaveMetric,
     onDeleteMetric,
     onSaveSharedMetrics,
+    onSaveExposureCriteria,
+    compact,
 }: MetricsPanelProps): JSX.Element => {
     const { closeExperimentMetricModal } = useActions(experimentMetricModalLogic)
     const { closeSharedMetricModal } = useActions(sharedMetricModalLogic)
@@ -55,8 +61,12 @@ export const MetricsPanel = ({
 
     return (
         <div>
-            <div className="font-semibold mb-2">Metrics</div>
-            <div className="text-muted mb-4">Add metrics to measure your experiment's impact.</div>
+            {!compact && (
+                <>
+                    <div className="font-semibold mb-2">Metrics</div>
+                    <div className="text-muted mb-4">Add metrics to measure your experiment's impact.</div>
+                </>
+            )}
 
             {primaryMetrics.length === 0 && secondaryMetrics.length === 0 ? (
                 <EmptyMetricsPanel />
@@ -98,11 +108,8 @@ export const MetricsPanel = ({
                     onSaveSharedMetrics(sharedMetrics, context)
                     closeSharedMetricModal()
                 }}
-                onDelete={(metric, context) => {
-                    onDeleteMetric(convertSharedMetricToExperimentMetric(metric), context)
-                    closeSharedMetricModal()
-                }}
             />
+            <ExposureCriteriaModal onSave={onSaveExposureCriteria} />
         </div>
     )
 }

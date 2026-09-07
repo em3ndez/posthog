@@ -1,4 +1,6 @@
 import ipaddress
+from concurrent.futures import Future, ThreadPoolExecutor
+from threading import Barrier, BoundedSemaphore
 
 import pytest
 
@@ -12,6 +14,76 @@ def force_prod(monkeypatch):
 
 
 class TestUrlValidation:
+    def test_resolve_host_ips_uses_bounded_lifetime(self, monkeypatch):
+        class Answers:
+            def addresses(self):
+                return iter(["93.184.216.34"])
+
+        class Resolver:
+            def resolve_name(self, host, *, lifetime):
+                assert host == "example.com"
+                assert lifetime == uv.DNS_RESOLUTION_LIFETIME_SECONDS
+                return Answers()
+
+        monkeypatch.setattr(uv.dns.resolver, "Resolver", Resolver)
+
+        assert uv.resolve_host_ips("example.com") == {ipaddress.ip_address("93.184.216.34")}
+
+    def test_resolve_url_hosts_ips_deduplicates_hosts(self, monkeypatch):
+        def fake_resolve_hosts_ips(hosts):
+            assert hosts == {"shared.example.com"}
+            return {"shared.example.com": {ipaddress.ip_address("93.184.216.34")}}
+
+        monkeypatch.setattr(uv, "resolve_hosts_ips", fake_resolve_hosts_ips)
+
+        assert uv.resolve_url_hosts_ips(["https://shared.example.com/first", "https://shared.example.com/second"]) == {
+            "shared.example.com": {ipaddress.ip_address("93.184.216.34")}
+        }
+
+    def test_resolve_hosts_ips_stops_at_batch_deadline(self, monkeypatch):
+        pending_future: Future[uv.ResolvedIPs] = Future()
+
+        class Executor:
+            def submit(self, _function, _host):
+                return pending_future
+
+        monkeypatch.setattr(uv, "_dns_resolution_executor", Executor())
+        monkeypatch.setattr(uv, "DNS_RESOLUTION_BATCH_TIMEOUT_SECONDS", 0)
+
+        assert uv.resolve_hosts_ips({"slow.example.com"}) == {"slow.example.com": set()}
+        assert pending_future.cancelled()
+
+    def test_resolve_hosts_ips_starts_all_allowed_hosts_within_the_batch_deadline(self, monkeypatch):
+        hosts = {f"host-{index}.example.com" for index in range(20)}
+        all_workers_started = Barrier(len(hosts))
+        public_ip = ipaddress.ip_address("93.184.216.34")
+
+        def resolve_after_all_workers_start(_host):
+            all_workers_started.wait(timeout=1)
+            return {public_ip}
+
+        executor = ThreadPoolExecutor(max_workers=uv.DNS_RESOLUTION_MAX_WORKERS)
+        monkeypatch.setattr(uv, "_dns_resolution_executor", executor)
+        monkeypatch.setattr(uv, "resolve_host_ips", resolve_after_all_workers_start)
+
+        try:
+            assert uv.resolve_hosts_ips(hosts) == {host: {public_ip} for host in hosts}
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+    def test_resolve_hosts_ips_fails_closed_when_global_capacity_is_exhausted(self, monkeypatch):
+        capacity = BoundedSemaphore(1)
+        capacity.acquire()
+
+        class Executor:
+            def submit(self, _function, _host):
+                raise AssertionError("capacity exhaustion must prevent queueing")
+
+        monkeypatch.setattr(uv, "_dns_resolution_capacity", capacity)
+        monkeypatch.setattr(uv, "_dns_resolution_executor", Executor())
+
+        assert uv.resolve_hosts_ips({"busy.example.com"}) == {"busy.example.com": set()}
+
     def test_is_url_allowed_disallowed_scheme(self):
         ok, err = uv.is_url_allowed("javascript:alert(1)")
         assert not ok and "scheme" in (err or "")
@@ -34,9 +106,33 @@ class TestUrlValidation:
         assert ok and err is None
         assert uv.should_block_url("http://localhost/x") is False
 
-    def test_is_url_allowed_private_resolution_blocked(self, monkeypatch):
+    def test_force_url_validation_setting_disables_dev_bypass(self, monkeypatch, settings):
+        monkeypatch.setattr(uv, "is_dev_mode", lambda: True)
+        settings.FORCE_URL_VALIDATION = True
+        ok, err = uv.is_url_allowed("http://localhost")
+        assert not ok and "Loopback" in (err or "")
+
+    def test_force_url_validation_setting_off_keeps_dev_bypass(self, monkeypatch, settings):
+        monkeypatch.setattr(uv, "is_dev_mode", lambda: True)
+        settings.FORCE_URL_VALIDATION = False
+        ok, err = uv.is_url_allowed("http://localhost")
+        assert ok and err is None
+
+    @pytest.mark.parametrize(
+        "resolved_ip",
+        [
+            "192.168.1.10",
+            # CGNAT (RFC 6598): neither is_private nor is_global, so the attribute flags
+            # alone let it through; guards the explicit _CGNAT_NETWORK check.
+            "100.64.0.1",
+            "100.127.255.255",
+            # IPv4-mapped form of a CGNAT address, which network membership alone misses.
+            "::ffff:100.64.0.1",
+        ],
+    )
+    def test_is_url_allowed_private_resolution_blocked(self, resolved_ip, monkeypatch):
         def fake_resolve(host: str):
-            return {ipaddress.ip_address("192.168.1.10")}
+            return {ipaddress.ip_address(resolved_ip)}
 
         monkeypatch.setattr(uv, "resolve_host_ips", fake_resolve)
         ok, err = uv.is_url_allowed("https://example.com")
@@ -48,6 +144,27 @@ class TestUrlValidation:
 
         monkeypatch.setattr(uv, "resolve_host_ips", fake_resolve)
         ok, err = uv.is_url_allowed("https://example.com/path")
+        assert ok and err is None
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://user%40corp.example:pass@example.com/path",
+            "https://user:p%2Fss@example.com/path",
+            "https://user:p%3Fss@example.com/path",
+            "https://user:p%23ss@example.com/path",
+        ],
+    )
+    def test_is_url_allowed_permits_percent_encoded_credentials(self, url, monkeypatch):
+        # Integrations and warehouse sources supply connection URLs with basic auth, and an
+        # email username or a password holding a reserved character has to percent-encode it.
+        # Every parser resolves these to example.com, so the fetch path takes the lenient
+        # rule. Swapping it for has_ambiguous_authority would break all of them.
+        def fake_resolve(host: str):
+            return {ipaddress.ip_address("93.184.216.34")}
+
+        monkeypatch.setattr(uv, "resolve_host_ips", fake_resolve)
+        ok, err = uv.is_url_allowed(url)
         assert ok and err is None
 
     @pytest.mark.parametrize(
@@ -170,3 +287,112 @@ class TestUrlValidation:
         monkeypatch.setattr(uv, "resolve_host_ips", fake_resolve)
         ok, err = uv.is_url_allowed("http://xn--n3h.com/")
         assert ok and err is None
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # urlparse extracts "example.com", but requests/urllib3 connect to 169.254.169.254.
+            "http://169.254.169.254\\@example.com/latest/meta-data/",
+            # Same trick, percent-encoded backslash. Browsers decode and follow to localhost.
+            "http://localhost%5C@example.com/",
+            "http://127.0.0.1\\@example.com/",
+            "https://attacker.com\\@example.com/",
+        ],
+    )
+    def test_backslash_authority_bypass_blocked(self, url, monkeypatch):
+        """Backslash (raw or %5c) before @ breaks urlparse-vs-client agreement on the host."""
+
+        def fake_resolve(host: str):
+            return {ipaddress.ip_address("93.184.216.34")}
+
+        monkeypatch.setattr(uv, "resolve_host_ips", fake_resolve)
+        ok, err = uv.is_url_allowed(url)
+        assert not ok
+        assert err == "Invalid URL: ambiguous authority"
+
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            ("http://example.com/", False),
+            ("http://example.com/path\\with-backslash", True),
+            ("http://example.com%5Cpath", True),
+            ("http://attacker.com\\@example.com", True),
+            # Percent-encoded credentials are ordinary basic auth. Every parser resolves
+            # these to example.com, so blocking them would break outbound fetches that
+            # carry an email username or a password containing a reserved character.
+            ("https://user%40corp.example:pass@example.com/path", False),
+            ("https://user:p%2Fss@example.com/path", False),
+            ("https://user:p%23ss@example.com/path", False),
+        ],
+    )
+    def test_has_authority_bypass_chars(self, url, expected):
+        assert uv.has_authority_bypass_chars(url) is expected
+
+    @pytest.mark.parametrize(
+        "url,expected",
+        [
+            # A consumer that percent-decodes before splitting the authority sees it end
+            # at the terminator, landing on a different host than urlparse reports.
+            ("https://example.com%2F@attacker.com/", True),
+            ("https://example.com%3f@attacker.com/", True),
+            ("https://example.com%23@attacker.com/", True),
+            ("https://example.com%40@attacker.com/", True),
+            ("https://example.com%2Fpath", True),
+            # Credentials are legitimate on a fetch but not on a URL we hand back, and
+            # the encoded characters in them are exactly what makes the authority
+            # ambiguous, so the strict rule rejects them where the lenient one allows.
+            ("https://user%40corp.example:pass@example.com/path", True),
+            # The strict rule subsumes the backslash cases.
+            ("http://attacker.com\\@example.com", True),
+            ("http://example.com%5Cpath", True),
+            ("https://example.com/", False),
+            # The same sequences outside the authority are ordinary encoded data.
+            ("https://example.com/repos/group%2Fproject", False),
+            ("https://example.com/send?to=someone%40example.com", False),
+            ("https://example.com/search#q=a%23b", False),
+            # Unparseable authorities fail closed rather than raising.
+            ("https://[::1", True),
+            ("https://exa℀mple.com/", True),
+        ],
+    )
+    def test_has_ambiguous_authority(self, url, expected):
+        assert uv.has_ambiguous_authority(url) is expected
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "https://prod-25.westeurope.logic.azure.com:443/workflows/abc/triggers/manual/paths/invoke?sig=x",
+            "https://acme.webhook.office.com/webhookb2/guid@guid/IncomingWebhook/hash/guid",
+            "https://europe.powerautomate.com/manual/paths/invoke",
+            "https://prod-01.flow.microsoft.com/manual/paths/invoke",
+            "https://acme.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/abc",
+        ],
+    )
+    def test_accepts_microsoft_teams_webhook_url(self, url):
+        assert uv.is_microsoft_teams_webhook_url(url) is True
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            # Both hostnames are registrable by anyone and satisfy the unescaped-dot patterns in
+            # the CDP Teams template. They must not satisfy these.
+            "https://evilpowerautomate.com/x",
+            "https://aaaflow-microsoft.com/y",
+            "https://evil.example.com/logic.azure.com/workflows/abc",
+            "https://logic.azure.com.evil.example.com/workflows/abc",
+            "http://prod-25.westeurope.logic.azure.com/workflows/abc/triggers/manual/paths/invoke",
+            "https://prod-25.westeurope.logic.azure.com:8443/workflows/abc/triggers/manual/paths/invoke",
+            "https://prod-25.westeurope.logic.azure.com/workflows/abc",
+            "https://acme.webhook.office.com/webhookb2/guid",
+            "https://acme.webhook.office.com/something-else/guid",
+            "https://prod-25.westeurope.logic.azure.com\\@evil.example.com/workflows/abc/triggers/manual/paths/invoke",
+            "definitely not a url",
+            "",
+            # `requests` would turn the userinfo into a Basic Authorization header on the send,
+            # and the credential would live on in the stored subscription.
+            "https://user:pass@prod-25.westeurope.logic.azure.com/workflows/abc/triggers/manual/paths/invoke",
+            "https://user@prod-25.westeurope.logic.azure.com/workflows/abc/triggers/manual/paths/invoke",
+        ],
+    )
+    def test_rejects_non_teams_webhook_url(self, url):
+        assert uv.is_microsoft_teams_webhook_url(url) is False

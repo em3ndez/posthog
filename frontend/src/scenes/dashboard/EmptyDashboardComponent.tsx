@@ -1,151 +1,187 @@
-import './EmptyDashboardComponent.scss'
-
 import { useActions, useValues } from 'kea'
 import { router } from 'kea-router'
-import React from 'react'
 
+import * as chartPng from '@posthog/brand/hoggies/png/chart'
 import { IconPlus } from '@posthog/icons'
+import { DashboardLoadingState } from '@posthog/products-dashboards/frontend/components/DashboardLoadingState/DashboardLoadingState'
 
+import { pngHoggie } from 'lib/brand/hoggies'
 import { AccessControlAction } from 'lib/components/AccessControlAction'
+import { ProductIntroduction } from 'lib/components/ProductIntroduction/ProductIntroduction'
 import { LemonButton } from 'lib/lemon-ui/LemonButton'
-import { LemonSkeleton } from 'lib/lemon-ui/LemonSkeleton'
+import { LemonMenuOverlay } from 'lib/lemon-ui/LemonMenu'
+import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
+import { maxGlobalLogic } from 'scenes/max/maxGlobalLogic'
 import { urls } from 'scenes/urls'
 
-import { AccessControlLevel, AccessControlResourceType } from '~/types'
+import { sidePanelStateLogic } from '~/layout/navigation-3000/sidepanel/sidePanelStateLogic'
+import {
+    AccessControlLevel,
+    AccessControlResourceType,
+    DashboardType,
+    QueryBasedInsightModel,
+    SidePanelTab,
+} from '~/types'
 
-import { DASHBOARD_CANNOT_EDIT_MESSAGE } from './DashboardHeader'
 import { addInsightToDashboardLogic } from './addInsightToDashboardModalLogic'
+import { DashboardAiPromptComposer } from './DashboardAiPromptComposer'
+import { DASHBOARD_CANNOT_EDIT_MESSAGE } from './DashboardHeader'
+import { getAddTileMenuItems } from './DashboardHeaderActions'
 import { dashboardLogic } from './dashboardLogic'
 
-function SkeletonCard({ children, active }: { children: React.ReactNode; active: boolean }): JSX.Element {
-    return (
-        <div className="border rounded p-10 h-full deprecated-space-y-4 flex-1 flex flex-col justify-between">
-            <div className="deprecated-space-y-4">
-                <LemonSkeleton className="w-1/3 h-4" active={active} />
-                <LemonSkeleton className="w-1/2 h-4" active={active} />
-            </div>
-            {children}
-        </div>
-    )
-}
+const HedgehogChart = pngHoggie(chartPng)
 
-function SkeletonCardOne({ active }: { active: boolean }): JSX.Element {
+const BASE_TEXT = 'Add a chart from your library, or start with a question about what matters to your product.'
+
+function DashboardEmptyActions({
+    canEdit,
+    dashboard,
+    aiDisabledReason,
+    dashboardWidgetsEnabled,
+    onAddInsight,
+    onAddText,
+    onAddImage,
+    onAddButton,
+    onAddWidget,
+    push,
+    onOpenAiWithPrompt,
+}: {
+    canEdit: boolean
+    dashboard: DashboardType<QueryBasedInsightModel> | null | undefined
+    aiDisabledReason: string | false
+    dashboardWidgetsEnabled: boolean
+    onAddInsight: () => void
+    onAddText: () => void
+    onAddImage: () => void
+    onAddButton: () => void
+    onAddWidget: () => void
+    push: (path: string) => void
+    onOpenAiWithPrompt: (prompt: string) => void
+}): JSX.Element {
+    const { reportDashboardEmptyAddChartClicked, reportDashboardEmptyWebAnalyticsClicked } = useActions(eventUsageLogic)
+    const chipDisabledReason = !canEdit ? DASHBOARD_CANNOT_EDIT_MESSAGE : aiDisabledReason || undefined
+    const handleAddInsight = (): void => {
+        reportDashboardEmptyAddChartClicked(dashboard?.id)
+        onAddInsight()
+    }
+
     return (
-        <SkeletonCard active={active}>
-            <div className="flex justify-center flex-1 items-end gap-10">
-                {[100, 66, 33].map((height) => (
-                    <div
-                        key={height}
-                        className="border border-primary rounded overflow-hidden flex flex-col justify-end w-[15%] h-[80%]"
+        <div className="flex flex-col gap-4 w-full max-w-full">
+            {!aiDisabledReason && (
+                <DashboardAiPromptComposer
+                    dashboardId={dashboard?.id}
+                    disabledReason={chipDisabledReason}
+                    onOpenAiWithPrompt={onOpenAiWithPrompt}
+                />
+            )}
+            <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-2 @min-[48rem]/main-content:justify-start">
+                {dashboard && (
+                    <AccessControlAction
+                        resourceType={AccessControlResourceType.Dashboard}
+                        minAccessLevel={AccessControlLevel.Editor}
+                        userAccessLevel={dashboard.user_access_level}
                     >
-                        {/* eslint-disable-next-line react/forbid-dom-props */}
-                        <div style={{ height: `${height}%` }}>
-                            <LemonSkeleton active={active} className="h-full w-full" />
-                        </div>
-                    </div>
-                ))}
-            </div>
-        </SkeletonCard>
-    )
-}
-
-function SkeletonBarsRaw({ active }: { active: boolean }): JSX.Element {
-    return (
-        <div className="flex items-end gap-1 flex-1">
-            {Array(8)
-                .fill(0)
-                .map((_, index) => {
-                    const height = Math.random() * 60 + 10
-                    return (
-                        <div
-                            key={index}
-                            className="w-[12.5%]"
-                            // eslint-disable-next-line react/forbid-dom-props
-                            style={{
-                                height: `${height}%`,
+                        <LemonButton
+                            data-attr="dashboard-add-graph-header"
+                            type="primary"
+                            icon={<IconPlus />}
+                            onClick={handleAddInsight}
+                            disabledReason={canEdit ? null : DASHBOARD_CANNOT_EDIT_MESSAGE}
+                            sideAction={{
+                                dropdown: {
+                                    placement: 'bottom-end',
+                                    overlay: (
+                                        <LemonMenuOverlay
+                                            items={getAddTileMenuItems({
+                                                dashboardWidgetsEnabled,
+                                                onAddInsight: handleAddInsight,
+                                                onAddText,
+                                                onAddImage,
+                                                onAddButton,
+                                                push,
+                                                setAddWidgetModalOpen: onAddWidget,
+                                            })}
+                                        />
+                                    ),
+                                },
+                                disabled: !canEdit,
+                                disabledReason: canEdit ? null : DASHBOARD_CANNOT_EDIT_MESSAGE,
+                                'data-attr': 'dashboard-add-dropdown',
                             }}
                         >
-                            <LemonSkeleton active={active} className="h-full w-full" />
-                        </div>
-                    )
-                })}
+                            Add an existing chart
+                        </LemonButton>
+                    </AccessControlAction>
+                )}
+                <LemonButton
+                    type="secondary"
+                    to={urls.webAnalytics()}
+                    onClick={() => reportDashboardEmptyWebAnalyticsClicked(dashboard?.id)}
+                >
+                    or View Web Analytics
+                </LemonButton>
+            </div>
         </div>
     )
 }
-/** This component looks different on each render due to Math.random() calls within, so it's memoized to avoid that. */
-const SkeletonBars = React.memo(SkeletonBarsRaw)
 
-function SkeletonCardTwo({ active }: { active: boolean }): JSX.Element {
+function EmptyDashboardContent({ canEdit }: { canEdit: boolean }): JSX.Element {
+    const { showAddInsightToDashboardModal } = useActions(addInsightToDashboardLogic)
+    const { dashboard, dashboardWidgetsEnabled } = useValues(dashboardLogic)
+    const { setAddWidgetModalOpen, openTextTileModal, openImageTileModal, openButtonTileModal } =
+        useActions(dashboardLogic)
+    const { push } = useActions(router)
+    const { openSidePanel } = useActions(sidePanelStateLogic)
+    const { dataProcessingAccepted, dataProcessingApprovalDisabledReason } = useValues(maxGlobalLogic)
+    const aiDisabledReason =
+        !dataProcessingAccepted &&
+        (dataProcessingApprovalDisabledReason ?? 'Approve AI data processing to use PostHog AI')
+
+    const onOpenAiWithPrompt = (prompt: string): void => {
+        const trimmed = prompt.trim()
+        if (trimmed) {
+            // `!` = auto-send after mount (parseCommandString in maxLogic); same as #panel=max:!…
+            openSidePanel(SidePanelTab.Max, `!${trimmed}`)
+        } else {
+            openSidePanel(SidePanelTab.Max)
+        }
+    }
+
     return (
-        <SkeletonCard active={active}>
-            <SkeletonBars active={active} />
-        </SkeletonCard>
+        <ProductIntroduction
+            productName="Dashboard"
+            thingName="insight"
+            titleOverride="Build your dashboard"
+            description={dataProcessingAccepted ? BASE_TEXT : 'Add a chart from your library.'}
+            isEmpty={true}
+            customHog={HedgehogChart}
+            hogLayout="responsive"
+            useMainContentContainerQueries={true}
+            className="mt-2 mb-2 py-4 @min-[48rem]/main-content:py-14"
+            contentClassName="[&>div:last-child]:!mt-4"
+            actionElementOverride={
+                <DashboardEmptyActions
+                    canEdit={canEdit}
+                    dashboard={dashboard}
+                    aiDisabledReason={aiDisabledReason}
+                    dashboardWidgetsEnabled={dashboardWidgetsEnabled}
+                    onAddInsight={showAddInsightToDashboardModal}
+                    onAddText={openTextTileModal}
+                    onAddImage={openImageTileModal}
+                    onAddButton={openButtonTileModal}
+                    onAddWidget={() => setAddWidgetModalOpen(true)}
+                    push={push}
+                    onOpenAiWithPrompt={onOpenAiWithPrompt}
+                />
+            }
+        />
     )
 }
 
 export function EmptyDashboardComponent({ loading, canEdit }: { loading: boolean; canEdit: boolean }): JSX.Element {
-    const { showAddInsightToDashboardModal } = useActions(addInsightToDashboardLogic)
-    const { dashboard } = useValues(dashboardLogic)
-    const { push } = useActions(router)
-    return (
-        <div className="EmptyDashboard">
-            {!loading && (
-                <div className="EmptyDashboard__cta">
-                    <h3 className="l3">Dashboard empty</h3>
-                    <p>This dashboard sure would look better with some graphs!</p>
-                    <div className="mt-4 text-center">
-                        <LemonButton
-                            data-attr="dashboard-add-graph-header"
-                            onClick={showAddInsightToDashboardModal}
-                            type="primary"
-                            icon={<IconPlus />}
-                            center
-                            fullWidth
-                            disabledReason={canEdit ? null : DASHBOARD_CANNOT_EDIT_MESSAGE}
-                            sideAction={
-                                dashboard
-                                    ? {
-                                          dropdown: {
-                                              placement: 'bottom-end',
-                                              overlay: (
-                                                  <AccessControlAction
-                                                      resourceType={AccessControlResourceType.Dashboard}
-                                                      minAccessLevel={AccessControlLevel.Editor}
-                                                      userAccessLevel={dashboard.user_access_level}
-                                                  >
-                                                      <LemonButton
-                                                          fullWidth
-                                                          onClick={() => {
-                                                              push(urls.dashboardTextTile(dashboard.id, 'new'))
-                                                          }}
-                                                          data-attr="add-text-tile-to-dashboard"
-                                                      >
-                                                          Add text card
-                                                      </LemonButton>
-                                                  </AccessControlAction>
-                                              ),
-                                          },
-                                          disabled: false,
-                                          'data-attr': 'dashboard-add-dropdown',
-                                      }
-                                    : undefined
-                            }
-                        >
-                            Add insight
-                        </LemonButton>
-                    </div>
-                </div>
-            )}
-            <div className="flex items-center gap-2 h-[30rem]">
-                <SkeletonCardOne active={loading} />
-                <SkeletonCardTwo active={loading} />
-            </div>
-            <div className="EmptyDashboard__fade">
-                <div className="flex items-center gap-2 h-[30rem]">
-                    <SkeletonCardOne active={loading} />
-                    <SkeletonCardTwo active={loading} />
-                </div>
-            </div>
-        </div>
-    )
+    if (loading) {
+        return <DashboardLoadingState />
+    }
+
+    return <EmptyDashboardContent canEdit={canEdit} />
 }

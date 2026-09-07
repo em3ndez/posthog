@@ -147,7 +147,7 @@ When a job fails, multiple waiters may all try to create a replacement job simul
 
 1. Job A fails
 2. Waiters B and C both try to create a replacement
-3. One succeeds (gets the new job), the other gets an IntegrityError
+3. One succeeds (gets the new job); the other's `INSERT .. ON CONFLICT DO NOTHING` is a silent no-op (`create_lazy_computation_job` returns `None`)
 4. The loser finds the winner's job and waits for it
 
 ### Replacement jobs use the same range
@@ -167,6 +167,105 @@ If an executor crashes while a job is PENDING, other waiters detect this via Red
 2. **CH INSERT started but heartbeat expired**: `poll_query_performance` sets a heartbeat key with a 60s TTL for every active ClickHouse query. If the CH start marker exists but the heartbeat key has expired and the job is older than the stale threshold (default 60s), the query is no longer running and the job is stale.
 
 Stale jobs are marked FAILED and the normal replacement flow kicks in. This means we can recover from crashes of the process we were waiting for.
+
+## Observability
+
+Each invocation of the executor emits both a structured log and Prometheus counters. The executor-level counter answers "is the caller getting served"; the job-level counters answer "are PG jobs flowing as fast as we're creating them".
+
+### Prometheus
+
+#### Executor-level
+
+`lazy_computation_executions_total` is incremented once per `executor.execute()` call, with labels:
+
+| label         | values                                                              |
+| ------------- | ------------------------------------------------------------------- |
+| `outcome`     | `success`, `timeout`, `non_retryable_error`, `max_retries_exceeded` |
+| `cache_state` | `hit`, `partial_hit`, `miss` — see below                            |
+| `table`       | the lazy table being populated (e.g. `preaggregation_results`)      |
+
+#### Job-level
+
+Jobs run synchronously inside `execute()` — there is no background queue, so PENDING just means "an INSERT is in flight in some pod". A periodic gauge of `status='pending'` rows misses jobs that started and finished between scrapes and tells you nothing about throughput. These two counters fire at the exact PG status transitions instead:
+
+- `lazy_computation_jobs_created_total{cache_state, table}` — one increment every time a PENDING row is inserted (one per missing range per executor). The loser of a partial-unique-index race does **not** increment, so the count matches PG row inserts. `cache_state` mirrors the executor-level label so a job created during a fresh execute() call lands on `miss` and a top-up job filling a hole in pre-existing READY data lands on `partial_hit`. `hit` never appears because hits don't create anything.
+- `lazy_computation_job_create_conflicts_total{table}` — one increment every time a create is skipped because a PENDING row already holds the `unique_pending_job_per_range` slot. A steady background rate is expected (the warmers and SWR revalidation race on the same windows by design); a sustained elevated rate means writers piling onto the same windows, or a PENDING row past its own `expires_at` blocking a window it no longer serves. Each conflict also emits a `lazy_computation.job_create_conflict` structured log with `team_id`, `query_hash`, and the window, which is the only place the colliding values appear now that the insert no longer raises a Postgres error.
+- `lazy_computation_jobs_finished_total{outcome, table}` — one increment every time a job reaches a terminal status.
+
+`outcome` values:
+
+- `ready` — INSERT succeeded and wrote rows, PENDING → READY.
+- `ready_empty` — INSERT succeeded but wrote no rows, PENDING → READY. Still a success; split out because an empty window is only provisionally computed (see `TtlSchedule.empty_result_ttl_seconds`), so a climbing share here points at a lagging source rather than a broken query.
+- `failed` — INSERT raised (retryable or non-retryable), PENDING → FAILED.
+- `stale` — a waiter detected the owning executor crashed (`_try_mark_stale_job_as_failed`) and the atomic update flipped the row to FAILED.
+
+Sum `ready` and `ready_empty` for total successes, and prefer `outcome=~"failed|stale"` over `outcome!="ready"` when alerting — the latter counts empty-but-successful jobs as problems.
+
+Net job throughput (positive = backlog growing, expected ~0 in steady state):
+
+```promql
+sum(rate(lazy_computation_jobs_created_total[5m]))
+  -
+sum(rate(lazy_computation_jobs_finished_total[5m]))
+```
+
+Failure share per table:
+
+```promql
+sum by (table) (rate(lazy_computation_jobs_finished_total{outcome=~"failed|stale"}[5m]))
+  /
+sum by (table) (rate(lazy_computation_jobs_finished_total[5m]))
+```
+
+Average miss size (jobs per full-miss execution — answers "when we miss, how much do we end up computing?"):
+
+```promql
+sum(rate(lazy_computation_jobs_created_total{cache_state="miss"}[5m]))
+  /
+sum(rate(lazy_computation_executions_total{cache_state="miss"}[5m]))
+```
+
+Average partial-hit top-up size (jobs per partial-hit execution):
+
+```promql
+sum(rate(lazy_computation_jobs_created_total{cache_state="partial_hit"}[5m]))
+  /
+sum(rate(lazy_computation_executions_total{cache_state="partial_hit"}[5m]))
+```
+
+`cache_state` values:
+
+- `hit` — the request did no new work (no jobs created, no waits).
+- `partial_hit` — the request had to do work but found pre-existing READY data.
+- `miss` — the request had to do work and found no pre-existing data.
+
+Full hit ratio across a window:
+
+```promql
+sum(rate(lazy_computation_executions_total{cache_state="hit"}[5m]))
+  /
+sum(rate(lazy_computation_executions_total[5m]))
+```
+
+Any-coverage ratio (`hit` or `partial_hit`):
+
+```promql
+sum(rate(lazy_computation_executions_total{cache_state=~"hit|partial_hit"}[5m]))
+  /
+sum(rate(lazy_computation_executions_total[5m]))
+```
+
+Per-table breakdown of failures:
+
+```promql
+sum by (table, outcome) (
+  rate(lazy_computation_executions_total{outcome!="success"}[5m])
+)
+```
+
+### Structured log
+
+The `lazy_computation.executed` log line carries the same `outcome`, `cache_state`, and `table` fields plus per-call detail (`query_hash`, `jobs_created`, `jobs_waited_for`, `total_duration_ms`, `time_range_days`). Useful when you need to follow a specific request rather than aggregate.
 
 ## Limitations
 

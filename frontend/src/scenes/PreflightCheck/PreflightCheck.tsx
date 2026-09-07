@@ -8,11 +8,11 @@ import { Link, Spinner } from '@posthog/lemon-ui'
 
 import { AnimatedCollapsible } from 'lib/components/AnimatedCollapsible'
 import { BridgePage } from 'lib/components/BridgePage/BridgePage'
+import { IconErrorOutline } from 'lib/lemon-ui/icons'
 import { LemonButton } from 'lib/lemon-ui/LemonButton'
 import { LemonDivider } from 'lib/lemon-ui/LemonDivider'
 import { LemonRow } from 'lib/lemon-ui/LemonRow'
-import { IconErrorOutline } from 'lib/lemon-ui/icons'
-import { capitalizeFirstLetter } from 'lib/utils'
+import { capitalizeFirstLetter } from 'lib/utils/strings'
 import { SceneExport } from 'scenes/sceneTypes'
 
 import { PreflightCheckStatus, PreflightItem, preflightLogic } from './preflightLogic'

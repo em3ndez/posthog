@@ -1,13 +1,15 @@
+import pytest
 from posthog.test.base import BaseTest
 from unittest.mock import patch
 
+from langgraph.errors import GraphInterrupt
 from pydantic import BaseModel
 
-from posthog.rbac.user_access_control import UserAccessControl
+from products.access_control.backend.facade.user_access_control import UserAccessControl
 
 from ee.hogai.core.context import set_node_path
 from ee.hogai.registry import CONTEXTUAL_TOOL_NAME_TO_TOOL, _import_max_tools
-from ee.hogai.tool import MaxTool
+from ee.hogai.tool import ApprovalResumePayload, ClientToolCallRequest, MaxTool
 from ee.hogai.tool_errors import (
     MaxToolAccessDeniedError,
     MaxToolError,
@@ -46,6 +48,40 @@ class TestMaxTool(BaseTest):
         tool = DummyTool(team=self.team, user=self.user, context_prompt_template="Value: {expected_key}")
         result = tool.format_context_prompt_injection({})
         assert result == "Value: None"
+
+    def test_format_context_prompt_injection_substitutes_provided_key(self):
+        tool = DummyTool(team=self.team, user=self.user, context_prompt_template="Value: {expected_key}")
+        result = tool.format_context_prompt_injection({"expected_key": "hello"})
+        assert result == "Value: hello"
+
+    def test_format_context_prompt_injection_ignores_literal_braces_in_code(self):
+        # Templates may contain literal `{...}` code snippets (e.g. Hog/JS examples).
+        # These must not be parsed as placeholders.
+        template = (
+            "Inline example: `fun name(args) { ... }` and the block form\n"
+            "    fun onEvent(event) {\n"
+            "        // ...\n"
+            "        return event\n"
+            "    }\n"
+            "End."
+        )
+        tool = DummyTool(team=self.team, user=self.user, context_prompt_template=template)
+        result = tool.format_context_prompt_injection({"current_hog_code": "let x := 1"})
+        assert result == template
+
+    def test_format_context_prompt_injection_mixed_placeholders_and_literal_braces(self):
+        template = "Code: { ... }\nKey: {expected_key}"
+        tool = DummyTool(team=self.team, user=self.user, context_prompt_template=template)
+        result = tool.format_context_prompt_injection({"expected_key": "v"})
+        assert result == "Code: { ... }\nKey: v"
+
+    def test_format_context_prompt_injection_supports_brace_escapes(self):
+        # `{{key}}` should render as `{<value>}` to preserve the prior escape behavior
+        # used by some templates (e.g. session-recording filters).
+        template = "filters={{{current_filters}}}"
+        tool = DummyTool(team=self.team, user=self.user, context_prompt_template=template)
+        result = tool.format_context_prompt_injection({"current_filters": "abc"})
+        assert result == "filters={abc}"
 
 
 class TestMaxToolNodePath(BaseTest):
@@ -87,6 +123,76 @@ class TestMaxToolNodePath(BaseTest):
         self.assertEqual(result[0].name, "explicit_parent")
         self.assertEqual(result[1].name, "explicit_child")
         self.assertEqual(result[2].name, "max_tool.read_taxonomy")
+
+
+class TestMaxToolClientExecution(BaseTest):
+    def _create_tool(self) -> DummyTool:
+        return DummyTool(
+            team=self.team,
+            user=self.user,
+            node_path=(NodePath(name="root", tool_call_id="call_123", message_id="msg_1"),),
+        )
+
+    def test_interrupts_with_client_tool_call_request(self):
+        tool = self._create_tool()
+
+        with patch("ee.hogai.tool.interrupt") as mock_interrupt:
+            mock_interrupt.side_effect = GraphInterrupt()
+
+            with self.assertRaises(GraphInterrupt):
+                tool.request_client_execution()
+
+            request = mock_interrupt.call_args.args[0]
+            self.assertIsInstance(request, ClientToolCallRequest)
+            self.assertEqual(request.tool_name, "read_taxonomy")
+            self.assertEqual(request.original_tool_call_id, "call_123")
+
+    def test_returns_client_result_verbatim(self):
+        tool = self._create_tool()
+
+        with patch("ee.hogai.tool.interrupt") as mock_interrupt:
+            mock_interrupt.return_value = {
+                "action": "client_tool_result",
+                "result": {"valid": False, "error": "no rule matched"},
+            }
+
+            result = tool.request_client_execution()
+
+            self.assertEqual(result, {"valid": False, "error": "no rule matched"})
+
+    def test_raises_retryable_error_on_invalid_resume_payload(self):
+        tool = self._create_tool()
+
+        with patch("ee.hogai.tool.interrupt") as mock_interrupt:
+            mock_interrupt.return_value = {"action": "approve", "proposal_id": "prop_1"}
+
+            with self.assertRaises(MaxToolRetryableError):
+                tool.request_client_execution()
+
+    def test_accepts_result_addressed_to_this_tool_call(self):
+        tool = self._create_tool()
+
+        with patch("ee.hogai.tool.interrupt") as mock_interrupt:
+            mock_interrupt.return_value = {
+                "action": "client_tool_result",
+                "tool_call_id": "call_123",
+                "result": {"ok": True},
+            }
+
+            self.assertEqual(tool.request_client_execution(), {"ok": True})
+
+    def test_raises_retryable_error_on_result_for_a_different_tool_call(self):
+        tool = self._create_tool()
+
+        with patch("ee.hogai.tool.interrupt") as mock_interrupt:
+            mock_interrupt.return_value = {
+                "action": "client_tool_result",
+                "tool_call_id": "call_999",
+                "result": {"ok": True},
+            }
+
+            with self.assertRaises(MaxToolRetryableError):
+                tool.request_client_execution()
 
 
 class TestMaxToolErrorHierarchy(BaseTest):
@@ -338,7 +444,6 @@ class TestToolAccessControlDeclarations(BaseTest):
         "switch_mode",
         "session_summarization",
         "manage_memories",  # Manages per-team/user memories, no protected resources
-        "recommend_products",  # Returns product recommendations, no protected resources
         # Tools with dynamic/conditional access checks inside _arun_impl
         "read_data",
         "list_data",  # Lists entities with pagination, no protected resources modified
@@ -361,6 +466,8 @@ class TestToolAccessControlDeclarations(BaseTest):
         "generate_hogql_query",
         "fix_hogql_query",
         "analyze_user_interviews",
+        "call_mcp_server",  # Scoped to user's own MCP installations (team + user filtered) but no protected resources modified
+        "diagnose_proxy",  # Explicit OrganizationMembership.Level >= ADMIN check inside _arun_impl; resource-level RBAC doesn't recognize membership level so we can't use get_required_resource_access here
     }
 
     def test_all_tools_have_access_control_or_are_exempt(self):
@@ -384,3 +491,41 @@ class TestToolAccessControlDeclarations(BaseTest):
                 f"Tools without access control declaration: {missing_access_control}. "
                 f"Either add get_required_resource_access() or add to TOOLS_WITHOUT_ACCESS_CONTROL with a reason."
             )
+
+
+class _ApprovalArgs(BaseModel):
+    count: int
+
+
+class TestDangerousOperationBindsApprovedArguments(BaseTest):
+    """An approving user may edit the arguments; the tool must run what they approved, not what was asked."""
+
+    class _SpendingTool(MaxTool):
+        name: str = "create_feature_flag"
+        description: str = "test"
+        thinking_message: str = "test"
+        args_schema: type[BaseModel] = _ApprovalArgs
+
+        def get_required_resource_access(self):
+            # Every registered tool must declare this, and subclassing registers under the shared name.
+            return [("feature_flag", "editor")]
+
+        async def is_dangerous_operation(self, **kwargs) -> bool:
+            return True
+
+        async def _arun_impl(self, count: int) -> tuple[str, dict]:
+            return f"ran with {count}", {"count": count}
+
+    @pytest.mark.asyncio
+    async def test_edited_arguments_reach_the_implementation(self):
+        # The approval payload used to be merged into a local copy of kwargs, so an edit at the prompt
+        # was discarded and the original operation ran. On a tool that spends money, that charges for
+        # something the user did not approve.
+        tool = self._SpendingTool(team=self.team, user=self.user)
+        approved = ApprovalResumePayload(action="approve", payload={"count": 5}, proposal_id="p1")
+
+        with patch("ee.hogai.tool.interrupt", return_value=approved.model_dump()):
+            content, artifact = await tool._arun_with_context(count=200)
+
+        assert artifact["count"] == 5
+        assert "5" in content

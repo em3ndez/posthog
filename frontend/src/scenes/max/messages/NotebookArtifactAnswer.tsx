@@ -11,9 +11,8 @@ import {
     SeriesSummary,
 } from 'lib/components/Cards/InsightCard/InsightDetails'
 import { TopHeading } from 'lib/components/Cards/InsightCard/TopHeading'
-import { JSONContent } from 'lib/components/RichContentEditor/types'
 import { IconOpenInNew } from 'lib/lemon-ui/icons'
-import { NotebookNodeType, NotebookTarget } from 'scenes/notebooks/types'
+import { NotebookTarget } from 'scenes/notebooks/types'
 import {
     SessionRecordingPlayer,
     SessionRecordingPlayerProps,
@@ -32,26 +31,32 @@ import {
     VisualizationBlock,
 } from '~/queries/schema/schema-assistant-artifacts'
 import { NotebookArtifactContent } from '~/queries/schema/schema-assistant-messages'
-import { DataVisualizationNode, InsightVizNode, NodeKind } from '~/queries/schema/schema-general'
+import { DataVisualizationNode, InsightVizNode } from '~/queries/schema/schema-general'
 import { isFunnelsQuery, isHogQLQuery, isInsightVizNode } from '~/queries/utils'
 
-import { MarkdownMessage } from '../MarkdownMessage'
+import { MarkdownMessage, MessageTemplate } from 'products/posthog_ai/frontend/api/primitives'
+
 import { MessageStatus } from '../maxLogic'
-import { castAssistantQuery, visualizationTypeToQuery } from '../utils'
-import { markdownToTiptap } from '../utils/markdownToTiptap'
-import { MessageTemplate } from './MessageTemplate'
+import { visualizationTypeToQuery } from '../utils'
+import { blocksToTiptapContent } from '../utils/blocksToTiptapContent'
 
 interface NotebookArtifactAnswerProps {
     content: NotebookArtifactContent
     status?: MessageStatus
+    artifactId?: string
 }
 
 const MAX_COLLAPSED_HEIGHT_PX = 400
 
-export function NotebookArtifactAnswer({ content, status }: NotebookArtifactAnswerProps): JSX.Element | null {
+export function NotebookArtifactAnswer({
+    content,
+    status,
+    artifactId,
+}: NotebookArtifactAnswerProps): JSX.Element | null {
     const { createNotebook } = useActions(notebooksModel)
     const [isExpanded, setIsExpanded] = useState(false)
     const [needsExpansion, setNeedsExpansion] = useState(false)
+    const [localIsSaved, setLocalIsSaved] = useState(content.is_saved ?? false)
     const contentRef = useRef<HTMLDivElement>(null)
 
     useEffect(() => {
@@ -59,6 +64,12 @@ export function NotebookArtifactAnswer({ content, status }: NotebookArtifactAnsw
             setNeedsExpansion(contentRef.current.scrollHeight > MAX_COLLAPSED_HEIGHT_PX)
         }
     }, [content.blocks, status])
+
+    useEffect(() => {
+        if (content.is_saved) {
+            setLocalIsSaved(true)
+        }
+    }, [content.is_saved])
 
     const isStreaming = status !== 'completed'
     const hasContent = content.blocks.length > 0
@@ -82,7 +93,14 @@ export function NotebookArtifactAnswer({ content, status }: NotebookArtifactAnsw
         // Convert blocks to tiptap JSONContent[] format
         const tiptapContent = blocksToTiptapContent(content.blocks)
 
-        createNotebook(NotebookTarget.Scene, content.title || 'AI Generated Notebook', tiptapContent)
+        createNotebook(
+            NotebookTarget.Scene,
+            content.title || 'AI Generated Notebook',
+            tiptapContent,
+            undefined,
+            artifactId
+        )
+        setLocalIsSaved(true)
     }
 
     const handleExpandClick = (): void => {
@@ -118,15 +136,27 @@ export function NotebookArtifactAnswer({ content, status }: NotebookArtifactAnsw
                 </div>
 
                 <div className="mt-4 flex justify-end">
-                    <LemonButton
-                        onClick={handleCreateNotebook}
-                        type="primary"
-                        size="small"
-                        icon={<IconOpenInNew />}
-                        disabledReason={isStreaming ? 'Wait for notebook to finish generating' : null}
-                    >
-                        Create notebook
-                    </LemonButton>
+                    {localIsSaved && artifactId ? (
+                        <LemonButton
+                            to={urls.notebook(artifactId)}
+                            targetBlank
+                            type="primary"
+                            size="small"
+                            icon={<IconOpenInNew />}
+                        >
+                            Open and save notebook
+                        </LemonButton>
+                    ) : (
+                        <LemonButton
+                            onClick={handleCreateNotebook}
+                            type="primary"
+                            size="small"
+                            icon={<IconOpenInNew />}
+                            disabledReason={isStreaming ? 'Wait for notebook to finish generating' : null}
+                        >
+                            Create notebook
+                        </LemonButton>
+                    )}
                 </div>
             </div>
         </MessageTemplate>
@@ -193,6 +223,7 @@ function VisualizationBlockPreview({ block }: { block: VisualizationBlock }): JS
                 </LemonButton>
                 <LemonButton
                     to={urls.insightNew({ query: query as InsightVizNode | DataVisualizationNode })}
+                    targetBlank
                     icon={<IconOpenInNew />}
                     size="xsmall"
                     tooltip="Open as new insight"
@@ -232,6 +263,7 @@ function SessionReplayBlockPreview({ block }: { block: SessionReplayBlock }): JS
                 <span className="text-xs font-medium">{block.title || 'Session Replay'}</span>
                 <LemonButton
                     to={urls.replaySingle(block.session_id)}
+                    targetBlank
                     icon={<IconOpenInNew />}
                     size="xsmall"
                     tooltip="Open session replay"
@@ -283,49 +315,4 @@ function getBlockKey(block: DocumentBlock, index: number): string {
         default:
             return `block-${index}`
     }
-}
-
-/**
- * Convert DocumentBlock[] to tiptap JSONContent[] for notebook creation.
- */
-function blocksToTiptapContent(blocks: DocumentBlock[]): JSONContent[] {
-    const result: JSONContent[] = []
-
-    for (const block of blocks) {
-        switch (block.type) {
-            case 'markdown':
-                // Convert markdown to proper tiptap JSON structure
-                result.push(...markdownToTiptap(block.content))
-                break
-            case 'visualization': {
-                // Create a ph-query node that the notebook can render
-                const source = castAssistantQuery(block.query)
-                const query = isHogQLQuery(source)
-                    ? { kind: NodeKind.DataVisualizationNode, source }
-                    : { kind: NodeKind.InsightVizNode, source }
-
-                result.push({
-                    type: NotebookNodeType.Query,
-                    attrs: {
-                        query,
-                        title: block.title,
-                    },
-                })
-                break
-            }
-            case 'session_replay':
-                result.push({
-                    type: NotebookNodeType.Recording,
-                    attrs: {
-                        id: block.session_id,
-                        __init: {
-                            expanded: true,
-                        },
-                    },
-                })
-                break
-        }
-    }
-
-    return result
 }

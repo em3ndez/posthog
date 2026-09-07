@@ -15,10 +15,10 @@ import planStartup from 'public/plan_startup.svg'
 import planTeams from 'public/plan_teams.png'
 import planYc from 'public/plan_yc.svg'
 
-import { PlanComparisonModal } from './PlanComparison'
 import { billingLogic } from './billingLogic'
 import { billingProductLogic } from './billingProductLogic'
 import { paymentEntryLogic } from './paymentEntryLogic'
+import { PlanComparisonModal } from './PlanComparison'
 
 const PLAN_BADGES: Record<BillingPlan, string> = {
     [BillingPlan.Free]: planFree,
@@ -63,10 +63,10 @@ const BADGE_CONFIG: Record<BillingPlan | StartupProgramLabel, CopyVariation> = {
                 If you're growing like crazy, you might want to check out our{' '}
                 {scrollToProduct ? (
                     <>
-                        <Link onClick={() => scrollToProduct('platform_and_support')}>Platform add-ons</Link>
+                        <Link onClick={() => scrollToProduct('platform_and_support')}>Platform packages</Link>
                     </>
                 ) : (
-                    'Platform add-ons'
+                    'Platform packages'
                 )}
                 .
             </p>
@@ -119,15 +119,24 @@ const BADGE_CONFIG: Record<BillingPlan | StartupProgramLabel, CopyVariation> = {
         subtitle: "You're on the startup plan.",
         backgroundColor: 'bg-warning-highlight',
         getDescription: (_billingPlan: BillingPlan, scrollToProduct: (productType: string) => void) => (
-            <p>
-                If you're growing like crazy, you might want to check out our{' '}
-                {scrollToProduct ? (
-                    <Link onClick={() => scrollToProduct('platform_and_support')}>Platform add-ons</Link>
-                ) : (
-                    'Platform add-ons'
-                )}
-                .
-            </p>
+            <>
+                <p>
+                    If you're growing like crazy, you might want to check out our{' '}
+                    {scrollToProduct ? (
+                        <Link onClick={() => scrollToProduct('platform_and_support')}>Platform packages</Link>
+                    ) : (
+                        'Platform packages'
+                    )}
+                    .
+                </p>
+                <p className="text-xs text-secondary mb-0">
+                    Credits can't be used for every product and tool. Check{' '}
+                    <Link to="https://posthog.com/startups" target="_blank">
+                        posthog.com/startups
+                    </Link>{' '}
+                    for details.
+                </p>
+            </>
         ),
     },
     [StartupProgramLabel.YC]: {
@@ -136,15 +145,25 @@ const BADGE_CONFIG: Record<BillingPlan | StartupProgramLabel, CopyVariation> = {
         backgroundColor: 'bg-warning-highlight',
         getDescription: (_billingPlan: BillingPlan, scrollToProduct: (productType: string) => void) => (
             <>
-                <p>You'll get $50K in credits every year, forever. Your credits will renew automatically.</p>
+                <p>
+                    You'll get $50K in credits every year, forever, until you hit $25M in funding. Your credits will
+                    renew automatically.
+                </p>
                 <p>
                     If you're growing like crazy, you might want to check out our{' '}
                     {scrollToProduct ? (
-                        <Link onClick={() => scrollToProduct('platform_and_support')}>Platform add-ons</Link>
+                        <Link onClick={() => scrollToProduct('platform_and_support')}>Platform packages</Link>
                     ) : (
-                        'Platform add-ons'
+                        'Platform packages'
                     )}
                     .
+                </p>
+                <p className="text-xs text-secondary mb-0">
+                    Credits can't be used for every product and tool. Check{' '}
+                    <Link to="https://posthog.com/startups" target="_blank">
+                        posthog.com/startups
+                    </Link>{' '}
+                    for details.
                 </p>
             </>
         ),

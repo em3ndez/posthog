@@ -1,22 +1,23 @@
 use std::{sync::Arc, time::Duration};
 
-use axum::{routing::get, Router};
+use axum::{response::IntoResponse, routing::get, Router};
 use common_kafka::kafka_consumer::SingleTopicConsumer;
-
-use futures::future::ready;
+use lifecycle::{ComponentOptions, Manager};
 use property_defs_rs::{
-    api::v1::{query::Manager, routing::apply_routes},
+    api::v1::{query::Manager as QueryManager, routing::apply_routes},
     app_context::AppContext,
     config::Config,
     measuring_channel::measuring_channel,
-    metrics_consts::CHANNEL_CAPACITY,
+    metrics_buckets::bucket_overrides,
+    metrics_consts::{CHANNEL_CAPACITY, CHANNEL_CAPACITY_TOTAL},
+    types::MAX_EVENTDEF_LAST_SEEN_FLOOR_SECS,
     update_cache::Cache,
     update_consumer_loop, update_producer_loop,
 };
 
-use serve_metrics::{serve, setup_metrics_routes};
+use common_metrics::setup_metrics_routes_with_overrides;
 use sqlx::postgres::PgPoolOptions;
-use tokio::task::JoinHandle;
+use tokio::net::TcpListener;
 use tracing::level_filters::LevelFilter;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
@@ -37,34 +38,26 @@ pub async fn index() -> &'static str {
     "property definitions service"
 }
 
-fn start_server(config: &Config, context: Arc<AppContext>) -> JoinHandle<()> {
-    let api_ctx = context.clone();
-
-    let router = Router::new()
-        .route("/", get(index))
-        .route("/_readiness", get(index))
-        .route(
-            "/_liveness",
-            get(move || ready(context.liveness.get_status())),
-        );
-    let router = apply_routes(router, api_ctx);
-    let router = setup_metrics_routes(router);
-
-    let bind = format!("{}:{}", config.host, config.port);
-
-    tokio::task::spawn(async move {
-        serve(router, &bind)
-            .await
-            .expect("failed to start serving metrics");
-    })
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_tracing();
     info!("Starting up property definitions service...");
 
     let config = Config::init_with_defaults()?;
+
+    // Refuse the "0 disables it" convention: with flooring off, every event's last_seen_at is
+    // unique, dedup filters nothing, and the full event stream lands on posthog_eventdefinition
+    // as row updates. Failing the deploy is cheaper than that. The upper bound guards the same
+    // outcome from the other direction, where the jitter offset outruns the timestamp range.
+    if config.eventdef_last_seen_floor_secs <= 0
+        || config.eventdef_last_seen_floor_secs > MAX_EVENTDEF_LAST_SEEN_FLOOR_SECS
+    {
+        return Err(format!(
+            "EVENTDEF_LAST_SEEN_FLOOR_SECS must be in 1..={MAX_EVENTDEF_LAST_SEEN_FLOOR_SECS}, got {}: flooring bounds how often event-definition writes are re-issued and must not be disabled",
+            config.eventdef_last_seen_floor_secs
+        )
+        .into());
+    }
 
     // Start continuous profiling if enabled (keep _agent alive for the duration of the program)
     let _profiling_agent = match config.continuous_profiling.start_agent() {
@@ -75,14 +68,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // -- Lifecycle manager: signals, health monitoring, coordinated shutdown --
+    let mut manager = Manager::builder("property-defs-rs")
+        .with_global_shutdown_timeout(Duration::from_secs(60))
+        .build();
+
+    let producer_handle = manager.register(
+        "producer",
+        ComponentOptions::new().with_graceful_shutdown(Duration::from_secs(30)),
+    );
+
+    let consumer_handle = manager.register(
+        "consumer",
+        ComponentOptions::new()
+            .with_graceful_shutdown(Duration::from_secs(30))
+            .with_liveness_deadline(Duration::from_secs(60))
+            .with_stall_threshold(3),
+    );
+
+    let metrics_handle =
+        manager.register("metrics", ComponentOptions::new().is_observability(true));
+
+    let readiness = manager.readiness_handler();
+    let liveness = manager.liveness_handler();
+
     let consumer = SingleTopicConsumer::new(config.kafka.clone(), config.consumer.clone())?;
 
-    // dedicated PG conn pool for serving propdefs API queries only (not currently live in prod)
-    // TODO: update this to conditionally point to new isolated propdefs & persons (grouptypemapping)
-    // DBs after those migrations are completed, prior to deployment
-    let options = PgPoolOptions::new().max_connections(config.max_pg_connections);
-    let api_pool = options.connect(&config.database_url).await?;
-    let query_manager = Manager::new(api_pool).await?;
+    // Dedicated PG conn pool for serving propdefs API queries only. The API is mounted but
+    // receives no production traffic today, so connect lazily: `connect` would open a connection
+    // at startup and hold it idle for a surface nothing calls, and would also make boot depend on
+    // Postgres being reachable. The first request pays the connect cost instead.
+    let api_pool = PgPoolOptions::new()
+        .max_connections(config.max_pg_connections)
+        .connect_lazy(&config.database_url)?;
+    let query_manager = QueryManager::new(api_pool).await?;
 
     let context = Arc::new(AppContext::new(&config, query_manager).await?);
 
@@ -91,7 +110,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.consumer.kafka_consumer_topic
     );
 
-    start_server(&config, context.clone());
+    // Build HTTP server with lifecycle readiness/liveness. This must happen before the
+    // cache is built and the worker loops are spawned: setup_metrics_routes_with_overrides
+    // installs the global metrics recorder, and those components resolve counter handles
+    // once at startup. A handle resolved before the recorder exists is a no-op forever.
+    let app = Router::new()
+        .route("/", get(index))
+        .route(
+            "/_readiness",
+            get({
+                let r = readiness.clone();
+                move || {
+                    let r = r.clone();
+                    async move { r.check().await }
+                }
+            }),
+        )
+        .route(
+            "/_liveness",
+            get({
+                let l = liveness.clone();
+                move || {
+                    let l = l.clone();
+                    async move { l.check().into_response() }
+                }
+            }),
+        );
+    let app = apply_routes(app, context.clone());
+    let app = setup_metrics_routes_with_overrides(app, &bucket_overrides());
 
     let (tx, rx) = measuring_channel(config.update_batch_size * config.channel_slots_per_worker);
 
@@ -103,43 +149,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cache = Arc::new(cache);
 
-    let mut handles = Vec::new();
+    // Start the lifecycle monitor before spawning components
+    let guard = manager.monitor_background();
 
+    // Spawn N producer loops (Kafka consumers -> channel)
     for _ in 0..config.worker_loop_count {
-        let handle = tokio::spawn(update_producer_loop(
+        let h = producer_handle.clone();
+        tokio::spawn(update_producer_loop(
             config.clone(),
             consumer.clone(),
             cache.clone(),
             tx.clone(),
+            h,
         ));
-
-        handles.push(handle);
     }
+    drop(producer_handle);
 
-    // Publish the tx capacity metric every 10 seconds
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(10)).await;
-            metrics::gauge!(CHANNEL_CAPACITY).set(tx.capacity() as f64);
+    // Publish the tx capacity metrics every 10 seconds. Both are needed to read occupancy:
+    // `capacity()` is remaining slots, `max_capacity()` is the channel size.
+    tokio::spawn({
+        let tx = tx.clone();
+        async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                metrics::gauge!(CHANNEL_CAPACITY).set(tx.capacity() as f64);
+                metrics::gauge!(CHANNEL_CAPACITY_TOTAL).set(tx.max_capacity() as f64);
+            }
         }
     });
+    drop(tx);
 
-    handles.push(tokio::spawn(update_consumer_loop(
+    // Spawn the consumer loop (channel -> DB)
+    tokio::spawn(update_consumer_loop(
         config.clone(),
         cache,
-        context,
+        context.clone(),
         rx,
-    )));
+        consumer_handle,
+    ));
 
-    // if any handle returns, abort the other ones, and then return an error
-    let (result, _, others) = futures::future::select_all(handles).await;
-    warn!(
-        "update loop process is shutting down with result: {:?}",
-        result
-    );
+    let bind = format!("{}:{}", config.host, config.port);
+    info!(address = %bind, "HTTP server starting");
+    let listener = TcpListener::bind(&bind).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(metrics_handle.shutdown_signal())
+        .await?;
+    metrics_handle.work_completed();
 
-    for handle in others {
-        handle.abort();
-    }
-    Ok(result?)
+    guard.wait().await?;
+
+    info!("property-defs-rs stopped");
+    Ok(())
 }

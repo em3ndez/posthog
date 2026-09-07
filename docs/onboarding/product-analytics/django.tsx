@@ -1,11 +1,9 @@
-import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/OnboardingDocsContentWrapper'
+import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/shared/OnboardingDocsContentWrapper'
 
 import { StepDefinition } from '../steps'
 
-export const getDjangoSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
-    const { CodeBlock, Markdown, dedent, snippets } = ctx
-
-    const PythonEventCapture = snippets?.PythonEventCapture
+export const getDjangoInstallSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
+    const { CodeBlock, Markdown, dedent } = ctx
 
     return [
         {
@@ -34,7 +32,7 @@ export const getDjangoSteps = (ctx: OnboardingComponentsContext): StepDefinition
             content: (
                 <>
                     <Markdown>
-                        Set the PostHog API key and host in your `AppConfig` in `apps.py` so that it's available
+                        Set the PostHog project token and host in your `AppConfig` in `apps.py` so that it's available
                         everywhere:
                     </Markdown>
                     <CodeBlock
@@ -50,7 +48,7 @@ export const getDjangoSteps = (ctx: OnboardingComponentsContext): StepDefinition
                                         name = "your_app_name"
 
                                         def ready(self):
-                                            posthog.api_key = '<ph_project_api_key>'
+                                            posthog.api_key = '<ph_project_token>'
                                             posthog.host = '<ph_client_api_host>'
                                 `,
                             },
@@ -77,11 +75,23 @@ export const getDjangoSteps = (ctx: OnboardingComponentsContext): StepDefinition
                 </>
             ),
         },
-        {
-            title: 'Send events',
-            content: <>{PythonEventCapture && <PythonEventCapture />}</>,
-        },
     ]
 }
+
+export const getDjangoEventStep = (ctx: OnboardingComponentsContext): StepDefinition => {
+    const { snippets } = ctx
+
+    const PythonEventCapture = snippets?.PythonEventCapture
+
+    return {
+        title: 'Send events',
+        content: <>{PythonEventCapture && <PythonEventCapture />}</>,
+    }
+}
+
+export const getDjangoSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => [
+    ...getDjangoInstallSteps(ctx),
+    getDjangoEventStep(ctx),
+]
 
 export const DjangoInstallation = createInstallation(getDjangoSteps)

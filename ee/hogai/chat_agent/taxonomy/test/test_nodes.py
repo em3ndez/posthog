@@ -7,6 +7,7 @@ from parameterized import parameterized
 from pydantic import ValidationError
 
 from ee.hogai.chat_agent.taxonomy.nodes import TaxonomyAgentNode, TaxonomyAgentToolsNode
+from ee.hogai.chat_agent.taxonomy.prompts import PROPERTY_TYPES_PROMPT
 from ee.hogai.chat_agent.taxonomy.toolkit import TaxonomyAgentToolkit
 from ee.hogai.chat_agent.taxonomy.types import TaxonomyAgentState
 
@@ -34,6 +35,27 @@ class ConcreteTaxonomyAgentToolsNode(TaxonomyAgentToolsNode[TaxonomyAgentState, 
     pass
 
 
+class TestPropertyTypesPrompt(BaseTest):
+    @parameterized.expand(
+        [
+            ("survey_dismissed", "$survey_dismissed/{survey_id}"),
+            ("survey_responded", "$survey_responded/{survey_id}"),
+            ("feature_enrollment", "$feature_enrollment/{flag_key}"),
+            ("feature_flag_value", "$feature/{flag_key}"),
+            ("feature_interaction", "$feature_interaction/{feature_key}"),
+            ("product_tour_dismissed", "$product_tour_dismissed/{tour_id}"),
+            ("product_tour_shown", "$product_tour_shown/{tour_id}"),
+            ("product_tour_completed", "$product_tour_completed/{tour_id}"),
+        ]
+    )
+    def test_dynamic_person_properties_section_contains_pattern(self, _name, pattern):
+        self.assertIn(pattern, PROPERTY_TYPES_PROMPT)
+
+    def test_dynamic_person_properties_section_exists(self):
+        self.assertIn("<dynamic_person_properties>", PROPERTY_TYPES_PROMPT)
+        self.assertIn("</dynamic_person_properties>", PROPERTY_TYPES_PROMPT)
+
+
 class TestTaxonomyAgentNode(BaseTest):
     def setUp(self):
         super().setUp()
@@ -45,9 +67,9 @@ class TestTaxonomyAgentNode(BaseTest):
         self.assertIsInstance(self.node._toolkit, MockTaxonomyAgentToolkit)
 
     def test_get_state_class(self):
-        state_class, partial_state_class = self.node._get_state_class(TaxonomyAgentNode)
-        self.assertEqual(state_class, TaxonomyAgentState)
-        self.assertEqual(partial_state_class, TaxonomyAgentState)
+        state_classes = self.node._get_state_class(TaxonomyAgentNode)
+        self.assertEqual(state_classes.state_class, TaxonomyAgentState)
+        self.assertEqual(state_classes.partial_state_class, TaxonomyAgentState)
 
     def test_get_system_prompt_concrete_implementation(self):
         prompts = self.node._get_system_prompt()
@@ -191,9 +213,9 @@ class TestTaxonomyAgentToolsNode(BaseTest):
         self.assertEqual(self.node.MAX_ITERATIONS, 10)
 
     def test_get_state_class(self):
-        state_class, partial_state_class = self.node._get_state_class(TaxonomyAgentToolsNode)
-        self.assertEqual(state_class, TaxonomyAgentState)
-        self.assertEqual(partial_state_class, TaxonomyAgentState)
+        state_classes = self.node._get_state_class(TaxonomyAgentToolsNode)
+        self.assertEqual(state_classes.state_class, TaxonomyAgentState)
+        self.assertEqual(state_classes.partial_state_class, TaxonomyAgentState)
 
     def test_get_state_class_no_generic_error(self):
         # Test error case for non-generic class

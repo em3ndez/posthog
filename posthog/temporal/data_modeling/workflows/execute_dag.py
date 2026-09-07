@@ -1,4 +1,5 @@
 import json
+import asyncio
 import datetime as dt
 import dataclasses
 from collections import defaultdict
@@ -6,15 +7,41 @@ from collections import defaultdict
 import temporalio.common
 import temporalio.workflow
 import temporalio.exceptions
+from temporalio.workflow import ParentClosePolicy
 
 from posthog.exceptions_capture import capture_exception
 from posthog.temporal.common.base import PostHogWorkflow
-from posthog.temporal.data_modeling.activities import GetDAGStructureInputs, get_dag_structure_activity
+from posthog.temporal.data_modeling.activities import (
+    UPSTREAM_NAMES_IN_SKIP_REASON,
+    GetDAGStructureInputs,
+    NotifyDAGMaterializationFailuresInputs,
+    PreemptDAGRunInputs,
+    RecordSkippedDataModelingJobsInputs,
+    SkippedDataModelingNode,
+    get_dag_structure_activity,
+    notify_dag_materialization_failures_activity,
+    preempt_dag_run_activity,
+    record_skipped_data_modeling_jobs_activity,
+)
+from posthog.temporal.data_modeling.activities.utils import strip_hostname_from_error
+from posthog.temporal.data_modeling.metrics import (
+    get_dag_duration_metric,
+    get_dag_finished_metric,
+    get_dag_node_count_metric,
+)
 from posthog.temporal.data_modeling.workflows.materialize_view import (
     MaterializeViewWorkflow,
     MaterializeViewWorkflowInputs,
     MaterializeViewWorkflowResult,
 )
+
+from products.data_modeling.backend.facade.models import DataModelingJobEngine
+from products.data_quality.backend.facade.contracts import CHECK_SUITE_WORKFLOW_NAME, MATERIALIZATION_GATE_ACTIVITY_NAME
+from products.data_quality.backend.facade.enums import SuiteRunTrigger
+
+MAX_CONCURRENT_CHILDREN = 10
+
+NODE_AUDIT_PATCH = "data-quality-node-audit-2026-08"
 
 
 class EmptyDAGOrCycleError(Exception):
@@ -25,7 +52,7 @@ class EmptyDAGOrCycleError(Exception):
 
 @dataclasses.dataclass
 class ExecuteDAGInputs:
-    """Inputs for the DAGOrchestratorWorkflow.
+    """Inputs for the ExecuteDAGWorkflow.
 
     Attributes:
         team_id: the team ID that owns the DAG.
@@ -37,6 +64,8 @@ class ExecuteDAGInputs:
     team_id: int
     dag_id: str
     node_ids: list[str] | None = None
+    duckgres_only: bool = False
+    dangerously_execute_raw_sql: bool = False
 
     @property
     def properties_to_log(self) -> dict:
@@ -47,7 +76,7 @@ class ExecuteDAGInputs:
         }
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(frozen=False)
 class NodeResult:
     """Result for a single node materialization."""
 
@@ -58,11 +87,13 @@ class NodeResult:
     error: str | None = None
     skipped: bool = False
     skip_reason: str | None = None
+    quality_failed: bool = False
+    quality_audited: bool = False
 
 
 @dataclasses.dataclass
 class ExecuteDAGResult:
-    """Result from the DAGOrchestratorWorkflow.
+    """Result from the ExecuteDAGWorkflow.
 
     Attributes:
         dag_id: The DAG that was orchestrated.
@@ -176,9 +207,32 @@ class ExecuteDAGWorkflow(PostHogWorkflow):
 
     @temporalio.workflow.run
     async def run(self, inputs: ExecuteDAGInputs) -> ExecuteDAGResult:
-        temporalio.workflow.logger.info("Starting DAGOrchestratorWorkflow", extra=inputs.properties_to_log)
-        start_time = temporalio.workflow.now()
+        temporalio.workflow.logger.info("Starting ExecuteDAGWorkflow", extra=inputs.properties_to_log)
+        # NOTE: this should be handled by temporal's cancellation policy but
+        # we leave this in to clean up any jobs left in a dirty state
+        await temporalio.workflow.execute_activity(
+            preempt_dag_run_activity,
+            PreemptDAGRunInputs(
+                team_id=inputs.team_id,
+                dag_id=inputs.dag_id,
+                node_ids=inputs.node_ids,
+            ),
+            start_to_close_timeout=dt.timedelta(minutes=5),
+            retry_policy=temporalio.common.RetryPolicy(
+                maximum_attempts=3,
+            ),
+        )
+        try:
+            return await self._execute_dag(inputs)
+        except asyncio.CancelledError:
+            temporalio.workflow.logger.warning(
+                "ExecuteDAGWorkflow was cancelled",
+                extra=inputs.properties_to_log,
+            )
+            raise
 
+    async def _execute_dag(self, inputs: ExecuteDAGInputs) -> ExecuteDAGResult:
+        start_time = temporalio.workflow.now()
         # fetch DAG structure
         dag_structure = await temporalio.workflow.execute_activity(
             get_dag_structure_activity,
@@ -186,7 +240,7 @@ class ExecuteDAGWorkflow(PostHogWorkflow):
                 team_id=inputs.team_id,
                 dag_id=inputs.dag_id,
             ),
-            start_to_close_timeout=dt.timedelta(minutes=1),
+            start_to_close_timeout=dt.timedelta(minutes=5),
             retry_policy=temporalio.common.RetryPolicy(
                 maximum_attempts=3,
             ),
@@ -226,7 +280,17 @@ class ExecuteDAGWorkflow(PostHogWorkflow):
         node_results: list[NodeResult] = []
         ephemeral_node_set = set(dag_structure.ephemeral_nodes)
         failed_node_set: set[str] = set()
+        quality_failed_node_set: set[str] = set()
+        serving_engine = (
+            DataModelingJobEngine.DUCKGRES if inputs.duckgres_only else DataModelingJobEngine.CLICKHOUSE
+        ).value
+        suspended_node_set: set[str] = set(dag_structure.suspended_nodes.get(serving_engine, []))
         downstreams = _get_downstream_lookup(edge_lookup)
+        skipped_jobs: list[SkippedDataModelingNode] = []
+        # execute child workflows with bounded concurrency using a sliding window;
+        # the semaphore limits how many child workflows run simultaneously across
+        # all levels to be a friendlier neighbor to duckgres and clickhouse infrastructure
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHILDREN)
         for i, level in enumerate(levels):
             temporalio.workflow.logger.info(
                 f"Executing level {i + 1}/{len(levels)}",
@@ -238,13 +302,42 @@ class ExecuteDAGWorkflow(PostHogWorkflow):
             for node_id in level:
                 should_skip = False
                 skip_reason = None
-                for failed_id in failed_node_set:
-                    if node_id in downstreams[failed_id]:
-                        should_skip = True
-                        skip_reason = f"Upstream node {failed_id} failed"
-                        break
+                failed_upstream: list[str] = []
+                suspended_upstream: list[str] = []
+                if node_id in suspended_node_set:
+                    # a node paused for its own failures keeps its Failed job as the latest one, which
+                    # is what the resume banner and the failure digest both read
+                    should_skip = True
+                    skip_reason = "Node suspended after repeated materialization failures"
+                else:
+                    for blocked_id in sorted(failed_node_set) + sorted(suspended_node_set):
+                        if node_id not in downstreams[blocked_id]:
+                            continue
+                        suspended = blocked_id in suspended_node_set
+                        if blocked_id in (suspended_upstream if suspended else failed_upstream):
+                            continue
+                        (suspended_upstream if suspended else failed_upstream).append(blocked_id)
+                        if not should_skip:
+                            should_skip = True
+                            if suspended:
+                                verb = "suspended"
+                            elif blocked_id in quality_failed_node_set:
+                                verb = "failed data quality checks"
+                            else:
+                                verb = "failed"
+                            skip_reason = f"Upstream node {blocked_id} {verb}"
                 if should_skip:
                     skip_nodes.append((node_id, skip_reason))
+                    if node_id not in ephemeral_node_set and (failed_upstream or suspended_upstream):
+                        skipped_jobs.append(
+                            SkippedDataModelingNode(
+                                node_id=node_id,
+                                failed_upstream_node_ids=failed_upstream[:UPSTREAM_NAMES_IN_SKIP_REASON],
+                                failed_upstream_total=len(failed_upstream),
+                                suspended_upstream_node_ids=suspended_upstream[:UPSTREAM_NAMES_IN_SKIP_REASON],
+                                suspended_upstream_total=len(suspended_upstream),
+                            )
+                        )
                 elif node_id in ephemeral_node_set:
                     ephemeral_nodes.append(node_id)
                 else:
@@ -274,67 +367,93 @@ class ExecuteDAGWorkflow(PostHogWorkflow):
             if not execute_nodes:
                 continue
 
-            # execute child workflows in parallel for this level
-            child_handles = []
-            for node_id in execute_nodes:
-                handle = await temporalio.workflow.start_child_workflow(
-                    MaterializeViewWorkflow.run,
-                    MaterializeViewWorkflowInputs(
-                        team_id=inputs.team_id,
-                        dag_id=inputs.dag_id,
-                        node_id=node_id,
-                    ),
-                    id=f"materialize-{inputs.dag_id}-{node_id}-{temporalio.workflow.now().isoformat()}",
-                    retry_policy=temporalio.common.RetryPolicy(
-                        maximum_attempts=1,  # retries handled within child workflow
-                    ),
-                )
-                child_handles.append((node_id, handle))
-
-            # wait for all child workflows in this level to complete
-            for node_id, handle in child_handles:
-                try:
-                    result: MaterializeViewWorkflowResult = await handle
-                    node_results.append(
-                        NodeResult(
+            async def _run_child(node_id: str) -> NodeResult:
+                async with semaphore:
+                    handle = await temporalio.workflow.start_child_workflow(
+                        MaterializeViewWorkflow.run,
+                        MaterializeViewWorkflowInputs(
+                            team_id=inputs.team_id,
+                            dag_id=inputs.dag_id,
+                            node_id=node_id,
+                            duckgres_only=inputs.duckgres_only,
+                            dangerously_execute_raw_sql=inputs.dangerously_execute_raw_sql,
+                        ),
+                        id=f"materialize-view-{inputs.dag_id}-{node_id}-{start_time.isoformat()}",
+                        parent_close_policy=ParentClosePolicy.REQUEST_CANCEL,
+                        retry_policy=temporalio.common.RetryPolicy(
+                            maximum_attempts=1,  # retries handled within child workflow
+                        ),
+                    )
+                    try:
+                        result: MaterializeViewWorkflowResult = await handle
+                        if result.quality_blocking_failures is not None and result.quality_blocking_failures > 0:
+                            temporalio.workflow.logger.warning(
+                                f"Node {node_id} materialized but was not published: "
+                                f"{result.quality_blocking_failures} data quality checks failed",
+                                extra=inputs.properties_to_log,
+                            )
+                            return NodeResult(
+                                node_id=node_id,
+                                success=False,
+                                error=f"Not published: {result.quality_blocking_failures} data quality checks failed",
+                                quality_failed=True,
+                                quality_audited=True,
+                            )
+                        temporalio.workflow.logger.info(
+                            f"Node {node_id} materialized successfully",
+                            extra={"rows_materialized": result.rows_materialized, **inputs.properties_to_log},
+                        )
+                        return NodeResult(
                             node_id=node_id,
                             success=True,
                             rows_materialized=result.rows_materialized,
                             duration_seconds=result.duration_seconds,
+                            quality_audited=result.quality_audited,
                         )
-                    )
-                    temporalio.workflow.logger.info(
-                        f"Node {node_id} materialized successfully",
-                        extra={"rows_materialized": result.rows_materialized, **inputs.properties_to_log},
-                    )
-                except temporalio.exceptions.ChildWorkflowError as e:
-                    failed_node_set.add(node_id)
-                    error_message = str(e.cause) if e.cause else str(e)
-                    node_results.append(
-                        NodeResult(
+                    except temporalio.exceptions.ChildWorkflowError as e:
+                        error_message = str(e.cause) if e.cause else str(e)
+                        temporalio.workflow.logger.error(
+                            f"Node {node_id} failed to materialize: {error_message}",
+                            extra=inputs.properties_to_log,
+                        )
+                        return NodeResult(
                             node_id=node_id,
                             success=False,
-                            error=error_message,
+                            error=strip_hostname_from_error(error_message),
                         )
-                    )
-                    temporalio.workflow.logger.error(
-                        f"Node {node_id} failed to materialize: {error_message}",
-                        extra=inputs.properties_to_log,
-                    )
-                except Exception as e:
-                    capture_exception(e)
-                    failed_node_set.add(node_id)
-                    node_results.append(
-                        NodeResult(
+                    except Exception as e:
+                        capture_exception(e)
+                        error_str = str(e)
+                        temporalio.workflow.logger.error(
+                            f"Node {node_id} failed with unexpected error: {error_str}",
+                            extra=inputs.properties_to_log,
+                        )
+                        return NodeResult(
                             node_id=node_id,
                             success=False,
-                            error=str(e),
+                            error=strip_hostname_from_error(error_str),
                         )
-                    )
-                    temporalio.workflow.logger.error(
-                        f"Node {node_id} failed with unexpected error: {str(e)}",
-                        extra=inputs.properties_to_log,
-                    )
+
+            level_results = await asyncio.gather(*[_run_child(node_id) for node_id in execute_nodes])
+            for nr in level_results:
+                node_results.append(nr)
+                if not nr.success:
+                    failed_node_set.add(nr.node_id)
+                    if nr.quality_failed:
+                        quality_failed_node_set.add(nr.node_id)
+
+        if skipped_jobs:
+            await temporalio.workflow.execute_activity(
+                record_skipped_data_modeling_jobs_activity,
+                RecordSkippedDataModelingJobsInputs(
+                    team_id=inputs.team_id,
+                    dag_id=inputs.dag_id,
+                    engine=serving_engine,
+                    skipped_nodes=skipped_jobs,
+                ),
+                start_to_close_timeout=dt.timedelta(minutes=5),
+                retry_policy=temporalio.common.RetryPolicy(maximum_attempts=3),
+            )
 
         # compute summary
         end_time = temporalio.workflow.now()
@@ -345,7 +464,7 @@ class ExecuteDAGWorkflow(PostHogWorkflow):
         skipped_nodes = sum(1 for r in node_results if r.skipped)
 
         temporalio.workflow.logger.info(
-            "DAGOrchestratorWorkflow completed",
+            "ExecuteDAGWorkflow completed",
             extra={
                 "total_nodes": len(node_results),
                 "successful_nodes": successful_nodes,
@@ -355,6 +474,35 @@ class ExecuteDAGWorkflow(PostHogWorkflow):
                 **inputs.properties_to_log,
             },
         )
+        # DAG-level metrics
+        if failed_nodes == 0 and skipped_nodes == 0:
+            dag_status = "completed"
+        elif successful_nodes == 0 and failed_nodes == 0:
+            dag_status = "skipped"
+        elif successful_nodes == 0:
+            dag_status = "failed"
+        else:
+            dag_status = "partial_failure"
+        get_dag_finished_metric(dag_status).add(1)
+        get_dag_duration_metric().record(duration_seconds)
+        get_dag_node_count_metric("successful").record(successful_nodes)
+        get_dag_node_count_metric("failed").record(failed_nodes)
+        get_dag_node_count_metric("skipped").record(skipped_nodes)
+
+        await self._run_data_quality_checks(inputs, node_results)
+
+        if failed_nodes:
+            await temporalio.workflow.execute_activity(
+                notify_dag_materialization_failures_activity,
+                NotifyDAGMaterializationFailuresInputs(
+                    team_id=inputs.team_id,
+                    dag_id=inputs.dag_id,
+                    parent_workflow_id=temporalio.workflow.info().workflow_id,
+                    run_started_at=start_time.isoformat(),
+                ),
+                start_to_close_timeout=dt.timedelta(minutes=5),
+                retry_policy=temporalio.common.RetryPolicy(maximum_attempts=3),
+            )
 
         return ExecuteDAGResult(
             dag_id=inputs.dag_id,
@@ -365,3 +513,55 @@ class ExecuteDAGWorkflow(PostHogWorkflow):
             duration_seconds=duration_seconds,
             node_results=node_results,
         )
+
+    async def _run_data_quality_checks(self, inputs: ExecuteDAGInputs, node_results: list[NodeResult]) -> None:
+        """Fire the check suite for the nodes this run refreshed but did not audit per-node.
+
+        Best-effort and fully isolated: started by registered name so data_modeling never imports
+        the catalog product, and ABANDON so a check suite can neither delay nor fail the DAG. The
+        node ids come from recorded child results, so replay stays deterministic.
+
+        The gate activity owns the feature flag and the "are there any checks here" question, both
+        of which need the database. Asking first keeps a team with no checks, or an org that never
+        opted in, from paying for a child workflow and a suite row on every materialization.
+        """
+        # Filtering can empty the list and skip the commands below, so an old history that recorded
+        # them has to keep taking the old path. A rolling deploy reaches this: an old worker can
+        # record those commands against a new child's quality_audited result.
+        if temporalio.workflow.patched(NODE_AUDIT_PATCH):
+            checkable_node_ids = [
+                result.node_id
+                for result in node_results
+                if result.success and not result.skipped and not result.quality_audited
+            ]
+        else:
+            checkable_node_ids = [result.node_id for result in node_results if result.success and not result.skipped]
+        if not checkable_node_ids:
+            return
+
+        try:
+            checks_needed = await temporalio.workflow.execute_activity(
+                MATERIALIZATION_GATE_ACTIVITY_NAME,
+                {"team_id": inputs.team_id, "node_ids": checkable_node_ids},
+                start_to_close_timeout=dt.timedelta(minutes=1),
+                retry_policy=temporalio.common.RetryPolicy(maximum_attempts=3),
+            )
+            if not checks_needed:
+                return
+
+            await temporalio.workflow.start_child_workflow(
+                CHECK_SUITE_WORKFLOW_NAME,
+                {
+                    "team_id": inputs.team_id,
+                    "trigger": SuiteRunTrigger.MATERIALIZATION.value,
+                    "node_ids": checkable_node_ids,
+                },
+                id=f"data-quality-run-suite-{inputs.dag_id}-{temporalio.workflow.info().run_id}",
+                parent_close_policy=ParentClosePolicy.ABANDON,
+                retry_policy=temporalio.common.RetryPolicy(maximum_attempts=1),
+            )
+        except Exception as e:
+            capture_exception(e)
+            temporalio.workflow.logger.warning(
+                "Could not start the data quality check suite", extra=inputs.properties_to_log
+            )

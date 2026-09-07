@@ -5,6 +5,7 @@ import typing as t
 import asyncio
 import datetime as dt
 import operator
+import dataclasses
 
 from django.conf import settings
 from django.test import override_settings
@@ -16,14 +17,21 @@ from temporalio.testing import WorkflowEnvironment
 from temporalio.testing._activity import ActivityEnvironment
 from temporalio.worker import UnsandboxedWorkflowRunner, Worker
 
-from posthog.batch_exports.service import BackfillDetails, BatchExportModel, BatchExportSchema
 from posthog.temporal.common.clickhouse import ClickHouseClient
 from posthog.temporal.tests.utils.models import afetch_batch_export_runs
 
+from products.batch_exports.backend.service import (
+    AwsS3BatchExportInputs,
+    BackfillDetails,
+    BatchExportModel,
+    BatchExportSchema,
+    S3BatchExportInputs,
+    S3CompatibleBatchExportInputs,
+    S3FamilyBaseInputs,
+)
 from products.batch_exports.backend.temporal.batch_exports import finish_batch_export_run, start_batch_export_run
 from products.batch_exports.backend.temporal.destinations.s3_batch_export import (
     COMPRESSION_EXTENSIONS,
-    S3BatchExportInputs,
     S3BatchExportWorkflow,
     S3InsertInputs,
     insert_into_s3_activity_from_stage,
@@ -33,10 +41,17 @@ from products.batch_exports.backend.temporal.pipeline.internal_stage import (
     BatchExportInsertIntoInternalStageInputs,
     insert_into_internal_stage_activity,
 )
+from products.batch_exports.backend.temporal.queue import RecordBatchQueue
 from products.batch_exports.backend.temporal.record_batch_model import SessionsRecordBatchModel
-from products.batch_exports.backend.temporal.spmc import Producer, RecordBatchQueue
+from products.batch_exports.backend.tests.temporal.utils.clickhouse_test_producer import ClickHouseTestProducer
 from products.batch_exports.backend.tests.temporal.utils.records import get_record_batch_from_queue
 from products.batch_exports.backend.tests.temporal.utils.s3 import assert_file_in_s3, assert_no_files_in_s3
+
+_INPUTS_BY_DESTINATION_TYPE: dict[str, type[S3BatchExportInputs] | type[S3FamilyBaseInputs]] = {
+    "S3": S3BatchExportInputs,
+    "AwsS3": AwsS3BatchExportInputs,
+    "S3Compatible": S3CompatibleBatchExportInputs,
+}
 
 COMPRESSION_OPTIONS = [*COMPRESSION_EXTENSIONS.keys(), None]
 
@@ -85,7 +100,11 @@ async def check_valid_credentials() -> bool:
     async with session.client("sts") as sts:
         try:
             await sts.get_caller_identity()
-        except botocore.exceptions.ClientError:
+        except (
+            botocore.exceptions.NoCredentialsError,
+            botocore.exceptions.PartialCredentialsError,
+            botocore.exceptions.ClientError,
+        ):
             return False
         else:
             return True
@@ -93,8 +112,7 @@ async def check_valid_credentials() -> bool:
 
 def has_valid_credentials() -> bool:
     """Synchronous wrapper around check_valid_credentials."""
-    loop = asyncio.get_event_loop()
-    return loop.run_until_complete(check_valid_credentials())
+    return asyncio.run(check_valid_credentials())
 
 
 MetricKind = t.Literal["success", "cancellation", "failure", "rows"]
@@ -174,7 +192,7 @@ async def assert_clickhouse_records_in_s3(
     """Assert ClickHouse records are written to JSON in key_prefix in S3 bucket_name.
 
     Arguments:
-        s3_compatible_client: An S3 client used to read records; can be MinIO if doing local testing.
+        s3_compatible_client: An S3 client used to read records; can point at local object storage if doing local testing.
         clickhouse_client: A ClickHouseClient used to read records that are expected to be exported.
         team_id: The ID of the team that we are testing for.
         bucket_name: S3 bucket name where records are exported to.
@@ -243,15 +261,14 @@ async def assert_clickhouse_records_in_s3(
 
     queue = RecordBatchQueue()
     if model_name == "sessions":
-        producer = Producer(model=SessionsRecordBatchModel(team_id))
+        producer = ClickHouseTestProducer(model=SessionsRecordBatchModel(team_id))
     else:
-        producer = Producer()
+        producer = ClickHouseTestProducer()
     producer_task = await producer.start(
         queue=queue,
         model_name=model_name,
         team_id=team_id,
         full_range=(data_interval_start, data_interval_end),
-        done_ranges=[],
         fields=fields,
         filters=filters,
         destination_default_fields=s3_default_fields(),
@@ -311,10 +328,17 @@ async def run_s3_batch_export_workflow(
     s3_client,
     backfill_details: BackfillDetails | None = None,
     expect_no_data: bool = False,
+    destination_type: str = "S3",
+    integration_id: int | None = None,
 ):
     """Run the S3 batch export workflow and assert it completes successfully.
 
-    This is a shared helper function used by tests for S3, GCS, and MinIO buckets.
+    This is a shared helper function used by tests for S3, GCS, and local object storage buckets.
+
+    `destination_type` selects which input dataclass is constructed and passed
+    to the workflow — exercising the per-destination → canonical-inputs adaptation
+    that happens in production. Defaults to the legacy "S3" type for backwards
+    compatibility with any callers that still need it.
     """
     batch_export_schema: BatchExportSchema | None = None
     batch_export_model: BatchExportModel | None = None
@@ -340,7 +364,8 @@ async def run_s3_batch_export_workflow(
     )
 
     workflow_id = str(uuid.uuid4())
-    inputs = S3BatchExportInputs(
+    inputs_cls = _INPUTS_BY_DESTINATION_TYPE[destination_type]
+    per_destination_inputs = inputs_cls(
         team_id=ateam.pk,
         batch_export_id=batch_export_id,
         data_interval_end=data_interval_end.isoformat(),
@@ -348,8 +373,10 @@ async def run_s3_batch_export_workflow(
         batch_export_model=batch_export_model,
         batch_export_schema=batch_export_schema,
         backfill_details=backfill_details,
+        integration_id=integration_id,
         **s3_destination_config,
     )
+    workflow_inputs = S3BatchExportInputs(**dataclasses.asdict(per_destination_inputs))
 
     async with await WorkflowEnvironment.start_time_skipping() as activity_environment:
         async with Worker(
@@ -366,7 +393,7 @@ async def run_s3_batch_export_workflow(
         ):
             await activity_environment.client.execute_workflow(
                 S3BatchExportWorkflow.run,
-                inputs,
+                workflow_inputs,
                 id=workflow_id,
                 task_queue=settings.BATCH_EXPORTS_TASK_QUEUE,
                 retry_policy=RetryPolicy(maximum_attempts=1),
@@ -428,7 +455,7 @@ async def run_activity(activity_environment: ActivityEnvironment, insert_inputs:
         BATCH_EXPORT_S3_UPLOAD_CHUNK_SIZE_BYTES=5 * 1024**2,
     ):
         assert insert_inputs.batch_export_id is not None
-        stage_folder = await activity_environment.run(
+        stage_result = await activity_environment.run(
             insert_into_internal_stage_activity,
             BatchExportInsertIntoInternalStageInputs(
                 team_id=insert_inputs.team_id,
@@ -444,7 +471,8 @@ async def run_activity(activity_environment: ActivityEnvironment, insert_inputs:
                 destination_default_fields=s3_default_fields(),
             ),
         )
-        insert_inputs.stage_folder = stage_folder
+        insert_inputs.stage_folder = stage_result.stage_folder
+        insert_inputs.records_total = stage_result.records_total
         result = await activity_environment.run(insert_into_s3_activity_from_stage, insert_inputs)
 
     return result

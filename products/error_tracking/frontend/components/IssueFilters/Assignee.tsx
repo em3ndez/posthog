@@ -1,22 +1,30 @@
 import { useActions, useValues } from 'kea'
 
-import { LemonButton } from '@posthog/lemon-ui'
+import { Button, SelectTriggerIcon } from 'lib/ui/quill'
 
-import { AssigneeLabelDisplay } from '../Assignee/AssigneeDisplay'
-import { AssigneeSelect } from '../Assignee/AssigneeSelect'
+import { AssigneeIconDisplay, AssigneeLabelDisplay } from '../Assignee/AssigneeDisplay'
+import { QuillAssigneeSelect } from '../Assignee/QuillAssigneeSelect'
 import { issueQueryOptionsLogic } from '../IssueQueryOptions/issueQueryOptionsLogic'
 
-export const AssigneeFilter = (): JSX.Element => {
+export function AssigneeFilter(): JSX.Element {
     const { assignee } = useValues(issueQueryOptionsLogic)
     const { setAssignee } = useActions(issueQueryOptionsLogic)
 
     return (
-        <AssigneeSelect assignee={assignee ?? null} onChange={(assignee) => setAssignee(assignee)}>
+        <QuillAssigneeSelect
+            ariaLabel="Assignee filter"
+            assignee={assignee ?? null}
+            clearActionLabel="Clear assignee filter"
+            currentUserActionLabel="Assigned to me"
+            onChange={setAssignee}
+        >
             {(displayAssignee) => (
-                <LemonButton type="secondary" size="small">
-                    <AssigneeLabelDisplay assignee={displayAssignee} placeholder="Any assignee" />
-                </LemonButton>
+                <Button variant="outline" size="default">
+                    <AssigneeIconDisplay assignee={displayAssignee} size="xsmall" />
+                    <AssigneeLabelDisplay assignee={displayAssignee} size="xsmall" placeholder="Any assignee" />
+                    <SelectTriggerIcon />
+                </Button>
             )}
-        </AssigneeSelect>
+        </QuillAssigneeSelect>
     )
 }

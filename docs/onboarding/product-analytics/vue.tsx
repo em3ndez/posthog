@@ -1,11 +1,10 @@
-import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/OnboardingDocsContentWrapper'
+import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/shared/OnboardingDocsContentWrapper'
 
 import { StepDefinition } from '../steps'
+import { SDK_DEFAULTS_DATE } from './_snippets/sdkDefaults'
 
-export const getVueSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
-    const { CodeBlock, Markdown, CalloutBox, dedent, snippets } = ctx
-
-    const JSEventCapture = snippets?.JSEventCapture
+export const getVueInstallSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
+    const { CodeBlock, Markdown, CalloutBox, dedent } = ctx
 
     return [
         {
@@ -37,6 +36,13 @@ export const getVueSteps = (ctx: OnboardingComponentsContext): StepDefinition[] 
                                     pnpm add posthog-js
                                 `,
                             },
+                            {
+                                language: 'bash',
+                                file: 'bun',
+                                code: dedent`
+                                    bun add posthog-js
+                                `,
+                            },
                         ]}
                     />
                     <CalloutBox type="fyi" title="Vue version">
@@ -63,9 +69,9 @@ export const getVueSteps = (ctx: OnboardingComponentsContext): StepDefinition[] 
                                     import posthog from 'posthog-js'
 
                                     export function usePostHog() {
-                                      posthog.init('<ph_project_api_key>', {
+                                      posthog.init('<ph_project_token>', {
                                         api_host: '<ph_client_api_host>',
-                                        defaults: '2026-01-30'
+                                        defaults: '${SDK_DEFAULTS_DATE}'
                                       })
 
                                       return { posthog }
@@ -119,11 +125,23 @@ export const getVueSteps = (ctx: OnboardingComponentsContext): StepDefinition[] 
                 </>
             ),
         },
-        {
-            title: 'Send events',
-            content: <>{JSEventCapture && <JSEventCapture />}</>,
-        },
     ]
 }
+
+export const getVueEventStep = (ctx: OnboardingComponentsContext): StepDefinition => {
+    const { snippets } = ctx
+
+    const JSEventCapture = snippets?.JSEventCapture
+
+    return {
+        title: 'Send events',
+        content: <>{JSEventCapture && <JSEventCapture />}</>,
+    }
+}
+
+export const getVueSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => [
+    ...getVueInstallSteps(ctx),
+    getVueEventStep(ctx),
+]
 
 export const VueInstallation = createInstallation(getVueSteps)

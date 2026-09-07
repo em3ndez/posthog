@@ -1,4 +1,4 @@
-import { Meta, StoryFn } from '@storybook/react'
+import type { Meta, StoryObj } from '@storybook/react'
 import { CapturedNetworkRequest } from 'posthog-js'
 
 import { LemonDivider } from 'lib/lemon-ui/LemonDivider'
@@ -14,7 +14,8 @@ import {
 import { mswDecorator } from '~/mocks/browser'
 import { PerformanceEvent } from '~/types'
 
-const meta: Meta<typeof ItemPerformanceEvent> = {
+type Story = StoryObj<ItemPerformanceEventProps>
+const meta: Meta<ItemPerformanceEventProps> = {
     title: 'Components/ItemPerformanceEvent',
     component: ItemPerformanceEvent,
     decorators: [
@@ -22,24 +23,23 @@ const meta: Meta<typeof ItemPerformanceEvent> = {
             get: {},
         }),
     ],
+    render: (props) => {
+        props.item = props.item || undefined
+
+        const propsToUse = props as ItemPerformanceEventProps
+
+        return (
+            <div className="flex flex-col gap-2 min-w-96">
+                <h3>Collapsed</h3>
+                <ItemPerformanceEvent {...propsToUse} />
+                <LemonDivider />
+                <h3>Expanded</h3>
+                <ItemPerformanceEventDetail {...propsToUse} />
+            </div>
+        )
+    },
 }
 export default meta
-
-const BasicTemplate: StoryFn<typeof ItemPerformanceEvent> = (props: Partial<ItemPerformanceEventProps>) => {
-    props.item = props.item || undefined
-
-    const propsToUse = props as ItemPerformanceEventProps
-
-    return (
-        <div className="flex flex-col gap-2 min-w-96">
-            <h3>Collapsed</h3>
-            <ItemPerformanceEvent {...propsToUse} />
-            <LemonDivider />
-            <h3>Expanded</h3>
-            <ItemPerformanceEventDetail {...propsToUse} />
-        </div>
-    )
-}
 
 const exampleWithPerformanceObserverValues = mapRRWebNetworkRequest(
     {
@@ -120,18 +120,47 @@ const exampleWithoutPerformanceObserverValues = {
     timestamp: 1726568460938,
 }
 
-export const Default = BasicTemplate.bind({})
-Default.args = {
-    item: exampleWithPerformanceObserverValues,
+export const Default: Story = {
+    args: {
+        item: exampleWithPerformanceObserverValues,
+    },
 }
 
-export const NoPerformanceObserverCapturedData = BasicTemplate.bind({})
-NoPerformanceObserverCapturedData.args = {
-    item: {
-        ...exampleWithoutPerformanceObserverValues,
-        // mapping isn't run here but would have added raw
-        raw: exampleWithoutPerformanceObserverValues,
-    } as unknown as PerformanceEvent,
+export const NoPerformanceObserverCapturedData: Story = {
+    args: {
+        item: {
+            ...exampleWithoutPerformanceObserverValues,
+            // mapping isn't run here but would have added raw
+            raw: exampleWithoutPerformanceObserverValues,
+        } as unknown as PerformanceEvent,
+    },
+}
+
+// A fetch that recorded no response (blocked, network error, or cancelled) has a method but no
+// status, and the browser cannot measure its size. It should read as "no response", not a success.
+export const NoResponseRecorded: Story = {
+    args: {
+        item: {
+            entry_type: 'resource',
+            initiator_type: 'fetch',
+            method: 'GET',
+            name: 'https://api.company.com/v1/counts',
+            start_time: 858859,
+            end_time: 859613,
+            duration: 754,
+            time_origin: '1726567602079',
+            timestamp: 1726568460938,
+        } as unknown as PerformanceEvent,
+    },
+}
+
+export function TimedOutBodyDisplay(): JSX.Element {
+    return (
+        <BodyDisplay
+            content="[SessionReplay] Timeout while trying to read body"
+            headers={{ 'content-type': 'application/json' }}
+        />
+    )
 }
 
 export function InitialHeadersDisplay(): JSX.Element {

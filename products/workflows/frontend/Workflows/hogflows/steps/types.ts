@@ -1,9 +1,8 @@
 import { Handle, NodeProps } from '@xyflow/react'
 import { z } from 'zod'
 
+import { Optional } from 'lib/utils/types'
 import { LogEntry } from 'scenes/hog-functions/logs/logsViewerLogic'
-
-import { Optional } from '~/types'
 
 import { HogFlowAction } from '../types'
 
@@ -20,13 +19,36 @@ const ActionFiltersSchema = z.object({
     actions: z.array(z.any()).optional(),
 })
 
+const DURATION_STRING = z.string().superRefine((v, ctx) => {
+    if (!/\d/.test(v)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Please enter a duration' })
+        return
+    }
+    if (!/^\d*\.?\d+[dhms]$/.test(v)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Duration must be a number followed by s, m, h, or d' })
+        return
+    }
+    if (parseFloat(v) <= 0) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Duration must be greater than 0' })
+    }
+})
+
+// A delay offset points either side of the date it offsets, so unlike DURATION_STRING it is signed.
+const OFFSET_DURATION_STRING = z.string().superRefine((v, ctx) => {
+    if (!/^-?\d*\.?\d+[dhms]$/.test(v)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Offset must be a number followed by s, m, h, or d' })
+    }
+})
+
 const _commonActionFields = {
     id: z.string(),
     name: z.string(),
-    description: z.string(),
+    // The server accepts actions without a description (agents routinely omit it), so an absent
+    // one must not fail the whole step's validation.
+    description: z.string().optional().default(''),
     on_error: z.enum(['continue', 'abort']).optional().nullable(),
-    created_at: z.number(),
-    updated_at: z.number(),
+    created_at: z.number().optional(),
+    updated_at: z.number().optional(),
     filters: ActionFiltersSchema.optional().nullable(),
     output_variable: z // The Hogflow-level variable to store the output of this action into
         .union([
@@ -34,12 +56,14 @@ const _commonActionFields = {
                 key: z.string(),
                 result_path: z.string().optional().nullable(), // The path within the action result to store, e.g. 'body.user.id'
                 spread: z.boolean().optional().nullable(), // When true, spread object result into multiple variables as {key}_{property}
+                label: z.string().optional().nullable(), // Display label for the auto-created workflow variable
             }),
             z.array(
                 z.object({
                     key: z.string(),
                     result_path: z.string().optional().nullable(),
                     spread: z.boolean().optional().nullable(),
+                    label: z.string().optional().nullable(),
                 })
             ),
         ])
@@ -66,9 +90,21 @@ export const CyclotronJobInputSchemaTypeSchema = z.object({
         'choice',
         'json',
         'integration',
+        'integration_multi',
         'integration_field',
         'email',
         'native_email',
+        'posthog_assignee',
+        'posthog_ticket_tags',
+        'posthog_business_hours',
+        'non_failure_status_codes',
+        'customer_analytics_account_properties',
+        'customer_analytics_account_relationships',
+        'task_model',
+        'task_repository',
+        'task_mcp_installations',
+        'signals_scout',
+        'task_skills',
     ]),
     key: z.string(),
     label: z.string(),
@@ -99,7 +135,7 @@ export const CyclotronInputMappingSchema = z.object({
     name: z.string(),
     disabled: z.boolean().optional(),
     inputs_schema: z.array(CyclotronJobInputSchemaTypeSchema).optional(),
-    inputs: z.record(CyclotronInputSchema).optional().nullable(),
+    inputs: z.record(z.string(), CyclotronInputSchema).optional().nullable(),
     filters: z.any().optional().nullable(),
 })
 
@@ -116,39 +152,66 @@ export const HogFlowTriggerSchema = z.discriminatedUnion('type', [
     }),
     z.object({
         type: z.literal('webhook'),
-        template_uuid: z.string().uuid().optional(), // May be used later to specify a specific template version
+        template_uuid: z.string().optional(), // May be used later to specify a specific template version
         template_id: z.string(),
-        inputs: z.record(CyclotronInputSchema),
+        inputs: z.record(z.string(), CyclotronInputSchema),
     }),
     z.object({
         type: z.literal('manual'),
-        template_uuid: z.string().uuid().optional(), // May be used later to specify a specific template version
+        template_uuid: z.string().optional(), // May be used later to specify a specific template version
         template_id: z.string(),
-        inputs: z.record(CyclotronInputSchema),
+        inputs: z.record(z.string(), CyclotronInputSchema),
     }),
     z.object({
         type: z.literal('tracking_pixel'),
-        template_uuid: z.string().uuid().optional(), // May be used later to specify a specific template version
+        template_uuid: z.string().optional(), // May be used later to specify a specific template version
         template_id: z.string(),
-        inputs: z.record(CyclotronInputSchema),
+        inputs: z.record(z.string(), CyclotronInputSchema),
     }),
     z.object({
         type: z.literal('schedule'),
-        template_uuid: z.string().uuid().optional(), // May be used later to specify a specific template version
-        template_id: z.string(),
-        inputs: z.record(CyclotronInputSchema),
-        scheduled_at: z.string().optional(), // ISO 8601 datetime string for one-time scheduling
-        // Future: recurring schedule fields can be added here
     }),
     z.object({
         type: z.literal('batch'),
         filters: z.object({
+            // 'accounts' fans out one run per customer analytics account instead of per person
+            audience_type: z.enum(['persons', 'accounts']).optional(),
             properties: z.array(z.any()),
+            tag_names: z.array(z.string()).optional(),
+            assigned_to_user_ids: z.array(z.number()).optional(),
+            all_roles_unassigned: z.boolean().optional(),
         }),
-        scheduled_at: z.string().optional(), // ISO 8601 datetime string for one-time scheduling
-        // Future: recurring schedule fields can be added here
+    }),
+    z.object({
+        type: z.literal('data-warehouse-table'),
+        // Dot-notated table name matching the Python CDPProducer naming
+        table_name: z.string(),
+        filters: z.object({
+            properties: z.array(z.any()).optional(),
+        }),
+        key_property: z.string().optional(),
+    }),
+    z.object({
+        type: z.literal('internal-event'),
+        filters: z.object({
+            source: z.literal('internal-events'),
+            events: z.array(z.any()).min(1),
+            properties: z.array(z.any()).optional(),
+        }),
+    }),
+    z.object({
+        type: z.literal('data-warehouse-view'),
+        // The materialized view's own name, which is also its HogQL name
+        table_name: z.string(),
+        filters: z.object({
+            properties: z.array(z.any()).optional(),
+        }),
+        key_property: z.string().optional(),
     }),
 ])
+
+/** Trigger types that use HogFlowSchedule for recurring execution */
+export const SCHEDULED_TRIGGER_TYPES: readonly string[] = ['batch', 'schedule'] as const
 
 export const HogFlowActionSchema = z.discriminatedUnion('type', [
     // Trigger
@@ -188,9 +251,56 @@ export const HogFlowActionSchema = z.discriminatedUnion('type', [
     z.object({
         ..._commonActionFields,
         type: z.literal('delay'),
-        config: z.object({
-            delay_duration: z.string().min(2),
-        }),
+        // Two ways to say when to continue, exactly one of which is set. `delay_duration` waits a fixed span
+        // from when the step starts; `delay_until` waits for an instant carried by the person or the event.
+        // Keep in sync with nodejs/src/cdp/schema/hogflow.ts and the server-side validation in hog_flow.py.
+        config: z
+            .object({
+                delay_duration: DURATION_STRING.optional(),
+                delay_until: z
+                    .object({
+                        // HogQL evaluating to a datetime. The builder composes it from a property picker,
+                        // but the API accepts any expression, so anything can turn up here.
+                        expression: z.string(),
+                        offset: OFFSET_DURATION_STRING.optional(),
+                        // Which zone a date carrying no offset of its own is read in, the same three
+                        // fields wait_until_time_window uses.
+                        timezone: z.string().nullish(),
+                        use_person_timezone: z.boolean().optional(),
+                        fallback_timezone: z.string().nullish(),
+                        // Compiled server-side at save; whatever the client sends is discarded.
+                        bytecode: z.any().optional(),
+                        bytecode_error: z.string().optional(),
+                    })
+                    .optional(),
+                max_delay_duration: DURATION_STRING.optional(),
+            })
+            .superRefine((config, ctx) => {
+                if (!config.delay_until) {
+                    if (config.delay_duration === undefined) {
+                        ctx.addIssue({
+                            code: z.ZodIssueCode.custom,
+                            path: ['delay_duration'],
+                            message: 'Please enter a duration',
+                        })
+                    }
+                    return
+                }
+                if (config.delay_duration !== undefined) {
+                    ctx.addIssue({
+                        code: z.ZodIssueCode.custom,
+                        path: ['delay_until'],
+                        message: 'A delay waits either for a duration or until a date, not both',
+                    })
+                }
+                if (!config.delay_until.expression.trim()) {
+                    ctx.addIssue({
+                        code: z.ZodIssueCode.custom,
+                        path: ['delay_until', 'expression'],
+                        message: 'Please choose a date to wait for',
+                    })
+                }
+            }),
     }),
     z.object({
         ..._commonActionFields,
@@ -200,7 +310,15 @@ export const HogFlowActionSchema = z.discriminatedUnion('type', [
                 filters: ActionFiltersSchema.optional().nullable(),
                 name: z.string().optional(), // Custom name for the condition
             }),
-            max_wait_duration: z.string(),
+            events: z
+                .array(
+                    z.object({
+                        filters: ActionFiltersSchema.optional().nullable(),
+                        name: z.string().optional(),
+                    })
+                )
+                .optional(),
+            max_wait_duration: DURATION_STRING,
         }),
     }),
 
@@ -233,9 +351,9 @@ export const HogFlowActionSchema = z.discriminatedUnion('type', [
         ..._commonActionFields,
         type: z.literal('function'),
         config: z.object({
-            template_uuid: z.string().uuid().optional(), // May be used later to specify a specific template version
+            template_uuid: z.string().optional(), // May be used later to specify a specific template version
             template_id: z.string(),
-            inputs: z.record(CyclotronInputSchema),
+            inputs: z.record(z.string(), CyclotronInputSchema),
             mappings: z.array(CyclotronInputMappingSchema).optional(),
         }),
     }),
@@ -243,22 +361,37 @@ export const HogFlowActionSchema = z.discriminatedUnion('type', [
         ..._commonActionFields,
         type: z.literal('function_email'),
         config: z.object({
-            message_category_id: z.string().uuid().optional(),
+            message_category_id: z.string().optional(),
             message_category_type: z.enum(['marketing', 'transactional']).optional(),
+            // When false, no open pixel is injected, links are not rewritten, and the send uses the
+            // untracked SES configuration set. Absent/true means tracked. Keep in sync with
+            // nodejs/src/cdp/schema/hogflow.ts.
+            tracking_enabled: z.boolean().optional(),
             template_uuid: z.string().optional(), // May be used later to specify a specific template version
             template_id: z.literal('template-email'),
-            inputs: z.record(CyclotronInputSchema),
+            inputs: z.record(z.string(), CyclotronInputSchema),
         }),
     }),
     z.object({
         ..._commonActionFields,
         type: z.literal('function_sms'),
         config: z.object({
+            message_category_id: z.string().optional(),
+            message_category_type: z.enum(['marketing', 'transactional']).optional(),
+            template_uuid: z.string().optional(),
+            template_id: z.literal('template-twilio'),
+            inputs: z.record(z.string(), CyclotronInputSchema),
+        }),
+    }),
+    z.object({
+        ..._commonActionFields,
+        type: z.literal('function_push'),
+        config: z.object({
             message_category_id: z.string().uuid().optional(),
             message_category_type: z.enum(['marketing', 'transactional']).optional(),
             template_uuid: z.string().uuid().optional(),
-            template_id: z.literal('template-twilio'),
-            inputs: z.record(CyclotronInputSchema),
+            template_id: z.literal('template-native-push'),
+            inputs: z.record(z.string(), CyclotronInputSchema),
         }),
     }),
 
@@ -274,27 +407,40 @@ export const HogFlowActionSchema = z.discriminatedUnion('type', [
 
 export const isOptOutEligibleAction = (
     action: HogFlowAction
-): action is Extract<HogFlowAction, { type: 'function_email' | 'function_sms' }> => {
-    return ['function_email', 'function_sms'].includes(action.type)
+): action is Extract<HogFlowAction, { type: 'function_email' | 'function_sms' | 'function_push' }> => {
+    return ['function_email', 'function_sms', 'function_push'].includes(action.type)
+}
+
+export const isEmailAction = (action: HogFlowAction): action is Extract<HogFlowAction, { type: 'function_email' }> => {
+    return ['function_email'].includes(action.type)
+}
+
+export const isPushAction = (action: HogFlowAction): action is Extract<HogFlowAction, { type: 'function_push' }> => {
+    return ['function_push'].includes(action.type)
 }
 
 export const isFunctionAction = (
     action: HogFlowAction
-): action is Extract<HogFlowAction, { type: 'function' | 'function_sms' | 'function_email' }> => {
-    return ['function', 'function_sms', 'function_email'].includes(action.type)
+): action is Extract<HogFlowAction, { type: 'function' | 'function_sms' | 'function_email' | 'function_push' }> => {
+    return ['function', 'function_sms', 'function_email', 'function_push'].includes(action.type)
 }
 
 export const isTriggerFunction = (
     action: HogFlowAction
-): action is Extract<
-    HogFlowAction,
-    { type: 'trigger'; config: { type: 'webhook' | 'tracking_pixel' | 'manual' | 'schedule' } }
-> => {
+): action is Extract<HogFlowAction, { type: 'trigger'; config: { type: 'webhook' | 'tracking_pixel' | 'manual' } }> => {
     if (action.type !== 'trigger') {
         return false
     }
     const trigger = action as Extract<HogFlowAction, { type: 'trigger' }>
-    return ['webhook', 'tracking_pixel', 'manual', 'schedule'].includes(trigger.config.type)
+    return ['webhook', 'tracking_pixel', 'manual'].includes(trigger.config.type)
+}
+
+export const isScheduleTrigger = (action: HogFlowAction): boolean => {
+    if (action.type !== 'trigger') {
+        return false
+    }
+    const trigger = action as Extract<HogFlowAction, { type: 'trigger' }>
+    return trigger.config.type === 'schedule'
 }
 
 export interface HogflowTestResult {

@@ -1,8 +1,8 @@
-import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/OnboardingDocsContentWrapper'
+import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/shared/OnboardingDocsContentWrapper'
 
 import { StepDefinition } from '../steps'
 
-export const getDocusaurusSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
+export const getDocusaurusInstallSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
     const { CodeBlock, Markdown, CalloutBox, dedent } = ctx
 
     return [
@@ -46,7 +46,7 @@ export const getDocusaurusSteps = (ctx: OnboardingComponentsContext): StepDefini
                                     [
                                       'posthog-docusaurus',
                                       {
-                                        apiKey: '<ph_project_api_key>',
+                                        apiKey: '<ph_project_token>',
                                         appUrl: '<ph_client_api_host>',
                                         enableInDevelopment: false,
                                       },
@@ -66,16 +66,26 @@ export const getDocusaurusSteps = (ctx: OnboardingComponentsContext): StepDefini
                 </>
             ),
         },
-        {
-            title: 'View events',
-            content: (
-                <Markdown>
-                    Start your Docusaurus site and visit a few pages. PostHog will automatically capture pageviews and
-                    other events.
-                </Markdown>
-            ),
-        },
     ]
 }
+
+export const getDocusaurusEventStep = (ctx: OnboardingComponentsContext): StepDefinition => {
+    const { Markdown } = ctx
+
+    return {
+        title: 'View events',
+        content: (
+            <Markdown>
+                Start your Docusaurus site and visit a few pages. PostHog will automatically capture pageviews and other
+                events.
+            </Markdown>
+        ),
+    }
+}
+
+export const getDocusaurusSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => [
+    ...getDocusaurusInstallSteps(ctx),
+    getDocusaurusEventStep(ctx),
+]
 
 export const DocusaurusInstallation = createInstallation(getDocusaurusSteps)

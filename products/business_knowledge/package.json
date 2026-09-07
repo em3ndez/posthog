@@ -1,0 +1,23 @@
+{
+    "name": "@posthog/products-business-knowledge",
+    "scripts": {
+        "backend:test": "pytest -c ../../pytest.ini --rootdir ../.. backend/tests -v --tb=short --override-ini='addopts=' || test $? -eq 5"
+    },
+    "dependencies": {
+        "kea": "catalog:",
+        "kea-forms": "catalog:",
+        "kea-loaders": "catalog:",
+        "kea-router": "catalog:",
+        "posthog-js": "catalog:"
+    },
+    "devDependencies": {
+        "kea-test-utils": "catalog:"
+    },
+    "peerDependencies": {
+        "@posthog/brand": "catalog:",
+        "@posthog/icons": "catalog:",
+        "@posthog/lemon-ui": "*",
+        "@types/react": "*",
+        "react": "*"
+    }
+}

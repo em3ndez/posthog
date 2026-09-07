@@ -6,68 +6,63 @@ import { LemonButton, LemonDropdown, LemonSelect, LemonTable, Tooltip } from '@p
 import { PayGateMini } from 'lib/components/PayGateMini/PayGateMini'
 import { getAccessControlTooltip } from 'lib/utils/accessControlUtils'
 
-import { APIScopeObject, AccessControlLevel, AvailableFeature } from '~/types'
+import { AccessControlLevel, AvailableFeature } from '~/types'
 
-import { ScopeIcon } from './ScopeIcon'
 import { accessControlsLogic } from './accessControlsLogic'
+import { getLevelOptionsForResource } from './helpers'
+import { ObjectAccessRules } from './ObjectAccessRules'
+import { PropertyAccessRules } from './PropertyAccessRules'
+import { ScopeIcon } from './ScopeIcon'
 
 export function AccessControlDefaultSettings({ projectId }: { projectId: string }): JSX.Element {
     const logic = accessControlsLogic({ projectId })
-    const {
-        resourcesWithProject,
-        getLevelOptionsForResource,
-        allRows,
-        loading,
-        canEditAccessControls,
-        canEditRoleBasedAccessControls,
-    } = useValues(logic)
+    const { defaults, resourceKeys, loading, accessDetailPanelEnabled } = useValues(logic)
     const { updateAccessControlDefault, updateResourceAccessControls } = useActions(logic)
 
-    const defaultRow = allRows.find((row) => row.id === 'default')
-    const mappedLevels: Record<APIScopeObject, AccessControlLevel | null> =
-        defaultRow?.levels.reduce(
-            (prev, l) => Object.assign(prev, { [l.resourceKey]: l.level }),
-            {} as Record<APIScopeObject, AccessControlLevel | null>
-        ) || ({} as Record<APIScopeObject, AccessControlLevel | null>)
+    const {
+        can_edit: canEdit = false,
+        available_project_levels: projectLevels = [],
+        available_resource_levels: resourceLevels = [],
+    } = defaults ?? {}
 
     return (
-        <div className="space-y-4">
-            <div className="p-3 bg-surface-primary rounded border border-border flex flex-row justify-between items-center">
-                <div>
-                    <h4 className="mb-0 font-semibold flex items-center gap-2">
-                        <span className="text-lg flex items-center">
-                            <IconHome />
-                        </span>
-                        Default access to this project
-                    </h4>
-                    <p className="text-xs text-muted-alt mb-0">
-                        This is the default level of access for everyone in your organization
-                    </p>
+        <PayGateMini feature={AvailableFeature.ACCESS_CONTROL} featureDetail="resource-access-control-default-settings">
+            <div className="space-y-4">
+                <div className="p-3 bg-surface-primary rounded border border-border flex flex-row justify-between items-center">
+                    <div>
+                        <h4 className="mb-0 font-semibold flex items-center gap-2">
+                            <span className="text-lg flex items-center">
+                                <IconHome />
+                            </span>
+                            Default access to this project
+                        </h4>
+                        <p className="text-xs text-muted-alt mb-0">
+                            This is the default level of access for everyone in your organization
+                        </p>
+                    </div>
+                    <div className="max-w-sm">
+                        <LemonSelect
+                            dropdownPlacement="bottom-start"
+                            value={defaults?.project_access_level ?? null}
+                            disabledReason={loading ? 'Loading...' : !canEdit ? 'Cannot edit' : undefined}
+                            size="small"
+                            className="w-36"
+                            onChange={(newValue) => {
+                                updateAccessControlDefault(newValue as AccessControlLevel, 'v2')
+                            }}
+                            options={getLevelOptionsForResource(projectLevels)}
+                        />
+                    </div>
                 </div>
-                <div className="max-w-sm">
-                    <LemonSelect
-                        dropdownPlacement="bottom-start"
-                        value={mappedLevels['project'] ?? null}
-                        disabled={loading || !canEditAccessControls}
-                        size="small"
-                        className="w-36"
-                        onChange={(newValue) => {
-                            updateAccessControlDefault(newValue as AccessControlLevel)
-                        }}
-                        options={getLevelOptionsForResource('project' as APIScopeObject)}
-                    />
-                </div>
-            </div>
 
-            <PayGateMini feature={AvailableFeature.ADVANCED_PERMISSIONS}>
                 <LemonTable
-                    dataSource={resourcesWithProject.filter((r) => r.key !== 'project')}
+                    dataSource={resourceKeys}
                     loading={loading}
                     columns={[
                         {
-                            title: 'Feature',
+                            title: 'Tool',
                             key: 'label',
-                            render: function RenderFeature(_, resource) {
+                            render: function RenderTool(_, resource) {
                                 const tooltipText = getAccessControlTooltip(resource.key)
                                 return (
                                     <div className="font-medium flex items-center gap-2">
@@ -89,8 +84,15 @@ export function AccessControlDefaultSettings({ projectId }: { projectId: string 
                             key: 'access',
                             align: 'right',
                             render: function RenderAccess(_, resource) {
-                                const canEdit = canEditRoleBasedAccessControls
-                                const value = mappedLevels[resource.key] ?? null
+                                const entry = defaults?.resource_access_levels[resource.key]
+                                const value = entry?.access_level ?? null
+                                const options = getLevelOptionsForResource(resourceLevels, {
+                                    minimum: entry?.minimum ?? null,
+                                    maximum: entry?.maximum ?? null,
+                                    inheritedLevel: null,
+                                    inheritedReason: null,
+                                    resourceLabel: resource.label,
+                                })
 
                                 if (value === null) {
                                     return (
@@ -98,7 +100,7 @@ export function AccessControlDefaultSettings({ projectId }: { projectId: string 
                                             placement="bottom-end"
                                             overlay={
                                                 <div className="flex flex-col">
-                                                    {getLevelOptionsForResource(resource.key).map((option) => (
+                                                    {options.map((option) => (
                                                         <LemonButton
                                                             key={option.value}
                                                             size="small"
@@ -131,7 +133,9 @@ export function AccessControlDefaultSettings({ projectId }: { projectId: string 
                                                 type="tertiary"
                                                 icon={<IconPlus />}
                                                 sideIcon={null}
-                                                disabled={loading || !canEdit}
+                                                disabledReason={
+                                                    loading ? 'Loading...' : !canEdit ? 'Cannot edit' : undefined
+                                                }
                                                 className="ml-auto my-0.5 w-36"
                                             >
                                                 Add default
@@ -145,7 +149,7 @@ export function AccessControlDefaultSettings({ projectId }: { projectId: string 
                                         dropdownPlacement="bottom-end"
                                         placeholder="No override"
                                         value={value}
-                                        disabled={loading || !canEdit}
+                                        disabledReason={loading ? 'Loading...' : !canEdit ? 'Cannot edit' : undefined}
                                         size="small"
                                         className="ml-auto w-36 my-0.5"
                                         onChange={(newValue) => {
@@ -161,17 +165,34 @@ export function AccessControlDefaultSettings({ projectId }: { projectId: string 
                                                 'default'
                                             )
                                         }}
-                                        options={[
-                                            { value: null, label: 'No override' },
-                                            ...getLevelOptionsForResource(resource.key),
-                                        ]}
+                                        options={[{ value: null, label: 'No override' }, ...options]}
                                     />
                                 )
                             },
                         },
                     ]}
                 />
-            </PayGateMini>
-        </div>
+
+                {accessDetailPanelEnabled && (
+                    <>
+                        <ObjectAccessRules
+                            projectId={projectId}
+                            scopeType="default"
+                            subjectId="default"
+                            subjectNoun="project"
+                            canEdit={canEdit}
+                        />
+
+                        <PropertyAccessRules
+                            projectId={projectId}
+                            scopeType="default"
+                            subjectId="default"
+                            subjectNoun="project"
+                            canEdit={canEdit}
+                        />
+                    </>
+                )}
+            </div>
+        </PayGateMini>
     )
 }

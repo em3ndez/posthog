@@ -10,16 +10,20 @@ from parameterized import parameterized
 from rest_framework import exceptions
 from rest_framework.exceptions import NotFound, ValidationError
 
-from posthog.models.experiment import Experiment
-from posthog.models.feature_flag import FeatureFlag
 from posthog.models.integration import Integration
 from posthog.models.organization import Organization, OrganizationMembership
 from posthog.models.organization_integration import OrganizationIntegration
 from posthog.models.team import Team
 from posthog.models.user import User
 
+from products.experiments.backend.models.experiment import Experiment
+from products.feature_flags.backend.models.feature_flag import FeatureFlag
+
 from ee.api.vercel.types import VercelUserClaims
-from ee.vercel.integration import VercelIntegration
+from ee.vercel.integration import VercelIntegration, _safe_vercel_sync
+
+# Hardcoded independently of ee.vercel.integration.CLIENT_ENV_PREFIXES so a dropped prefix fails these tests.
+EXPECTED_PREFIXES = ["NEXT_PUBLIC_", "VITE_", "NUXT_PUBLIC_", "PUBLIC_"]
 
 
 class TestVercelIntegration(TestCase):
@@ -161,13 +165,27 @@ class TestVercelIntegration(TestCase):
     def test_update_installation_not_found(self):
         VercelIntegration.update_installation(self.NONEXISTENT_INSTALLATION_ID, "pro200")
 
-    def test_delete_installation(self):
+    @patch("ee.billing.billing_manager.BillingManager")
+    @patch("ee.vercel.integration.get_cached_instance_license")
+    def test_delete_installation(self, mock_license, mock_billing_manager):
+        mock_license.return_value = Mock()
+        mock_billing_manager.return_value = Mock()
+
         result = VercelIntegration.delete_installation(self.installation_id)
 
         assert result["finalized"]
         assert not OrganizationIntegration.objects.filter(integration_id=self.installation_id).exists()
 
-    @patch("ee.vercel.integration.BillingManager")
+    @patch("ee.vercel.integration.get_cached_instance_license")
+    def test_delete_installation_aborts_without_license(self, mock_license):
+        mock_license.return_value = None
+
+        with self.assertRaises(RuntimeError):
+            VercelIntegration.delete_installation(self.installation_id)
+
+        assert OrganizationIntegration.objects.filter(integration_id=self.installation_id).exists()
+
+    @patch("ee.billing.billing_manager.BillingManager")
     @patch("ee.vercel.integration.get_cached_instance_license")
     def test_delete_installation_calls_billing_deauthorize(self, mock_license, mock_billing_manager):
         """Deleting installation should notify billing service to cancel subscription."""
@@ -180,26 +198,42 @@ class TestVercelIntegration(TestCase):
         result = VercelIntegration.delete_installation(self.installation_id)
 
         assert result["finalized"]
-        mock_billing_manager.assert_called_once_with(mock_license.return_value)
+        mock_billing_manager.assert_called_once_with(mock_license.return_value, user=self.user)
         mock_manager_instance.deauthorize.assert_called_once_with(
             self.organization, billing_provider=BillingProvider.VERCEL
         )
 
-    @patch("ee.vercel.integration.capture_exception")
-    @patch("ee.vercel.integration.BillingManager")
+    @patch("ee.billing.billing_manager.BillingManager")
     @patch("ee.vercel.integration.get_cached_instance_license")
-    def test_delete_installation_continues_on_billing_failure(self, mock_license, mock_billing_manager, mock_capture):
-        """Deletion should complete even if billing deauthorization fails."""
+    def test_delete_installation_aborts_on_billing_failure(self, mock_license, mock_billing_manager):
+        """Deletion should not proceed if billing deauthorization fails, so Vercel retries the webhook."""
         mock_license.return_value = Mock()
         mock_manager_instance = Mock()
         mock_manager_instance.deauthorize.side_effect = Exception("Billing service error")
         mock_billing_manager.return_value = mock_manager_instance
 
-        result = VercelIntegration.delete_installation(self.installation_id)
+        with self.assertRaises(Exception) as context:
+            VercelIntegration.delete_installation(self.installation_id)
+        assert "Billing service error" in str(context.exception)
 
-        assert result["finalized"]
-        assert not OrganizationIntegration.objects.filter(integration_id=self.installation_id).exists()
-        mock_capture.assert_called_once()
+        assert OrganizationIntegration.objects.filter(integration_id=self.installation_id).exists()
+
+    @patch("ee.billing.billing_manager.BillingManager")
+    @patch("ee.vercel.integration.get_cached_instance_license")
+    def test_delete_installation_blocked_by_open_invoices(self, mock_license, mock_billing_manager):
+        from ee.billing.billing_manager import BillingServiceOpenInvoicesError
+
+        mock_license.return_value = Mock()
+        mock_manager_instance = Mock()
+        mock_manager_instance.deauthorize.side_effect = BillingServiceOpenInvoicesError(
+            "Cannot uninstall billing provider: 1 unpaid invoice must be resolved first."
+        )
+        mock_billing_manager.return_value = mock_manager_instance
+
+        with self.assertRaises(BillingServiceOpenInvoicesError):
+            VercelIntegration.delete_installation(self.installation_id)
+
+        assert OrganizationIntegration.objects.filter(integration_id=self.installation_id).exists()
 
     def test_delete_installation_not_found(self):
         with self.assertRaises(NotFound):
@@ -222,8 +256,10 @@ class TestVercelIntegration(TestCase):
         VercelIntegration.upsert_installation(self.installation_id, self.payload, self.user_claims)
 
         self.installation.refresh_from_db()
-        assert self.installation.config == self.payload
+        expected_config = {k: v for k, v in self.payload.items() if k != "credentials"}
+        assert self.installation.config == expected_config
         assert self.installation.config != original_config
+        assert self.installation.sensitive_config["credentials"] == self.payload["credentials"]
 
     @patch("ee.vercel.integration.report_user_signed_up")
     def test_upsert_installation_new_user_new_org(self, mock_report):
@@ -244,9 +280,12 @@ class TestVercelIntegration(TestCase):
         assert "new_user_456" in new_installation.config["user_mappings"]
         assert new_installation.config["user_mappings"]["new_user_456"] is not None
 
-        # Check all other config fields match
+        # Check all other config fields match (credentials are in sensitive_config)
         for key, value in self.payload.items():
-            assert new_installation.config[key] == value
+            if key == "credentials":
+                assert new_installation.sensitive_config["credentials"] == value
+            else:
+                assert new_installation.config[key] == value
 
         new_user = User.objects.get(email=self.payload["account"]["contact"]["email"])
         assert new_user.first_name == "John"
@@ -281,9 +320,12 @@ class TestVercelIntegration(TestCase):
             "user_mappings", {}
         )
 
-        # Check all other config fields match
+        # Check all other config fields match (credentials are in sensitive_config)
         for key, value in self.payload.items():
-            assert new_installation.config[key] == value
+            if key == "credentials":
+                assert new_installation.sensitive_config["credentials"] == value
+            else:
+                assert new_installation.config[key] == value
 
         # Existing user IS added to the organization - they are installing so they should be a member
         new_org = new_installation.organization
@@ -374,7 +416,7 @@ class TestVercelIntegration(TestCase):
             self.fail("SSO should NOT require login for trusted Vercel user")
 
     @patch("ee.vercel.integration.report_user_signed_up")
-    @patch("ee.vercel.integration.BillingManager")
+    @patch("ee.billing.billing_manager.BillingManager")
     @patch("ee.vercel.integration.get_cached_instance_license")
     def test_billing_failure_does_not_delete_existing_user(self, mock_license, mock_billing, mock_report):
         """Billing failure should NOT delete existing users (only newly created ones)."""
@@ -560,15 +602,29 @@ class TestVercelIntegration(TestCase):
 
         assert "name" in str(context.exception.detail)
 
-    def test_build_secrets(self):
+    def test_build_secrets_leads_with_the_next_public_names(self):
         team = Team.objects.create(organization=self.organization, name="Test Team", api_token="test_api_token")
         secrets = VercelIntegration._build_secrets(team)
 
-        assert len(secrets) == 2
-        assert secrets[0]["name"] == "NEXT_PUBLIC_POSTHOG_KEY"
+        assert secrets[0]["name"] == "NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN"
         assert secrets[0]["value"] == "test_api_token"
         assert secrets[1]["name"] == "NEXT_PUBLIC_POSTHOG_HOST"
         assert secrets[1]["value"].startswith(("https://", "http://"))
+
+    @parameterized.expand([(prefix,) for prefix in EXPECTED_PREFIXES])
+    def test_build_secrets_injects_framework_prefixed_aliases(self, prefix: str):
+        team = Team.objects.create(organization=self.organization, name="Test Team", api_token="test_api_token")
+        secrets = {secret["name"]: secret["value"] for secret in VercelIntegration._build_secrets(team)}
+
+        assert secrets[f"{prefix}POSTHOG_PROJECT_TOKEN"] == "test_api_token"
+        assert secrets[f"{prefix}POSTHOG_HOST"].startswith(("https://", "http://"))
+
+    def test_build_secrets_covers_every_prefix_exactly_once(self):
+        team = Team.objects.create(organization=self.organization, name="Test Team", api_token="test_api_token")
+        secrets = VercelIntegration._build_secrets(team)
+
+        names = [secret["name"] for secret in secrets]
+        assert len(names) == len(set(names)) == 2 * len(EXPECTED_PREFIXES)
 
     @parameterized.expand(
         [
@@ -603,10 +659,18 @@ class TestVercelIntegration(TestCase):
         ]
     )
     def test_get_access_token(self, _, credentials, expected):
-        self.installation.config["credentials"] = credentials
+        self.installation.sensitive_config["credentials"] = credentials
         self.installation.save()
         result = VercelIntegration._get_access_token(self.installation)
         assert result == expected
+
+    def test_get_access_token_fallback_from_config(self):
+        """Pre-migration installations store credentials in config — fallback should find them."""
+        self.installation.config["credentials"] = {"access_token": "legacy_token", "token_type": "Bearer"}
+        self.installation.sensitive_config = {}
+        self.installation.save()
+        result = VercelIntegration._get_access_token(self.installation)
+        assert result == "legacy_token"
 
     @parameterized.expand(
         [
@@ -822,6 +886,38 @@ class TestVercelIntegration(TestCase):
         experiment.save()
 
         mock_sync.assert_called_once_with(experiment, False)
+
+    @parameterized.expand(
+        [
+            ("delete_skips_autocreate", True, False, 0),
+            ("sync_autocreates", False, True, 1),
+        ]
+    )
+    def test_safe_vercel_sync_only_autocreates_resource_on_sync(
+        self, _name, is_delete, should_create, expected_sync_calls
+    ):
+        team = Team.objects.create(organization=self.organization, name="No Resource Team")
+        sync_func = Mock()
+
+        _safe_vercel_sync("op", "item_1", team, sync_func, is_delete=is_delete)
+
+        created = Integration.objects.filter(team=team, kind=Integration.IntegrationKind.VERCEL).exists()
+        assert created is should_create
+        assert sync_func.call_count == expected_sync_calls
+
+    @patch("ee.vercel.integration.VercelAPIClient")
+    def test_feature_flag_post_delete_does_not_recreate_vercel_resource(self, _mock_client):
+        # Regression: project deletion looped forever. During the team-deletion cascade the team's Vercel
+        # resource is deleted before its feature flags, so each flag's post_delete auto-created a connectable
+        # Integration row for the team being deleted in the same atomic transaction — orphaning it and failing
+        # COMMIT with an IntegrityError on the team FK. The delete path must never auto-create a resource.
+        team = Team.objects.create(organization=self.organization, name="Doomed Team")
+        flag = FeatureFlag.objects.create(team=team, key="doomed-flag")
+        Integration.objects.filter(team=team, kind=Integration.IntegrationKind.VERCEL).delete()
+
+        flag.delete()
+
+        assert not Integration.objects.filter(team=team, kind=Integration.IntegrationKind.VERCEL).exists()
 
 
 class TestVercelInstallationRegressions(TestCase):
@@ -1168,6 +1264,8 @@ class TestPushSecretsToVercel(TestCase):
             integration_id="icfg_secrets_test_123456789",
             config={
                 "billing_plan_id": "posthog-usage-based",
+            },
+            sensitive_config={
                 "credentials": {"access_token": "test_token", "token_type": "Bearer"},
             },
             created_by=self.user,
@@ -1187,9 +1285,10 @@ class TestPushSecretsToVercel(TestCase):
         assert call_args[1]["resource_id"] == str(self.resource.pk)
 
         secrets = call_args[1]["secrets"]
-        assert len(secrets) == 2
-        assert any(s["name"] == "NEXT_PUBLIC_POSTHOG_KEY" for s in secrets)
-        assert any(s["name"] == "NEXT_PUBLIC_POSTHOG_HOST" for s in secrets)
+        assert len(secrets) == 2 * len(EXPECTED_PREFIXES)
+        for prefix in EXPECTED_PREFIXES:
+            assert any(s["name"] == f"{prefix}POSTHOG_PROJECT_TOKEN" for s in secrets)
+            assert any(s["name"] == f"{prefix}POSTHOG_HOST" for s in secrets)
 
     @patch("ee.vercel.integration.VercelAPIClient")
     def test_push_secrets_sends_current_api_token(self, mock_client_class):
@@ -1201,7 +1300,7 @@ class TestPushSecretsToVercel(TestCase):
 
         call_args = mock_client.update_resource_secrets.call_args
         secrets = call_args[1]["secrets"]
-        api_key_secret = next(s for s in secrets if s["name"] == "NEXT_PUBLIC_POSTHOG_KEY")
+        api_key_secret = next(s for s in secrets if s["name"] == "NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN")
         assert api_key_secret["value"] == self.team.api_token
 
     @patch("ee.vercel.integration.VercelAPIClient")

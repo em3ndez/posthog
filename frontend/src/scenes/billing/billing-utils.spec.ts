@@ -1,23 +1,33 @@
 import tk from 'timekeeper'
 
+import { FEATURE_FLAGS, OrganizationMembershipLevel } from 'lib/constants'
 import { dayjs } from 'lib/dayjs'
+import type { FeatureFlagsSet } from 'lib/logic/featureFlagLogic'
 
 import { billingJson } from '~/mocks/fixtures/_billing'
 import billingJsonWithFlatFee from '~/mocks/fixtures/_billing_with_flat_fee.json'
 
 import {
     buildUsageLimitApproachingMessage,
-    buildUsageLimitExceededMessage,
+    buildUsageLimitReachedMessage,
+    canAccessBilling,
+    canViewUsageAndSpend,
     convertAmountToUsage,
     convertLargeNumberToWords,
     convertUsageToAmount,
     formatDisplayUsage,
     formatProductNames,
     formatWithDecimals,
+    getMinimumBillingAccessLevel,
+    getMinimumUsageSpendReadAccessLevel,
     getProration,
     getUsageLimitConsequence,
+    isMemberUsageSpendReadAccessEnabled,
+    isUsageApproachingLimit,
+    isUsageAtOrOverLimit,
     projectUsage,
     summarizeUsage,
+    selectionCoversEveryProject,
 } from './billing-utils'
 
 describe('summarizeUsage', () => {
@@ -30,6 +40,23 @@ describe('summarizeUsage', () => {
         expect(summarizeUsage(100000)).toEqual('100 K')
         expect(summarizeUsage(999999)).toEqual('1 M')
         expect(summarizeUsage(10000000)).toEqual('10 M')
+    })
+})
+
+describe('usage limit thresholds', () => {
+    it('treats exactly 100% usage as at the limit', () => {
+        expect(isUsageAtOrOverLimit(null)).toBe(false)
+        expect(isUsageAtOrOverLimit(undefined)).toBe(false)
+        expect(isUsageAtOrOverLimit(0.99)).toBe(false)
+        expect(isUsageAtOrOverLimit(1)).toBe(true)
+        expect(isUsageAtOrOverLimit(1.01)).toBe(true)
+    })
+
+    it('only treats usage below 100% as approaching the limit', () => {
+        expect(isUsageApproachingLimit(0.8, 0.8)).toBe(false)
+        expect(isUsageApproachingLimit(0.81, 0.8)).toBe(true)
+        expect(isUsageApproachingLimit(1, 0.8)).toBe(false)
+        expect(isUsageApproachingLimit(1.01, 0.8)).toBe(false)
     })
 })
 
@@ -442,6 +469,10 @@ describe('getUsageLimitConsequence', () => {
         expect(getUsageLimitConsequence('PostHog AI')).toEqual('PostHog AI will be unavailable')
     })
 
+    it('should return specific message for the self-driving inbox', () => {
+        expect(getUsageLimitConsequence('Self-driving inbox')).toEqual('self-driving agents will be paused')
+    })
+
     it('should return generic message for other products', () => {
         expect(getUsageLimitConsequence('Session replay')).toEqual('data loss may occur')
         expect(getUsageLimitConsequence('Product analytics')).toEqual('data loss may occur')
@@ -449,70 +480,121 @@ describe('getUsageLimitConsequence', () => {
     })
 })
 
-describe('buildUsageLimitExceededMessage', () => {
+describe('buildUsageLimitReachedMessage', () => {
     it('should return empty strings for empty array', () => {
-        expect(buildUsageLimitExceededMessage([])).toEqual({ title: '', message: '' })
+        expect(buildUsageLimitReachedMessage([])).toEqual({ title: '', message: '' })
     })
 
     it('should build message for single subscribed product', () => {
-        const result = buildUsageLimitExceededMessage([{ name: 'Session replay', subscribed: true }])
-        expect(result.title).toEqual('Usage limit exceeded')
+        const result = buildUsageLimitReachedMessage([{ name: 'Session replay', subscribed: true }])
+        expect(result.title).toEqual('Usage limit reached')
         expect(result.message).toEqual(
-            'You have exceeded the usage limit for Session replay. Please increase your billing limit or data loss may occur.'
+            'You have reached the usage limit for Session replay. Please increase your billing limit or data loss may occur.'
         )
     })
 
     it('should build message for single unsubscribed product', () => {
-        const result = buildUsageLimitExceededMessage([{ name: 'Session replay', subscribed: false }])
+        const result = buildUsageLimitReachedMessage([{ name: 'Session replay', subscribed: false }])
         expect(result.message).toContain('upgrade your plan')
     })
 
     it('should build message for multiple products with unique consequences', () => {
-        const result = buildUsageLimitExceededMessage([
+        const result = buildUsageLimitReachedMessage([
             { name: 'Session replay', subscribed: true },
             { name: 'Feature flags & Experiments', subscribed: true },
         ])
-        expect(result.title).toEqual('Usage limits exceeded')
+        expect(result.title).toEqual('Usage limits reached')
         expect(result.message).toEqual(
-            'You have exceeded the usage limit for Session replay and Feature flags & Experiments. Please increase your billing limit or data loss may occur and feature flags will not evaluate.'
+            'You have reached the usage limit for Session replay and Feature flags & Experiments. Please increase your billing limit or data loss may occur and feature flags will not evaluate.'
         )
     })
 
     it('should build message for PostHog AI with specific consequence', () => {
-        const result = buildUsageLimitExceededMessage([{ name: 'PostHog AI', subscribed: true }])
-        expect(result.title).toEqual('Usage limit exceeded')
+        const result = buildUsageLimitReachedMessage([{ name: 'PostHog AI', subscribed: true }])
+        expect(result.title).toEqual('Usage limit reached')
         expect(result.message).toEqual(
-            'You have exceeded the usage limit for PostHog AI. Please increase your billing limit or PostHog AI will be unavailable.'
+            'You have reached the usage limit for PostHog AI. Please increase your billing limit or PostHog AI will be unavailable.'
+        )
+    })
+
+    it('should name the self-driving inbox by its app name, not its billing name', () => {
+        const result = buildUsageLimitReachedMessage([{ type: 'inbox', name: 'Inbox', subscribed: true }])
+        expect(result.title).toEqual('Usage limit reached')
+        expect(result.message).toEqual(
+            'You have reached the usage limit for Self-driving inbox. Please increase your billing limit or self-driving agents will be paused.'
         )
     })
 
     it('should build message for PostHog AI with other products', () => {
-        const result = buildUsageLimitExceededMessage([
+        const result = buildUsageLimitReachedMessage([
             { name: 'PostHog AI', subscribed: true },
             { name: 'Session replay', subscribed: true },
         ])
-        expect(result.title).toEqual('Usage limits exceeded')
+        expect(result.title).toEqual('Usage limits reached')
         expect(result.message).toEqual(
-            'You have exceeded the usage limit for PostHog AI and Session replay. Please increase your billing limit or PostHog AI will be unavailable and data loss may occur.'
+            'You have reached the usage limit for PostHog AI and Session replay. Please increase your billing limit or PostHog AI will be unavailable and data loss may occur.'
         )
     })
 
     it('should deduplicate consequences for products with same consequence', () => {
-        const result = buildUsageLimitExceededMessage([
+        const result = buildUsageLimitReachedMessage([
             { name: 'Session replay', subscribed: true },
             { name: 'Product analytics', subscribed: true },
         ])
         expect(result.message).toEqual(
-            'You have exceeded the usage limit for Session replay and Product analytics. Please increase your billing limit or data loss may occur.'
+            'You have reached the usage limit for Session replay and Product analytics. Please increase your billing limit or data loss may occur.'
         )
     })
 
     it('should use upgrade message when any product is not subscribed', () => {
-        const result = buildUsageLimitExceededMessage([
+        const result = buildUsageLimitReachedMessage([
             { name: 'Session replay', subscribed: true },
             { name: 'Feature flags & Experiments', subscribed: false },
         ])
         expect(result.message).toContain('upgrade your plan')
+    })
+
+    it.each([
+        {
+            hasBillingAccess: true,
+            subscribed: true,
+            expected: 'increase your billing limit',
+        },
+        {
+            hasBillingAccess: true,
+            subscribed: false,
+            expected: 'upgrade your plan',
+        },
+        {
+            hasBillingAccess: false,
+            subscribed: true,
+            expected: 'ask an organization admin to increase the billing limit',
+        },
+        {
+            hasBillingAccess: false,
+            subscribed: false,
+            expected: 'ask an organization admin to upgrade the plan',
+        },
+    ])(
+        'should use "$expected" when hasBillingAccess=$hasBillingAccess and subscribed=$subscribed',
+        ({ hasBillingAccess, subscribed, expected }) => {
+            const result = buildUsageLimitReachedMessage([{ name: 'Session replay', subscribed }], hasBillingAccess)
+            expect(result.message).toContain(expected)
+        }
+    )
+
+    it('should say "owner" when minimumBillingAccessLevel is Owner and user has no billing access', () => {
+        const result = buildUsageLimitReachedMessage(
+            [{ name: 'Session replay', subscribed: true }],
+            false,
+            OrganizationMembershipLevel.Owner
+        )
+        expect(result.message).toContain('ask an organization owner')
+    })
+
+    it('should default to admin message when hasBillingAccess is not provided', () => {
+        const result = buildUsageLimitReachedMessage([{ name: 'Session replay', subscribed: true }])
+        expect(result.message).toContain('increase your billing limit')
     })
 })
 
@@ -526,7 +608,7 @@ describe('buildUsageLimitApproachingMessage', () => {
             { name: 'Session replay', percentage_usage: 0.9, usage_key: 'recordings' },
         ])
         expect(result.title).toEqual('You will soon hit your usage limit')
-        expect(result.message).toEqual('You have currently used 90% of your recordings allocation.')
+        expect(result.message).toEqual('You have currently used 90% of your Session replay allocation.')
     })
 
     it('should build message for multiple products', () => {
@@ -536,13 +618,17 @@ describe('buildUsageLimitApproachingMessage', () => {
         ])
         expect(result.title).toEqual('You will soon hit your usage limits')
         expect(result.message).toEqual(
-            'You are approaching your usage limits: 90% of your recordings allocation, 87% of your feature_flag_requests allocation.'
+            'You are approaching your usage limits: 90% of your Session replay allocation, 87% of your Feature flags & Experiments allocation.'
         )
     })
 
-    it('should handle missing usage_key', () => {
-        const result = buildUsageLimitApproachingMessage([{ name: 'Session replay', percentage_usage: 0.9 }])
-        expect(result.message).toContain('usage allocation')
+    it.each([
+        { name: 'Session replay', usage_key: undefined, expected: 'Session replay allocation' },
+        { name: '', usage_key: 'signals_credits', expected: 'signals_credits allocation' },
+        { name: '', usage_key: undefined, expected: 'usage allocation' },
+    ])('should resolve label to "$expected" (name="$name", usage_key=$usage_key)', ({ name, usage_key, expected }) => {
+        const result = buildUsageLimitApproachingMessage([{ name, percentage_usage: 0.9, usage_key }])
+        expect(result.message).toContain(expected)
     })
 
     it('should format percentage with up to 2 decimal places', () => {
@@ -550,5 +636,162 @@ describe('buildUsageLimitApproachingMessage', () => {
             { name: 'Session replay', percentage_usage: 0.8567, usage_key: 'recordings' },
         ])
         expect(result.message).toContain('85.67%')
+    })
+
+    it.each([
+        {
+            hasBillingAccess: true,
+            expectedSuffix: false,
+        },
+        {
+            hasBillingAccess: false,
+            expectedSuffix: true,
+        },
+    ])(
+        'should include admin contact message when hasBillingAccess=$hasBillingAccess',
+        ({ hasBillingAccess, expectedSuffix }) => {
+            const result = buildUsageLimitApproachingMessage(
+                [{ name: 'Session replay', percentage_usage: 0.9, usage_key: 'recordings' }],
+                hasBillingAccess
+            )
+            if (expectedSuffix) {
+                expect(result.message).toContain('Please ask an organization admin to increase the billing limit.')
+            } else {
+                expect(result.message).not.toContain('organization admin')
+            }
+        }
+    )
+
+    it('should say "owner" when minimumBillingAccessLevel is Owner and user has no billing access', () => {
+        const result = buildUsageLimitApproachingMessage(
+            [{ name: 'Session replay', percentage_usage: 0.9, usage_key: 'recordings' }],
+            false,
+            OrganizationMembershipLevel.Owner
+        )
+        expect(result.message).toContain('ask an organization owner')
+    })
+
+    it('should default to no admin suffix when hasBillingAccess is not provided', () => {
+        const result = buildUsageLimitApproachingMessage([
+            { name: 'Session replay', percentage_usage: 0.9, usage_key: 'recordings' },
+        ])
+        expect(result.message).not.toContain('organization admin')
+    })
+})
+
+describe('getMinimumBillingAccessLevel', () => {
+    it('returns Admin when ownerOnlyBilling is false', () => {
+        expect(getMinimumBillingAccessLevel(false)).toBe(OrganizationMembershipLevel.Admin)
+    })
+
+    it('returns Owner when ownerOnlyBilling is true', () => {
+        expect(getMinimumBillingAccessLevel(true)).toBe(OrganizationMembershipLevel.Owner)
+    })
+})
+
+describe('canAccessBilling', () => {
+    it.each([
+        { level: OrganizationMembershipLevel.Owner, ownerOnly: false, expected: true },
+        { level: OrganizationMembershipLevel.Owner, ownerOnly: true, expected: true },
+        { level: OrganizationMembershipLevel.Admin, ownerOnly: false, expected: true },
+        { level: OrganizationMembershipLevel.Admin, ownerOnly: true, expected: false },
+        { level: OrganizationMembershipLevel.Member, ownerOnly: false, expected: false },
+        { level: OrganizationMembershipLevel.Member, ownerOnly: true, expected: false },
+        { level: null, ownerOnly: false, expected: false },
+        { level: null, ownerOnly: true, expected: false },
+    ])('returns $expected for level=$level, ownerOnly=$ownerOnly', ({ level, ownerOnly, expected }) => {
+        expect(canAccessBilling(level, ownerOnly)).toBe(expected)
+    })
+})
+
+describe('getMinimumUsageSpendReadAccessLevel', () => {
+    it.each([
+        { memberAccess: false, ownerOnly: false, expected: OrganizationMembershipLevel.Admin },
+        { memberAccess: true, ownerOnly: false, expected: OrganizationMembershipLevel.Member },
+        { memberAccess: false, ownerOnly: true, expected: OrganizationMembershipLevel.Owner },
+        // owner-only-billing wins over member-billing-usage-spend-read-access
+        { memberAccess: true, ownerOnly: true, expected: OrganizationMembershipLevel.Owner },
+    ])(
+        'returns $expected for memberAccess=$memberAccess, ownerOnly=$ownerOnly',
+        ({ memberAccess, ownerOnly, expected }) => {
+            expect(getMinimumUsageSpendReadAccessLevel(memberAccess, ownerOnly)).toBe(expected)
+        }
+    )
+})
+
+describe('canViewUsageAndSpend', () => {
+    it.each([
+        { level: OrganizationMembershipLevel.Member, memberAccess: true, ownerOnly: false, expected: true },
+        { level: OrganizationMembershipLevel.Member, memberAccess: true, ownerOnly: true, expected: false },
+        { level: OrganizationMembershipLevel.Member, memberAccess: false, ownerOnly: false, expected: false },
+        { level: OrganizationMembershipLevel.Admin, memberAccess: false, ownerOnly: false, expected: true },
+        { level: OrganizationMembershipLevel.Admin, memberAccess: true, ownerOnly: true, expected: false },
+        { level: OrganizationMembershipLevel.Owner, memberAccess: false, ownerOnly: true, expected: true },
+        { level: null, memberAccess: true, ownerOnly: false, expected: false },
+    ])(
+        'returns $expected for level=$level, memberAccess=$memberAccess, ownerOnly=$ownerOnly',
+        ({ level, memberAccess, ownerOnly, expected }) => {
+            expect(canViewUsageAndSpend(level, memberAccess, ownerOnly)).toBe(expected)
+        }
+    )
+})
+
+describe('isMemberUsageSpendReadAccessEnabled', () => {
+    // Dropping the usage-spend-dashboards half of this lets a view-only member reach Usage and Spend
+    // by URL while the account menu and settings sidebar hide Billing from them entirely.
+    it.each<{ case: string; featureFlags: FeatureFlagsSet; expected: boolean }>([
+        {
+            case: 'both flags are on',
+            featureFlags: {
+                [FEATURE_FLAGS.MEMBER_BILLING_USAGE_SPEND_READ_ACCESS]: true,
+                [FEATURE_FLAGS.USAGE_SPEND_DASHBOARDS]: true,
+            },
+            expected: true,
+        },
+        {
+            case: 'the grant is on but there are no dashboards to reach',
+            featureFlags: {
+                [FEATURE_FLAGS.MEMBER_BILLING_USAGE_SPEND_READ_ACCESS]: true,
+                [FEATURE_FLAGS.USAGE_SPEND_DASHBOARDS]: false,
+            },
+            expected: false,
+        },
+        {
+            case: 'the dashboards are on but the grant is not',
+            featureFlags: {
+                [FEATURE_FLAGS.MEMBER_BILLING_USAGE_SPEND_READ_ACCESS]: false,
+                [FEATURE_FLAGS.USAGE_SPEND_DASHBOARDS]: true,
+            },
+            expected: false,
+        },
+        { case: 'neither flag is present', featureFlags: {}, expected: false },
+    ])('returns $expected when $case', ({ featureFlags, expected }) => {
+        expect(isMemberUsageSpendReadAccessEnabled(featureFlags)).toBe(expected)
+    })
+})
+
+describe('selectionCoversEveryProject', () => {
+    const options = [{ key: '1' }, { key: '2' }, { key: '3' }]
+
+    it('treats selecting every project as no filter', () => {
+        expect(selectionCoversEveryProject([1, 2, 3], options)).toBe(true)
+    })
+
+    it('keeps a partial selection as a filter', () => {
+        expect(selectionCoversEveryProject([1, 2], options)).toBe(false)
+    })
+
+    it('keeps an empty selection alone, since that already means every project', () => {
+        expect(selectionCoversEveryProject([], options)).toBe(false)
+        expect(selectionCoversEveryProject(undefined, options)).toBe(false)
+    })
+
+    it('does not claim coverage before the project list has loaded', () => {
+        expect(selectionCoversEveryProject([1, 2, 3], [])).toBe(false)
+    })
+
+    it('covers a deleted project that still appears as an option', () => {
+        // The options include projects that have usage but no longer exist.
+        expect(selectionCoversEveryProject([1, 2, 3, 99], [...options, { key: '99' }])).toBe(true)
     })
 })

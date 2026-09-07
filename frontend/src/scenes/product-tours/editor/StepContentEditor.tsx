@@ -3,7 +3,6 @@ import './StepContentEditor.scss'
 import { JSONContent } from '@tiptap/core'
 import { Color } from '@tiptap/extension-color'
 import { Image } from '@tiptap/extension-image'
-import { Link } from '@tiptap/extension-link'
 import { Placeholder } from '@tiptap/extension-placeholder'
 import { TextAlign } from '@tiptap/extension-text-align'
 import { TextStyle } from '@tiptap/extension-text-style'
@@ -18,12 +17,13 @@ import { IconCode, IconImage, IconList, IconVideoCamera } from '@posthog/icons'
 import { LemonButton, LemonDivider, LemonInput, LemonMenu, LemonModal } from '@posthog/lemon-ui'
 
 import { ResizableElement } from 'lib/components/ResizeElement/ResizeElement'
+import { LinkExtension } from 'lib/components/RichContentEditor/LinkExtension'
 import { useUploadFiles } from 'lib/hooks/useUploadFiles'
+import { IconBold, IconItalic, IconLink } from 'lib/lemon-ui/icons'
 import { LemonFileInput } from 'lib/lemon-ui/LemonFileInput'
 import { lemonToast } from 'lib/lemon-ui/LemonToast'
 import { Popover } from 'lib/lemon-ui/Popover'
 import { Spinner } from 'lib/lemon-ui/Spinner'
-import { IconBold, IconItalic, IconLink } from 'lib/lemon-ui/icons'
 
 import { DEFAULT_APPEARANCE } from '../constants'
 import { productTourLogic } from '../productTourLogic'
@@ -32,9 +32,9 @@ import { getWidthValue } from '../stepUtils'
 import { CodeBlockExtension } from './CodeBlockExtension'
 import { EmbedExtension } from './EmbedExtension'
 import { FooterPreview } from './FooterPreview'
-import { SlashCommandExtension } from './SlashCommandMenu'
 import { IconAlignCenter, IconAlignLeft, IconAlignRight, IconListNumbers, IconUnderline } from './icons'
 import { addProductTourCSSVariablesToElement } from './productTourCSSUtils'
+import { SlashCommandExtension } from './SlashCommandMenu'
 
 export interface StepContentEditorProps {
     tourId: string
@@ -69,15 +69,15 @@ export function StepContentEditor({
     autoFocus = false,
     uploadImage,
 }: StepContentEditorProps): JSX.Element {
-    const { productTour, productTourForm, selectedStepIndex } = useValues(productTourLogic({ id: tourId }))
+    const { productTour, productTourForm, selectedStep, selectedStepIndex } = useValues(
+        productTourLogic({ id: tourId })
+    )
     const { updateSelectedStep } = useActions(productTourLogic({ id: tourId }))
 
-    const steps = productTourForm.content?.steps ?? []
-    const step = steps[selectedStepIndex]
     const appearance = productTourForm.content?.appearance
     const isBanner = productTour ? isBannerAnnouncement(productTour) : false
 
-    const content = step?.content as JSONContent | null
+    const content = selectedStep?.content as JSONContent | null
     const placeholder =
         placeholderProp ??
         (isBanner
@@ -126,7 +126,7 @@ export function StepContentEditor({
                   }),
                   TextStyle,
                   Color,
-                  Link.configure({
+                  LinkExtension.configure({
                       openOnClick: false,
                       HTMLAttributes: {
                           class: 'step-content-link',
@@ -554,7 +554,7 @@ export function StepContentEditor({
                 editorContent
             ) : (
                 <ResizableElement
-                    defaultWidth={getWidthValue(step?.maxWidth)}
+                    defaultWidth={getWidthValue(selectedStep?.maxWidth)}
                     minWidth={200}
                     maxWidth={700}
                     onResize={(width) => updateSelectedStep({ maxWidth: width })}

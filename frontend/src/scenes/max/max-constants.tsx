@@ -3,25 +3,41 @@ import {
     IconBook,
     IconBrain,
     IconCheckbox,
+    IconCloud,
     IconCreditCard,
     IconDocument,
     IconGlobe,
     IconMemory,
     IconNotebook,
+    IconNotification,
+    IconPeople,
+    IconPlug,
     IconSearch,
     IconShuffle,
 } from '@posthog/icons'
 
 import { FEATURE_FLAGS } from 'lib/constants'
 import { IconQuestionAnswer, IconRobot } from 'lib/lemon-ui/icons'
+import { isObject } from 'lib/utils/guards'
 import { Scene } from 'scenes/sceneTypes'
 
 import { iconForType } from '~/layout/panel-layout/ProjectTree/defaultTree'
-import { isObject } from '~/lib/utils'
-import { AgentMode, AssistantTool } from '~/queries/schema/schema-assistant-messages'
+import {
+    AgentMode,
+    AssistantTool,
+    AssistantToolCall,
+    AssistantToolCallMessage,
+    TaskExecutionStatus,
+} from '~/queries/schema/schema-assistant-messages'
 import { RecordingUniversalFilters } from '~/types'
 
-import { EnhancedToolCall } from './Thread'
+export interface EnhancedToolCall extends AssistantToolCall {
+    status: TaskExecutionStatus
+    isLastPlanningMessage?: boolean
+    updates?: string[]
+    /** The tool call result message, if available */
+    result?: AssistantToolCallMessage
+}
 
 export interface DisplayFormatterContext {
     registeredToolMap: Record<string, ToolRegistration>
@@ -47,7 +63,7 @@ export interface ToolDefinition<N extends string = string> {
     displayFormatter?: (
         toolCall: EnhancedToolCall,
         { registeredToolMap }: DisplayFormatterContext
-    ) => string | [text: string, widgetDef: RecordingsWidgetDef | null]
+    ) => string | [text: string, widgetDef: RecordingsWidgetDef | ReplayVisionScanWidgetDef | null]
     /**
      * If only available in a specific product, specify it here.
      * We're using Scene instead of ProductKey, because that's more flexible (specifically for SQL editor there
@@ -58,8 +74,15 @@ export interface ToolDefinition<N extends string = string> {
     flag?: (typeof FEATURE_FLAGS)[keyof typeof FEATURE_FLAGS]
     /** If the tool is in beta, set this to true to display a beta badge */
     beta?: boolean
+    /** If the tool is in alpha, set this to true to display an alpha badge */
+    alpha?: boolean
     /** Agent modes this tool is available in (defined in backend presets) */
     modes?: AgentMode[]
+    /**
+     * Set for tools using ToolRegistration.clientExecution, so a pending call is resumed with
+     * a refusal (instead of stranded) after the owning view deregistered the handler.
+     */
+    clientExecuted?: boolean
 }
 
 /** Active instance of a tool. */
@@ -97,11 +120,23 @@ export interface ToolRegistration extends Pick<ToolDefinition, 'name' | 'descrip
     suggestions?: string[]
     /** The callback function that will be executed with the LLM's tool call output */
     callback?: (toolOutput: any, conversationId: string) => void | Promise<void>
+    /**
+     * Optional: executes part of the tool client-side. Runs with the tool call's arguments when
+     * the backend pauses via `MaxTool.request_client_execution()`; the returned result resumes
+     * the conversation and becomes that call's return value. Keep results small (verdicts, ids):
+     * they ride a Temporal resume payload capped at ~2MiB.
+     */
+    clientExecution?: (args: Record<string, any>) => Promise<Record<string, unknown>>
 }
 
 export interface RecordingsWidgetDef {
     widget: 'recordings'
     args: RecordingUniversalFilters
+}
+
+export interface ReplayVisionScanWidgetDef {
+    widget: 'replay_vision_scan'
+    args: { scanId: string; sessionIds: string[]; skipped: { sessionId: string; reason: string }[] }
 }
 
 /** Static mode definition for display purposes. */
@@ -112,6 +147,9 @@ export interface ModeDefinition {
     /** Scenes that should trigger this agent mode */
     scenes?: Set<Scene>
     beta?: boolean
+    alpha?: boolean
+    /** Feature flag key that gates this mode. When set, the mode is only available if the flag is enabled. */
+    flag?: keyof typeof FEATURE_FLAGS
 }
 
 /** Default tools available in all modes */
@@ -119,11 +157,71 @@ export const DEFAULT_TOOL_KEYS: (keyof typeof TOOL_DEFINITIONS)[] = [
     'read_taxonomy',
     'read_data',
     'list_data',
+    'list_feature_flags',
     'search',
     'switch_mode',
+    'list_llm_skills',
+    'get_llm_skill',
+    'get_llm_skill_file',
 ]
 
+function skillStatusFormatter(
+    toolCall: EnhancedToolCall,
+    { completedLabel, pendingLabel, nameArgKey }: { completedLabel: string; pendingLabel: string; nameArgKey?: string }
+): string {
+    const rawName = nameArgKey ? toolCall.args?.[nameArgKey] : undefined
+    const suffix = typeof rawName === 'string' && rawName ? ` "${rawName}"` : ''
+    if (toolCall.status === 'completed') {
+        return `${completedLabel}${suffix}`
+    }
+    return `${pendingLabel}${suffix}...`
+}
+
+/** Only these produce a row to wait for. Anything else is reported rather than polled for. */
+const OUTCOMES_THAT_MINT_AN_OBSERVATION = ['started', 'already_running', 'already_scanned']
+
+/**
+ * The scan tool reports what it started, per session, and the results land later on the scanner it
+ * minted. Sessions it skipped never get a row, so they are carried separately rather than left to
+ * look like work still in progress.
+ */
+function replayVisionScanWidgetDef(toolCall: EnhancedToolCall): ReplayVisionScanWidgetDef | null {
+    const payload = toolCall.result?.ui_payload?.scan_replay_vision_sessions
+    const scanId = typeof payload?.scan_id === 'string' ? payload.scan_id : null
+    if (!scanId || !Array.isArray(payload?.results)) {
+        return null
+    }
+    const results = payload.results as { session_id?: unknown; scan_outcome?: unknown }[]
+    const sessionIds: string[] = []
+    const skipped: { sessionId: string; reason: string }[] = []
+    for (const result of results) {
+        if (typeof result?.session_id !== 'string' || typeof result?.scan_outcome !== 'string') {
+            continue
+        }
+        if (OUTCOMES_THAT_MINT_AN_OBSERVATION.includes(result.scan_outcome)) {
+            sessionIds.push(result.session_id)
+        } else {
+            skipped.push({ sessionId: result.session_id, reason: result.scan_outcome })
+        }
+    }
+    if (!sessionIds.length && !skipped.length) {
+        return null
+    }
+    return { widget: 'replay_vision_scan', args: { scanId, sessionIds, skipped } }
+}
+
 export const TOOL_DEFINITIONS: Record<AssistantTool, ToolDefinition> = {
+    call_mcp_server: {
+        name: 'Call an MCP server',
+        description: 'Call an MCP server',
+        icon: <IconPlug />,
+        displayFormatter: (toolCall) => {
+            if (toolCall.status === 'completed') {
+                return 'Called an MCP server'
+            }
+            return 'Calling an MCP server...'
+        },
+    },
     todo_write: {
         name: 'Write a todo',
         description: 'Write a todo to remember a task',
@@ -458,6 +556,18 @@ export const TOOL_DEFINITIONS: Record<AssistantTool, ToolDefinition> = {
             return `Listing ${entityLabel}${pageInfo}...`
         },
     },
+    list_feature_flags: {
+        name: 'List feature flags',
+        description: 'List feature flags with their status, filterable by stale/enabled/disabled',
+        icon: <IconSearch />,
+        displayFormatter: (toolCall) => {
+            const status = typeof toolCall.args?.status === 'string' ? toolCall.args.status : null
+            const offset = typeof toolCall.args?.offset === 'number' ? toolCall.args.offset : 0
+            const pageInfo = offset > 0 ? ` (page ${Math.floor(offset / 100) + 1})` : ''
+            const label = status ? `${status} feature flags` : 'feature flags'
+            return toolCall.status === 'completed' ? `Listed ${label}${pageInfo}` : `Listing ${label}${pageInfo}...`
+        },
+    },
     create_insight: {
         name: 'Create an insight or edit an existing one',
         description: "Create an insight or edit an existing one you're viewing",
@@ -510,11 +620,26 @@ export const TOOL_DEFINITIONS: Record<AssistantTool, ToolDefinition> = {
         product: Scene.UserInterviews,
         flag: FEATURE_FLAGS.USER_INTERVIEWS,
         icon: iconForType('user_interview'),
+        modes: [AgentMode.UserInterview],
         displayFormatter: (toolCall) => {
             if (toolCall.status === 'completed') {
                 return 'Analyzed user interviews'
             }
             return 'Analyzing user interviews...'
+        },
+    },
+    create_user_interview_topic: {
+        name: 'Set up user interviews',
+        description: 'Set up user interviews — plan a research topic, target participants, and draft questions',
+        product: Scene.UserInterviews,
+        flag: FEATURE_FLAGS.USER_INTERVIEWS,
+        icon: iconForType('user_interview'),
+        modes: [AgentMode.UserInterview],
+        displayFormatter: (toolCall) => {
+            if (toolCall.status === 'completed') {
+                return 'Created interview topic'
+            }
+            return 'Setting up interview topic...'
         },
     },
     create_hog_function_filters: {
@@ -565,6 +690,48 @@ export const TOOL_DEFINITIONS: Record<AssistantTool, ToolDefinition> = {
             return 'Filtering issues...'
         },
     },
+    upsert_account: {
+        name: 'Manage accounts',
+        description: 'Manage accounts by creating them or updating roles, properties, and tags',
+        product: Scene.CustomerAnalytics,
+        icon: iconForType('cohort'),
+        modes: [AgentMode.CustomerAnalytics],
+        displayFormatter: (toolCall) => {
+            const action = toolCall.args?.action
+            const isUpdate = isObject(action) && 'action' in action && action.action === 'update'
+            if (isUpdate) {
+                return toolCall.status === 'completed' ? 'Updated account' : 'Updating account...'
+            }
+            return toolCall.status === 'completed' ? 'Created account' : 'Creating account...'
+        },
+    },
+    upsert_account_notebook: {
+        name: 'Manage account notes',
+        description: 'Manage account notes — call recaps, summaries, or edits to an existing note',
+        product: Scene.CustomerAnalytics,
+        icon: iconForType('notebook'),
+        modes: [AgentMode.CustomerAnalytics],
+        displayFormatter: (toolCall) => {
+            const action = toolCall.args?.action
+            const isUpdate = isObject(action) && 'action' in action && action.action === 'update'
+            if (isUpdate) {
+                return toolCall.status === 'completed' ? 'Updated account note' : 'Updating account note...'
+            }
+            return toolCall.status === 'completed' ? 'Created account note' : 'Creating account note...'
+        },
+    },
+    open_account: {
+        name: 'Open account',
+        description: 'Open account details and tabs',
+        product: Scene.CustomerAnalytics,
+        icon: <IconPeople />,
+        displayFormatter: (toolCall) => {
+            if (toolCall.status === 'completed') {
+                return 'Opened account'
+            }
+            return 'Opening account...'
+        },
+    },
     search_error_tracking_issues: {
         name: 'Search issues',
         description: 'Search issues in error tracking',
@@ -604,18 +771,172 @@ export const TOOL_DEFINITIONS: Record<AssistantTool, ToolDefinition> = {
             return 'Summarizing experiment results...'
         },
     },
-    experiment_session_replays_summary: {
-        name: 'Summarize experiment session replays',
-        description:
-            'Summarize experiment session replays to analyze user behavior patterns across experiment variants using session recordings',
-        product: Scene.Experiment,
+    summarize_replay_vision_summaries: {
+        name: 'Summarize session summaries',
+        description: 'Summarize session summaries across a Replay Vision summarizer scanner',
         icon: iconForType('session_replay'),
-        modes: [AgentMode.Flags],
+        modes: [AgentMode.SessionReplay],
         displayFormatter: (toolCall) => {
             if (toolCall.status === 'completed') {
-                return 'Analyzed session replay patterns'
+                return 'Summarized session summaries'
             }
-            return 'Analyzing session replays...'
+            return 'Summarizing session summaries...'
+        },
+    },
+    draft_replay_vision_scanner_prompt: {
+        name: 'Write scanner prompts',
+        description: 'Write scanner prompts for Replay Vision scanners',
+        icon: iconForType('session_replay'),
+        modes: [AgentMode.SessionReplay],
+        displayFormatter: (toolCall) => {
+            if (toolCall.status === 'completed') {
+                return 'Drafted scanner prompt'
+            }
+            return 'Drafting scanner prompt...'
+        },
+    },
+    search_replay_vision_observations: {
+        name: 'Search observations',
+        description: "Search observations by the meaning of a Replay Vision scanner's model reasoning",
+        icon: iconForType('session_replay'),
+        modes: [AgentMode.SessionReplay],
+        displayFormatter: (toolCall) => {
+            if (toolCall.status === 'completed') {
+                return 'Searched observations'
+            }
+            return 'Searching observations...'
+        },
+    },
+    scan_replay_vision_sessions: {
+        name: 'Scan recordings',
+        description: 'Scan recordings with Replay Vision to answer a question about them',
+        icon: iconForType('session_replay'),
+        modes: [AgentMode.SessionReplay],
+        displayFormatter: (toolCall) => {
+            if (toolCall.status !== 'completed') {
+                return 'Starting scans...'
+            }
+            return ['Scanned recordings', replayVisionScanWidgetDef(toolCall)]
+        },
+    },
+    retry_replay_vision_observation: {
+        name: 'Retry a scan',
+        description: 'Retry a scan on a recording whose observation failed',
+        icon: iconForType('session_replay'),
+        modes: [AgentMode.SessionReplay],
+        displayFormatter: (toolCall) => {
+            if (toolCall.status === 'completed') {
+                return 'Retried the scan'
+            }
+            return 'Retrying the scan...'
+        },
+    },
+    get_replay_vision_quota: {
+        name: 'Check Replay Vision credits',
+        description: 'Check Replay Vision credits left in the monthly budget',
+        icon: iconForType('session_replay'),
+        modes: [AgentMode.SessionReplay],
+        displayFormatter: (toolCall) => {
+            if (toolCall.status === 'completed') {
+                return 'Checked Replay Vision credits'
+            }
+            return 'Checking Replay Vision credits...'
+        },
+    },
+    create_replay_vision_scanner: {
+        name: 'Create a scanner',
+        description: 'Create a scanner that watches new recordings as they arrive',
+        icon: iconForType('session_replay'),
+        modes: [AgentMode.SessionReplay],
+        displayFormatter: (toolCall) => {
+            if (toolCall.status === 'completed') {
+                return 'Created the scanner'
+            }
+            return 'Creating the scanner...'
+        },
+    },
+    update_replay_vision_scanner: {
+        name: 'Update a scanner',
+        description: 'Update a scanner: turn it on or off, rename it, reword it, or change its sampling',
+        icon: iconForType('session_replay'),
+        modes: [AgentMode.SessionReplay],
+        displayFormatter: (toolCall) => {
+            if (toolCall.status === 'completed') {
+                return 'Updated the scanner'
+            }
+            return 'Updating the scanner...'
+        },
+    },
+    list_replay_vision_scanners: {
+        name: 'List scanners',
+        description: 'List scanners in this project, with their ids, status and sampling',
+        icon: iconForType('session_replay'),
+        modes: [AgentMode.SessionReplay],
+        displayFormatter: (toolCall) => {
+            if (toolCall.status === 'completed') {
+                return 'List scanners'
+            }
+            return 'List scanners...'
+        },
+    },
+    delete_replay_vision_scanner: {
+        name: 'Delete a scanner',
+        description: 'Delete a scanner and every observation it produced',
+        icon: iconForType('session_replay'),
+        modes: [AgentMode.SessionReplay],
+        displayFormatter: (toolCall) => {
+            if (toolCall.status === 'completed') {
+                return 'Delete a scanner'
+            }
+            return 'Delete a scanner...'
+        },
+    },
+    estimate_replay_vision_scanner: {
+        name: 'Estimate scanner cost',
+        description: 'Estimate scanner cost: recordings a month and the credits they take',
+        icon: iconForType('session_replay'),
+        modes: [AgentMode.SessionReplay],
+        displayFormatter: (toolCall) => {
+            if (toolCall.status === 'completed') {
+                return 'Estimate scanner cost'
+            }
+            return 'Estimate scanner cost...'
+        },
+    },
+    label_replay_vision_observation: {
+        name: 'Rate a result',
+        description: 'Rate a result: tell Replay Vision whether a scanner got a recording right',
+        icon: iconForType('session_replay'),
+        modes: [AgentMode.SessionReplay],
+        displayFormatter: (toolCall) => {
+            if (toolCall.status === 'completed') {
+                return 'Rate a result'
+            }
+            return 'Rate a result...'
+        },
+    },
+    analyze_replay_vision_impact: {
+        name: 'Measure impact',
+        description: "Measure impact: how many sessions and people a scanner's findings affected",
+        icon: iconForType('session_replay'),
+        modes: [AgentMode.SessionReplay],
+        displayFormatter: (toolCall) => {
+            if (toolCall.status === 'completed') {
+                return 'Measure impact'
+            }
+            return 'Measure impact...'
+        },
+    },
+    suggest_replay_vision_tags: {
+        name: 'Suggest categories',
+        description: 'Suggest categories for a classifier, grounded in what it has seen',
+        icon: iconForType('session_replay'),
+        modes: [AgentMode.SessionReplay],
+        displayFormatter: (toolCall) => {
+            if (toolCall.status === 'completed') {
+                return 'Suggest categories'
+            }
+            return 'Suggest categories...'
         },
     },
     create_survey: {
@@ -679,18 +1000,6 @@ export const TOOL_DEFINITIONS: Record<AssistantTool, ToolDefinition> = {
             return 'Fixing SQL...'
         },
     },
-    filter_revenue_analytics: {
-        name: 'Filter revenue analytics',
-        description: 'Filter revenue analytics to find the most impactful revenue insights',
-        product: Scene.RevenueAnalytics,
-        icon: iconForType('revenue_analytics'),
-        displayFormatter: (toolCall) => {
-            if (toolCall.status === 'completed') {
-                return 'Filtered revenue analytics'
-            }
-            return 'Filtering revenue analytics...'
-        },
-    },
     filter_web_analytics: {
         name: 'Filter web analytics',
         description: 'Filter web analytics to analyze traffic patterns and user behavior',
@@ -702,6 +1011,96 @@ export const TOOL_DEFINITIONS: Record<AssistantTool, ToolDefinition> = {
             }
             return 'Filtering web analytics...'
         },
+    },
+    web_analytics_doctor: {
+        name: 'Diagnose web analytics',
+        description: 'Diagnose web analytics setup issues like missing pageviews or partial proxy coverage',
+        product: Scene.WebAnalytics,
+        icon: iconForType('web_analytics'),
+        displayFormatter: (toolCall) => {
+            return toolCall.status === 'completed' ? 'Diagnosed web analytics' : 'Diagnosing web analytics...'
+        },
+    },
+    assess_heatmap: {
+        name: 'Assess a heatmap',
+        description:
+            'Assess a heatmap for a page — click, rageclick, and scroll-depth data plus the elements under the hot spots — and recommend concrete changes',
+        product: Scene.WebAnalytics,
+        icon: iconForType('web_analytics'),
+        displayFormatter: (toolCall) => {
+            return toolCall.status === 'completed' ? 'Assessed heatmap' : 'Assessing heatmap...'
+        },
+    },
+    summarize_website_interactions: {
+        name: 'Summarize website interactions',
+        description:
+            "Summarize website interactions by fusing the aggregate heatmap with Replay Vision's per-session narratives — the numbers and the why",
+        product: Scene.WebAnalytics,
+        icon: iconForType('web_analytics'),
+        displayFormatter: (toolCall) => {
+            return toolCall.status === 'completed'
+                ? 'Summarized website interactions'
+                : 'Summarizing website interactions...'
+        },
+    },
+    marketing_diagnose_setup: {
+        name: 'Diagnose marketing analytics',
+        description:
+            'Diagnose marketing analytics setup with a health check across data sources, attribution, and conversion goals',
+        product: Scene.MarketingAnalytics,
+        icon: iconForType('marketing_analytics'),
+        displayFormatter: (toolCall) =>
+            toolCall.status === 'completed' ? 'Diagnosed marketing analytics' : 'Diagnosing marketing analytics...',
+    },
+    marketing_explain_conversion_goal: {
+        name: 'Explain a conversion goal',
+        description:
+            'Explain a conversion goal by showing which events drove its count, broken down by source and integration',
+        product: Scene.MarketingAnalytics,
+        icon: iconForType('marketing_analytics'),
+        displayFormatter: (toolCall) =>
+            toolCall.status === 'completed' ? 'Explained conversion goal' : 'Explaining conversion goal...',
+    },
+    marketing_list_conversion_goals: {
+        name: 'List conversion goals',
+        description: 'List conversion goals with their last-30d performance',
+        product: Scene.MarketingAnalytics,
+        icon: iconForType('marketing_analytics'),
+        displayFormatter: (toolCall) =>
+            toolCall.status === 'completed' ? 'Listed conversion goals' : 'Listing conversion goals...',
+    },
+    marketing_list_data_sources: {
+        name: 'List marketing data sources',
+        description: 'List marketing data sources with platform-side health for every connected ad integration',
+        product: Scene.MarketingAnalytics,
+        icon: iconForType('marketing_analytics'),
+        displayFormatter: (toolCall) =>
+            toolCall.status === 'completed' ? 'Listed marketing data sources' : 'Listing marketing data sources...',
+    },
+    marketing_audit_utm: {
+        name: 'Audit UTM tagging',
+        description: 'Audit UTM tagging to find issues that prevent attribution to ad platforms',
+        product: Scene.MarketingAnalytics,
+        icon: iconForType('marketing_analytics'),
+        displayFormatter: (toolCall) =>
+            toolCall.status === 'completed' ? 'Audited UTM tagging' : 'Auditing UTM tagging...',
+    },
+    marketing_suggest_conversion_goals: {
+        name: 'Suggest conversion goals',
+        description: 'Suggest conversion goals by ranking custom events that are good candidates',
+        product: Scene.MarketingAnalytics,
+        icon: iconForType('marketing_analytics'),
+        displayFormatter: (toolCall) =>
+            toolCall.status === 'completed' ? 'Suggested conversion goals' : 'Suggesting conversion goals...',
+    },
+    marketing_suggest_utm_mappings: {
+        name: 'Suggest UTM mappings',
+        description:
+            'Suggest UTM mappings by detecting unmatched utm_source values and proposing custom_source_mappings entries',
+        product: Scene.MarketingAnalytics,
+        icon: iconForType('marketing_analytics'),
+        displayFormatter: (toolCall) =>
+            toolCall.status === 'completed' ? 'Suggested UTM mappings' : 'Suggesting UTM mappings...',
     },
     upsert_dashboard: {
         name: 'Create and edit dashboards',
@@ -884,22 +1283,17 @@ export const TOOL_DEFINITIONS: Record<AssistantTool, ToolDefinition> = {
             if (toolCall.status === 'completed') {
                 return 'Executed SQL'
             }
-            return 'Writing an SQL query...'
+            return 'Writing a SQL query...'
         },
     },
     summarize_sessions: {
+        // Retired tool. The entry stays so old conversations still render it, but it carries no `modes`:
+        // `getToolsForMode` reads that field, and listing it would offer a tool nobody can call.
         name: 'Summarize sessions',
-        description: 'Summarize sessions to analyze real user behavior',
-        flag: 'max-session-summarization',
+        description: 'Summarize sessions analyze real user behavior',
         icon: iconForType('session_replay'),
-        beta: true,
-        modes: [AgentMode.SessionReplay],
-        displayFormatter: (toolCall) => {
-            if (toolCall.status === 'completed') {
-                return 'Summarized sessions'
-            }
-            return 'Summarizing sessions...'
-        },
+        displayFormatter: (toolCall) =>
+            toolCall.status === 'completed' ? 'Summarized sessions' : 'Summarizing sessions...',
     },
     web_search: {
         name: 'Search the web', // Web search is a special case of a tool, as it's a built-in LLM provider one
@@ -912,7 +1306,6 @@ export const TOOL_DEFINITIONS: Record<AssistantTool, ToolDefinition> = {
             }
             return toolCall.args.query ? `Searching the web for **${toolCall.args.query}**...` : 'Searching the web...'
         },
-        flag: FEATURE_FLAGS.PHAI_WEB_SEARCH,
     },
     manage_memories: {
         name: 'Manage memories',
@@ -936,6 +1329,27 @@ export const TOOL_DEFINITIONS: Record<AssistantTool, ToolDefinition> = {
             return 'Creating a document...'
         },
     },
+    upsert_alert: {
+        name: 'Manage alerts',
+        description: 'Manage alerts to monitor insight metrics',
+        icon: <IconNotification />,
+        product: Scene.Insight,
+        modes: [AgentMode.ProductAnalytics],
+        displayFormatter: (toolCall) => {
+            if (isObject(toolCall.args?.action) && 'alert_id' in toolCall.args.action) {
+                return toolCall.status === 'completed' ? 'Updated alert' : 'Updating alert...'
+            }
+            return toolCall.status === 'completed' ? 'Created alert' : 'Creating alert...'
+        },
+    },
+    diagnose_proxy: {
+        name: 'Diagnose reverse proxy',
+        description: 'Diagnose reverse proxy stuck or erroring states',
+        icon: <IconCloud />,
+        displayFormatter: (toolCall) => {
+            return toolCall.status === 'completed' ? 'Diagnosed reverse proxy' : 'Diagnosing reverse proxy...'
+        },
+    },
     finalize_plan: {
         name: 'Finalize plan',
         description: 'Finalize plan',
@@ -947,21 +1361,118 @@ export const TOOL_DEFINITIONS: Record<AssistantTool, ToolDefinition> = {
             return 'Finalizing plan...'
         },
     },
-    recommend_products: {
-        name: 'Recommend products',
-        description: 'Recommend products based on user needs',
-        icon: iconForType('product_analytics'),
+    search_llm_traces: {
+        name: 'Search LLM traces',
+        description: 'Search LLM traces to analyze model usage, costs, latency, and errors',
+        icon: iconForType('llm_analytics'),
+        modes: [AgentMode.AIObservability],
         displayFormatter: (toolCall) => {
             if (toolCall.status === 'completed') {
-                return 'Recommended products'
+                return 'Searched LLM traces'
             }
-            return 'Recommending products...'
+            return 'Searching LLM traces...'
         },
+    },
+    create_ai_trace_parser: {
+        name: 'Create custom parsers',
+        description: 'Create custom parsers to control how AI observability events are displayed',
+        icon: iconForType('llm_analytics'),
+        clientExecuted: true,
+        displayFormatter: (toolCall) => {
+            if (toolCall.status === 'completed') {
+                return 'Created a custom parser'
+            }
+            return 'Writing a custom parser...'
+        },
+    },
+    run_hog_eval_test: {
+        name: 'Test evaluation',
+        description: 'Test evaluation code against sample events',
+        product: Scene.AIObservabilityEvaluation,
+        icon: iconForType('llm_evaluations'),
+        modes: [AgentMode.AIObservability],
+        displayFormatter: (toolCall) => {
+            if (toolCall.status === 'completed') {
+                return 'Tested evaluation code'
+            }
+            return 'Testing evaluation code...'
+        },
+    },
+    list_llm_skills: {
+        name: 'List shared skills',
+        description: 'List shared skills stored for this team',
+        icon: <IconBook />,
+        displayFormatter: (toolCall) =>
+            skillStatusFormatter(toolCall, {
+                completedLabel: 'Listed shared skills',
+                pendingLabel: 'Listing shared skills',
+            }),
+    },
+    get_llm_skill: {
+        name: 'Load shared skill',
+        description: 'Load shared skill body and file manifest',
+        icon: <IconBook />,
+        displayFormatter: (toolCall) =>
+            skillStatusFormatter(toolCall, {
+                completedLabel: 'Loaded shared skill',
+                pendingLabel: 'Loading shared skill',
+                nameArgKey: 'skill_name',
+            }),
+    },
+    get_llm_skill_file: {
+        name: 'Load shared skill file',
+        description: 'Load shared skill file bundled in a skill',
+        icon: <IconBook />,
+        displayFormatter: (toolCall) =>
+            skillStatusFormatter(toolCall, {
+                completedLabel: 'Loaded skill file',
+                pendingLabel: 'Loading skill file',
+                nameArgKey: 'file_path',
+            }),
+    },
+    create_llm_skill: {
+        name: 'Create shared skill',
+        description: 'Create shared skill to save a reusable workflow',
+        product: Scene.AIObservability,
+        icon: <IconBook />,
+        modes: [AgentMode.AIObservability],
+        displayFormatter: (toolCall) =>
+            skillStatusFormatter(toolCall, {
+                completedLabel: 'Created shared skill',
+                pendingLabel: 'Creating shared skill',
+                nameArgKey: 'name',
+            }),
+    },
+    update_llm_skill: {
+        name: 'Update shared skill',
+        description: 'Update shared skill by publishing a new version',
+        product: Scene.AIObservability,
+        icon: <IconBook />,
+        modes: [AgentMode.AIObservability],
+        displayFormatter: (toolCall) =>
+            skillStatusFormatter(toolCall, {
+                completedLabel: 'Updated shared skill',
+                pendingLabel: 'Updating shared skill',
+                nameArgKey: 'skill_name',
+            }),
+    },
+    archive_llm_skill: {
+        name: 'Archive shared skill',
+        description: 'Archive shared skill to hide it from suggestions',
+        product: Scene.AIObservability,
+        icon: <IconBook />,
+        modes: [AgentMode.AIObservability],
+        displayFormatter: (toolCall) =>
+            skillStatusFormatter(toolCall, {
+                completedLabel: 'Archived shared skill',
+                pendingLabel: 'Archiving shared skill',
+                nameArgKey: 'skill_name',
+            }),
     },
 }
 
 export const MODE_DEFINITIONS: Record<
-    Exclude<AgentMode, AgentMode.Plan | AgentMode.Execution | AgentMode.Research>,
+    Exclude<AgentMode, AgentMode.Plan | AgentMode.Execution | AgentMode.Research | AgentMode.Sandbox>,
     ModeDefinition
 > = {
     [AgentMode.ProductAnalytics]: {
@@ -1000,12 +1511,6 @@ export const MODE_DEFINITIONS: Record<
         icon: iconForType('survey'),
         scenes: new Set([Scene.Surveys, Scene.Survey]),
     },
-    [AgentMode.Onboarding]: {
-        name: 'Onboarding',
-        description: 'Helps new users discover which PostHog products are right for their needs.',
-        icon: iconForType('product_analytics'),
-        scenes: new Set([Scene.Onboarding]),
-    },
     [AgentMode.Flags]: {
         name: 'Flags',
         description: 'Creates and manages feature flags and experiments.',
@@ -1020,6 +1525,36 @@ export const MODE_DEFINITIONS: Record<
             Scene.ExperimentsSharedMetric,
             Scene.ExperimentsSharedMetrics,
         ]),
+    },
+    [AgentMode.AIObservability]: {
+        name: 'AI observability',
+        description: 'Analyzes LLM traces and writes evaluation code for AI observability.',
+        icon: iconForType('llm_analytics'),
+        scenes: new Set([
+            Scene.AIObservability,
+            Scene.AIObservabilityTrace,
+            Scene.AIObservabilityEvaluation,
+            Scene.AIObservabilityEvaluations,
+            Scene.AIObservabilityDataset,
+            Scene.AIObservabilityDatasets,
+            Scene.AIObservabilityPlayground,
+            Scene.AIObservabilityUsers,
+        ]),
+    },
+    [AgentMode.UserInterview]: {
+        name: 'User interviews',
+        description: 'Sets up live AI voice interviews and analyzes interview transcripts.',
+        icon: iconForType('user_interview'),
+        scenes: new Set([Scene.UserInterviews, Scene.UserInterview, Scene.UserInterviewResponse]),
+        flag: 'USER_INTERVIEWS',
+    },
+    [AgentMode.CustomerAnalytics]: {
+        name: 'Customer analytics',
+        description:
+            'Works with your customer accounts — assign owners, review notes and usage, and dig into account data.',
+        icon: iconForType('cohort'),
+        scenes: new Set([Scene.CustomerAnalytics, Scene.CustomerAnalyticsAccount]),
+        flag: 'CUSTOMER_ANALYTICS_CSP',
     },
 }
 
@@ -1044,6 +1579,18 @@ export const SPECIAL_MODES: Record<string, ModeDefinition> = {
         icon: <IconBrain />,
         beta: true,
     },
+    sandbox: {
+        name: 'Sandbox',
+        description: 'Spawns a cloud coding agent to work on the PostHog codebase.',
+        icon: <IconCloud />,
+        flag: 'PHAI_SANDBOX_MODE',
+        alpha: true,
+    },
+}
+
+/** Human-readable label for an agent or special mode value (e.g. `'product_analytics'` → `'Product analytics'`). */
+export function getModeDisplayName(mode: string): string {
+    return MODE_DEFINITIONS[mode as keyof typeof MODE_DEFINITIONS]?.name ?? SPECIAL_MODES[mode]?.name ?? mode
 }
 
 /** Get tools available for a specific agent mode */
@@ -1052,12 +1599,10 @@ export function getToolsForMode(mode: AgentMode): ToolDefinition[] {
 }
 
 /** Get default tools available in auto mode */
-export function getDefaultTools({ webSearchEnabled }: { webSearchEnabled: boolean }): ToolDefinition[] {
+export function getDefaultTools(): ToolDefinition[] {
     const defaultTools = DEFAULT_TOOL_KEYS.map((key) => TOOL_DEFINITIONS[key])
-    if (webSearchEnabled) {
-        // Add web search after `search`
-        defaultTools.splice(defaultTools.indexOf(TOOL_DEFINITIONS.search) + 1, 0, TOOL_DEFINITIONS.web_search)
-    }
+    // Add web search after `search`
+    defaultTools.splice(defaultTools.indexOf(TOOL_DEFINITIONS.search) + 1, 0, TOOL_DEFINITIONS.web_search)
     return defaultTools
 }
 

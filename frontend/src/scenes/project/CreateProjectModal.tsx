@@ -1,5 +1,5 @@
 import { useActions, useValues } from 'kea'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 
 import { LemonButton, LemonInput, LemonModal, Link } from '@posthog/lemon-ui'
 
@@ -31,9 +31,13 @@ export function CreateProjectModal({
 }): JSX.Element {
     const { currentProject, currentProjectLoading } = useValues(projectLogic)
     const { createProject } = useActions(projectLogic)
-    const { currentOrganization } = useValues(organizationLogic)
+    const { currentOrganization, projectCreationForbiddenReason } = useValues(organizationLogic)
     const { reportProjectCreationSubmitted } = useActions(eventUsageLogic)
     const [name, setName] = useState<string>('')
+
+    const isNameTaken = !!currentOrganization?.projects?.some(
+        (project) => project.name.trim().toLowerCase() === name.trim().toLowerCase()
+    )
 
     const closeModal: () => void = () => {
         if (onClose) {
@@ -44,6 +48,10 @@ export function CreateProjectModal({
         }
     }
     const handleSubmit = (): void => {
+        // Also guards Enter-key submission, which bypasses the button's disabledReason
+        if (!name || isNameTaken || currentProjectLoading || projectCreationForbiddenReason) {
+            return
+        }
         createProject({ name })
         reportProjectCreationSubmitted(
             currentOrganization?.projects ? currentOrganization.projects.length : 0,
@@ -51,9 +59,15 @@ export function CreateProjectModal({
         )
     }
 
-    // Anytime the project changes close the modal as it indicates we have created a new project
+    // Close the modal once a *new* project is created (the current project id changes). Guarding on the
+    // id rather than the object reference avoids closing on mount and avoids reacting to a failed create
+    // that left the existing project in place.
+    const previousProjectId = useRef(currentProject?.id)
     useEffect(() => {
-        closeModal()
+        if (currentProject && currentProject.id !== previousProjectId.current) {
+            previousProjectId.current = currentProject.id
+            closeModal()
+        }
     }, [currentProject]) // oxlint-disable-line react-hooks/exhaustive-deps
 
     return (
@@ -97,7 +111,15 @@ export function CreateProjectModal({
                         type="primary"
                         onClick={handleSubmit}
                         loading={currentProjectLoading}
-                        disabledReason={!name ? 'Think of a name!' : null}
+                        disabledReason={
+                            projectCreationForbiddenReason
+                                ? projectCreationForbiddenReason
+                                : !name
+                                  ? 'Think of a name!'
+                                  : isNameTaken
+                                    ? 'There is already a project with this name in this organization. Choose a different name.'
+                                    : null
+                        }
                     >
                         Create project
                     </LemonButton>

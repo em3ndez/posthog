@@ -10,12 +10,12 @@ import { useUploadFiles } from 'lib/hooks/useUploadFiles'
 import { LemonButton } from 'lib/lemon-ui/LemonButton'
 import { LemonFileInput } from 'lib/lemon-ui/LemonFileInput'
 import { LemonTabs } from 'lib/lemon-ui/LemonTabs'
-import { LemonTextArea, LemonTextAreaProps } from 'lib/lemon-ui/LemonTextArea/LemonTextArea'
 import { emojiUsageLogic } from 'lib/lemon-ui/LemonTextArea/emojiUsageLogic'
+import { LemonTextArea, LemonTextAreaProps } from 'lib/lemon-ui/LemonTextArea/LemonTextArea'
 import { lemonToast } from 'lib/lemon-ui/LemonToast'
 import { Spinner } from 'lib/lemon-ui/Spinner'
 import { Tooltip } from 'lib/lemon-ui/Tooltip'
-import { preflightLogic } from 'scenes/PreflightCheck/preflightLogic'
+import { preflightLogic } from 'lib/logic/preflightLogic'
 
 export const LemonTextAreaMarkdown = React.forwardRef<HTMLTextAreaElement, LemonTextAreaProps>(
     function LemonTextAreaMarkdown({ value, onChange, className, ...editAreaProps }, ref): JSX.Element {

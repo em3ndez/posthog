@@ -3,6 +3,26 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::types::{Json, Uuid};
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, sqlx::Type)]
+#[serde(transparent)]
+#[sqlx(transparent)]
+pub struct PropertyMatchingVersion(pub i16);
+
+impl PropertyMatchingVersion {
+    pub const LEGACY: Self = Self(1);
+    pub const EXPLICIT: Self = Self(2);
+
+    pub fn uses_explicit_matching(self) -> bool {
+        self == Self::EXPLICIT
+    }
+}
+
+impl Default for PropertyMatchingVersion {
+    fn default() -> Self {
+        Self::LEGACY
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, sqlx::FromRow)]
 pub struct Team {
     pub id: TeamId,
@@ -10,6 +30,11 @@ pub struct Team {
     pub api_token: String,
     pub uuid: Uuid,
     pub organization_id: Option<Uuid>,
+    // The project (environment parent) this team belongs to. Django writes it into the team
+    // metadata cache payload; `#[serde(default)]` keeps cache entries written before the
+    // field existed deserializing (they get `None`, and the handler falls back to a query).
+    #[serde(default)]
+    pub project_id: Option<i64>,
     pub autocapture_opt_out: Option<bool>,
     pub autocapture_exceptions_opt_in: Option<bool>,
     pub autocapture_web_vitals_opt_in: Option<bool>,
@@ -45,6 +70,14 @@ pub struct Team {
     pub cookieless_server_hash_mode: Option<i16>,
     #[serde(default = "default_timezone")]
     pub timezone: String,
+    // Sourced from the internal-only TeamFeatureFlagsConfig extension, not a posthog_team
+    // column. #[serde(default)] keeps cache entries written before this field existed
+    // deserializing to `false` (full events), fail-safe.
+    #[serde(default)]
+    pub minimal_flag_called_events: bool,
+    // Cache entries written before this field existed retain legacy matching.
+    #[serde(default)]
+    pub property_matching_version: PropertyMatchingVersion,
 }
 
 fn default_timezone() -> String {
@@ -76,5 +109,32 @@ impl TeamIdentifier for Team {
 
     fn api_token(&self) -> &str {
         &self.api_token
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_minimal_flag_called_events_defaults_false_on_legacy_cache_blob() {
+        // A HyperCache JSON blob written before this field existed has no
+        // minimal_flag_called_events key. #[serde(default)] must make that
+        // deserialize to `false` (full events) rather than erroring.
+        let legacy_json = serde_json::json!({
+            "id": 1,
+            "name": "test team",
+            "api_token": "test_token",
+            "uuid": Uuid::new_v4().to_string(),
+        });
+
+        let team: Team =
+            serde_json::from_value(legacy_json).expect("legacy blob must still deserialize");
+
+        assert!(!team.minimal_flag_called_events);
+        assert_eq!(
+            team.property_matching_version,
+            PropertyMatchingVersion::LEGACY
+        );
     }
 }

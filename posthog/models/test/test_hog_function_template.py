@@ -1,8 +1,9 @@
 from django.test import TestCase
 
+from posthog.cdp.templates.fixtures import template_slack as slack_template
 from posthog.cdp.templates.hog_function_template import sync_template_to_db
-from posthog.cdp.templates.slack.template_slack import template as slack_template
-from posthog.models.hog_function_template import HogFunctionTemplate
+
+from products.cdp.backend.models.hog_function_template import HogFunctionTemplate
 
 
 class TestHogFunctionTemplate(TestCase):

@@ -32,6 +32,9 @@ export interface LemonButtonPropsBase
         | 'style'
         | 'role'
         | 'aria-haspopup'
+        | 'aria-pressed'
+        | 'aria-expanded'
+        | 'aria-controls'
     > {
     children?: React.ReactNode
     type?: 'primary' | 'secondary' | 'tertiary'
@@ -74,6 +77,11 @@ export interface LemonButtonPropsBase
     noPadding?: boolean
     size?: 'xxsmall' | 'xsmall' | 'small' | 'medium' | 'large'
     'data-attr'?: string
+    /**
+     * Optional stable id for autocapture / action matching when the project includes `data-attr-id` in
+     * **Project settings → Data attributes**. Defaults to the same value as `data-attr` when omitted.
+     */
+    'data-attr-id'?: string
     'aria-label'?: string
     /** Whether to truncate the button's text if necessary */
     truncate?: boolean
@@ -94,6 +102,7 @@ export type SideAction = Pick<
     | 'id'
     | 'onClick'
     | 'to'
+    | 'center'
     | 'loading'
     | 'disableClientSideRouting'
     | 'disabled'
@@ -103,6 +112,7 @@ export type SideAction = Pick<
     | 'tooltip'
     | 'tooltipPlacement'
     | 'data-attr'
+    | 'data-attr-id'
     | 'aria-label'
     | 'status'
     | 'targetBlank'
@@ -252,21 +262,22 @@ export const LemonButton: React.FunctionComponent<LemonButtonProps & React.RefAt
                         truncate && 'LemonButton--truncate',
                         className
                     )}
-                    onClick={
-                        !disabled
-                            ? (event) => {
-                                  if (stopPropagation) {
-                                      event.stopPropagation()
-                                  }
-                                  onClick?.(event)
-                              }
-                            : undefined
-                    }
+                    onClick={(event) => {
+                        if (stopPropagation) {
+                            event.stopPropagation()
+                        }
+                        if (disabled) {
+                            event.preventDefault()
+                            return
+                        }
+                        onClick?.(event)
+                    }}
                     // We are using the ARIA disabled instead of native HTML because of this:
                     // https://css-tricks.com/making-disabled-buttons-more-inclusive/
-                    aria-disabled={disabled}
+                    aria-disabled={!!disabled}
                     {...linkDependentProps}
                     {...buttonProps}
+                    data-attr-id={buttonProps['data-attr-id'] ?? buttonProps['data-attr']}
                 >
                     <span className="LemonButton__chrome">
                         {icon ? <span className="LemonButton__icon">{icon}</span> : null}
@@ -292,6 +303,8 @@ export const LemonButton: React.FunctionComponent<LemonButtonProps & React.RefAt
                         arrowOffset={tooltipArrowOffset}
                         docLink={tooltipDocLink}
                         visible={tooltipForceMount}
+                        // A click on a blocked button must surface the reason, since hover is unavailable on touch
+                        openOnClick={!!disabledReason}
                         interactive={disabledReasonInteractive}
                         closeDelayMs={disabledReasonInteractive ? INTERACTIVE_CLOSE_DELAY_MS : undefined}
                     >

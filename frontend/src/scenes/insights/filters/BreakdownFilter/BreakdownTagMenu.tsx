@@ -8,8 +8,8 @@ import { LemonButton, LemonDivider, LemonInput, LemonSwitch } from '@posthog/lem
 import { Tooltip } from 'lib/lemon-ui/Tooltip'
 import { urls } from 'scenes/urls'
 
-import { GlobalBreakdownOptionsMenu } from './GlobalBreakdownOptionsMenu'
 import { breakdownTagLogic } from './breakdownTagLogic'
+import { GlobalBreakdownOptionsMenu } from './GlobalBreakdownOptionsMenu'
 import { taxonomicBreakdownFilterLogic } from './taxonomicBreakdownFilterLogic'
 
 export const BreakdownTagMenu = (): JSX.Element => {
@@ -80,6 +80,7 @@ export const BreakdownTagMenu = (): JSX.Element => {
                         <div className="flex flex-row items-center">
                             Path cleaning
                             <Tooltip
+                                interactive
                                 title={
                                     hasPathCleaningFilters ? (
                                         <>

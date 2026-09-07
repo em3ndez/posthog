@@ -1,3 +1,4 @@
+import { apiMutator } from '../../../../frontend/src/lib/api-orval-mutator'
 /**
  * Auto-generated from the Django backend OpenAPI schema.
  * To modify these types, update the Django serializers or views, then run:
@@ -7,13 +8,14 @@
  * PostHog API - generated
  * OpenAPI spec version: 1.0.0
  */
-import { apiMutator } from '../../../../frontend/src/lib/api-orval-mutator'
 import type {
     PaginatedSessionRecordingListApi,
     PaginatedSessionRecordingPlaylistListApi,
     PatchedSessionRecordingApi,
     PatchedSessionRecordingPlaylistApi,
     SessionRecordingApi,
+    SessionRecordingBulkDeleteRequestApi,
+    SessionRecordingBulkDeleteResponseApi,
     SessionRecordingPlaylistApi,
     SessionRecordingPlaylistsListParams,
     SessionRecordingsListParams,
@@ -36,9 +38,6 @@ type NonReadonly<T> = [T] extends [UnionToIntersection<T>]
       }
     : DistributeReadOnlyOverUnions<T>
 
-/**
- * Override list to include synthetic playlists
- */
 export const getSessionRecordingPlaylistsListUrl = (
     projectId: string,
     params?: SessionRecordingPlaylistsListParams
@@ -47,7 +46,7 @@ export const getSessionRecordingPlaylistsListUrl = (
 
     Object.entries(params || {}).forEach(([key, value]) => {
         if (value !== undefined) {
-            normalizedParams.append(key, value === null ? 'null' : value.toString())
+            normalizedParams.append(key, value === null ? 'null' : String(value))
         }
     })
 
@@ -58,6 +57,15 @@ export const getSessionRecordingPlaylistsListUrl = (
         : `/api/projects/${projectId}/session_recording_playlists/`
 }
 
+/**
+ * Override list to include synthetic playlists.
+ *
+ * Synthetics have no DB row, so we compute each one's position in the merged
+ * sort and split the requested page between synthetics and a DB queryset slice.
+ * The merge/rank/sort is all in-memory, so each phase is wrapped in a span and
+ * the input sizes are recorded as span attributes — a slow response on a team
+ * with many playlists then shows up as a wide span against a large db_count.
+ */
 export const sessionRecordingPlaylistsList = async (
     projectId: string,
     params?: SessionRecordingPlaylistsListParams,
@@ -78,7 +86,7 @@ export const getSessionRecordingPlaylistsCreateUrl = (projectId: string) => {
 
 export const sessionRecordingPlaylistsCreate = async (
     projectId: string,
-    sessionRecordingPlaylistApi: NonReadonly<SessionRecordingPlaylistApi>,
+    sessionRecordingPlaylistApi?: NonReadonly<SessionRecordingPlaylistApi>,
     options?: RequestInit
 ): Promise<SessionRecordingPlaylistApi> => {
     return apiMutator<SessionRecordingPlaylistApi>(getSessionRecordingPlaylistsCreateUrl(projectId), {
@@ -111,7 +119,7 @@ export const getSessionRecordingPlaylistsUpdateUrl = (projectId: string, shortId
 export const sessionRecordingPlaylistsUpdate = async (
     projectId: string,
     shortId: string,
-    sessionRecordingPlaylistApi: NonReadonly<SessionRecordingPlaylistApi>,
+    sessionRecordingPlaylistApi?: NonReadonly<SessionRecordingPlaylistApi>,
     options?: RequestInit
 ): Promise<SessionRecordingPlaylistApi> => {
     return apiMutator<SessionRecordingPlaylistApi>(getSessionRecordingPlaylistsUpdateUrl(projectId, shortId), {
@@ -129,7 +137,7 @@ export const getSessionRecordingPlaylistsPartialUpdateUrl = (projectId: string, 
 export const sessionRecordingPlaylistsPartialUpdate = async (
     projectId: string,
     shortId: string,
-    patchedSessionRecordingPlaylistApi: NonReadonly<PatchedSessionRecordingPlaylistApi>,
+    patchedSessionRecordingPlaylistApi?: NonReadonly<PatchedSessionRecordingPlaylistApi>,
     options?: RequestInit
 ): Promise<SessionRecordingPlaylistApi> => {
     return apiMutator<SessionRecordingPlaylistApi>(getSessionRecordingPlaylistsPartialUpdateUrl(projectId, shortId), {
@@ -140,13 +148,13 @@ export const sessionRecordingPlaylistsPartialUpdate = async (
     })
 }
 
-/**
- * Hard delete of this model is not allowed. Use a patch API call to set "deleted" to true
- */
 export const getSessionRecordingPlaylistsDestroyUrl = (projectId: string, shortId: string) => {
     return `/api/projects/${projectId}/session_recording_playlists/${shortId}/`
 }
 
+/**
+ * Hard delete of this model is not allowed. Use a patch API call to set "deleted" to true
+ */
 export const sessionRecordingPlaylistsDestroy = async (
     projectId: string,
     shortId: string,
@@ -185,7 +193,7 @@ export const sessionRecordingPlaylistsRecordingsCreate = async (
     projectId: string,
     shortId: string,
     sessionRecordingId: string,
-    sessionRecordingPlaylistApi: NonReadonly<SessionRecordingPlaylistApi>,
+    sessionRecordingPlaylistApi?: NonReadonly<SessionRecordingPlaylistApi>,
     options?: RequestInit
 ): Promise<void> => {
     return apiMutator<void>(getSessionRecordingPlaylistsRecordingsCreateUrl(projectId, shortId, sessionRecordingId), {
@@ -221,7 +229,7 @@ export const getSessionRecordingsListUrl = (projectId: string, params?: SessionR
 
     Object.entries(params || {}).forEach(([key, value]) => {
         if (value !== undefined) {
-            normalizedParams.append(key, value === null ? 'null' : value.toString())
+            normalizedParams.append(key, value === null ? 'null' : String(value))
         }
     })
 
@@ -265,7 +273,7 @@ export const getSessionRecordingsUpdateUrl = (projectId: string, id: string) => 
 export const sessionRecordingsUpdate = async (
     projectId: string,
     id: string,
-    sessionRecordingApi: NonReadonly<SessionRecordingApi>,
+    sessionRecordingApi?: NonReadonly<SessionRecordingApi>,
     options?: RequestInit
 ): Promise<SessionRecordingApi> => {
     return apiMutator<SessionRecordingApi>(getSessionRecordingsUpdateUrl(projectId, id), {
@@ -283,7 +291,7 @@ export const getSessionRecordingsPartialUpdateUrl = (projectId: string, id: stri
 export const sessionRecordingsPartialUpdate = async (
     projectId: string,
     id: string,
-    patchedSessionRecordingApi: NonReadonly<PatchedSessionRecordingApi>,
+    patchedSessionRecordingApi?: NonReadonly<PatchedSessionRecordingApi>,
     options?: RequestInit
 ): Promise<SessionRecordingApi> => {
     return apiMutator<SessionRecordingApi>(getSessionRecordingsPartialUpdateUrl(projectId, id), {
@@ -302,5 +310,25 @@ export const sessionRecordingsDestroy = async (projectId: string, id: string, op
     return apiMutator<void>(getSessionRecordingsDestroyUrl(projectId, id), {
         ...options,
         method: 'DELETE',
+    })
+}
+
+export const getSessionRecordingsBulkDeleteCreateUrl = (projectId: string) => {
+    return `/api/projects/${projectId}/session_recordings/bulk_delete/`
+}
+
+/**
+ * Delete a batch of session recordings by session ID. Deletion is permanent and cannot be undone. IDs that don't match an existing recording are skipped and counted in `total_requested` but not `deleted_count`.
+ */
+export const sessionRecordingsBulkDeleteCreate = async (
+    projectId: string,
+    sessionRecordingBulkDeleteRequestApi: SessionRecordingBulkDeleteRequestApi,
+    options?: RequestInit
+): Promise<SessionRecordingBulkDeleteResponseApi> => {
+    return apiMutator<SessionRecordingBulkDeleteResponseApi>(getSessionRecordingsBulkDeleteCreateUrl(projectId), {
+        ...options,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...options?.headers },
+        body: JSON.stringify(sessionRecordingBulkDeleteRequestApi),
     })
 }

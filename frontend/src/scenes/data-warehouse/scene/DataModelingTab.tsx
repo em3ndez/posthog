@@ -10,17 +10,22 @@ import { TableView } from './modeling/TableView'
 function ToolBar(): JSX.Element {
     const { viewNodes, searchTerm, viewMode } = useValues(dataModelingLogic)
     const { setSearchTerm, setViewMode } = useActions(dataModelingLogic)
+
     return (
         <div className="flex gap-2 items-center">
             {(viewNodes.length > 0 || searchTerm) && (
                 <LemonInput type="search" placeholder="Search models..." onChange={setSearchTerm} value={searchTerm} />
             )}
-            <div className="flex gap-2 ml-auto">
+            <div className="flex gap-2 ml-auto items-center">
                 <LemonSegmentedButton
                     value={viewMode}
                     onChange={(value) => setViewMode(value)}
                     options={[
-                        { value: 'graph', icon: <IconDirectedGraph />, tooltip: 'Graph view' },
+                        {
+                            value: 'graph',
+                            icon: <IconDirectedGraph />,
+                            tooltip: 'Graph view',
+                        },
                         { value: 'list', icon: <IconList />, tooltip: 'List view' },
                     ]}
                     size="small"

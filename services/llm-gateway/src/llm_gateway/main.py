@@ -1,31 +1,48 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 import time
+import traceback
 import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
 import asyncpg
+import httpx
 import structlog
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from redis.asyncio import Redis
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.requests import ClientDisconnect
 from starlette.responses import Response
 from starlette.types import ASGIApp
 
 from llm_gateway.api.health import health_router
 from llm_gateway.api.routes import router
 from llm_gateway.callbacks import init_callbacks
-from llm_gateway.config import get_settings
+from llm_gateway.circuit_breaker import build_anthropic_circuit_breaker, publish_anthropic_breaker_gauges_loop
+from llm_gateway.config import Settings, get_settings
 from llm_gateway.db.postgres import close_db_pool, init_db_pool
 from llm_gateway.metrics.prometheus import DB_POOL_SIZE, get_instrumentator
+from llm_gateway.rate_limiting.billable_credits_throttle import BillableCreditThrottle
+from llm_gateway.rate_limiting.cost_gauge_publisher import publish_product_cost_gauges_loop
 from llm_gateway.rate_limiting.cost_refresh import ensure_costs_fresh
-from llm_gateway.rate_limiting.cost_throttles import ProductCostThrottle, UserCostThrottle
+from llm_gateway.rate_limiting.cost_throttles import (
+    ProductCostThrottle,
+    SandboxTaskCostThrottle,
+    UserCostBurstThrottle,
+    UserCostSustainedThrottle,
+)
+from llm_gateway.rate_limiting.denial_event import PosthogDenialCapturer
 from llm_gateway.rate_limiting.runner import ThrottleRunner
 from llm_gateway.request_context import RequestContext, set_request_context
+from llm_gateway.services.billing_period_resolver import BillingPeriodResolver
+from llm_gateway.services.desktop_access_resolver import DesktopAccessResolver
+from llm_gateway.services.quota_resolver import QuotaResolver
 
 
 def configure_logging(debug: bool = False) -> None:
@@ -64,26 +81,52 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         structlog.contextvars.bind_contextvars(request_id=request_id)
 
         start_time = time.monotonic()
+        # Stays None for a client that went away: CancelledError is a BaseException and escapes the
+        # except clauses below, and ClientDisconnect is re-raised untouched. Neither produced a
+        # status code, so logging one would invent a response the client never received.
+        status_code: int | None = None
 
-        response = await call_next(request)
-        response.headers["x-request-id"] = request_id
-
-        duration_ms = (time.monotonic() - start_time) * 1000
-
-        if request.url.path not in ("/_liveness", "/_readiness", "/metrics"):
-            logger.info(
-                "request",
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            response.headers["x-request-id"] = request_id
+            if hasattr(request.app.state, "db_pool"):
+                update_db_pool_metrics(request.app.state.db_pool)
+            return response
+        except ClientDisconnect:
+            # A plain Exception, so without this it would take the clause below and report a 500 the
+            # aborting client never saw. The rest of the service treats a disconnect as ordinary
+            # traffic too (see the disconnect counters in api/handler.py and api/anthropic.py).
+            raise
+        except Exception as exc:
+            # Starlette's ServerErrorMiddleware sits above this middleware, so an exception escaping
+            # call_next is the 500 the client gets. Without logging it here the request would leave
+            # no line at all, and a status-code aggregation would read the failure as no traffic.
+            status_code = 500
+            logger.error(
+                "unhandled_exception",
                 method=request.method,
                 path=request.url.path,
-                status_code=response.status_code,
-                duration_ms=round(duration_ms, 2),
+                error_type=type(exc).__name__,
+                # The configured processor chain has no format_exc_info, so exc_info would render as
+                # a repr of the tuple instead of a traceback. Pass the formatted text explicitly,
+                # under the key structlog's own exception renderer would use.
+                exception=traceback.format_exc(),
             )
+            raise
+        finally:
+            duration_ms = (time.monotonic() - start_time) * 1000
 
-        if hasattr(request.app.state, "db_pool"):
-            update_db_pool_metrics(request.app.state.db_pool)
+            if status_code is not None and request.url.path not in ("/_liveness", "/_readiness", "/metrics"):
+                logger.info(
+                    "request",
+                    method=request.method,
+                    path=request.url.path,
+                    status_code=status_code,
+                    duration_ms=round(duration_ms, 2),
+                )
 
-        structlog.contextvars.unbind_contextvars("request_id")
-        return response
+            structlog.contextvars.unbind_contextvars("request_id")
 
 
 async def init_redis(url: str | None) -> Redis[bytes] | None:
@@ -98,20 +141,38 @@ async def init_redis(url: str | None) -> Redis[bytes] | None:
         return None
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    import os
+def export_provider_credentials(settings: Settings) -> None:
+    """Export provider credentials and routing config as process env vars.
 
-    settings = get_settings()
-
+    The OpenAI and Anthropic SDKs (and litellm, which uses them) read these
+    env vars by default, so doing this at startup is enough to propagate the
+    configured values to every outbound request without per-call wiring.
+    """
     if settings.anthropic_api_key:
         os.environ["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
+    if settings.bedrock_region_name:
+        os.environ["AWS_REGION"] = settings.bedrock_region_name
     if settings.openai_api_key:
         os.environ["OPENAI_API_KEY"] = settings.openai_api_key
     if settings.openai_api_base_url:
         os.environ["OPENAI_BASE_URL"] = settings.openai_api_base_url
-    if settings.gemini_api_key:
-        os.environ["GEMINI_API_KEY"] = settings.gemini_api_key
+    if settings.openai_organization:
+        os.environ["OPENAI_ORG_ID"] = settings.openai_organization
+    if settings.openrouter_api_key:
+        os.environ["OPENROUTER_API_KEY"] = settings.openrouter_api_key
+    if settings.fireworks_api_key:
+        os.environ["FIREWORKS_API_KEY"] = settings.fireworks_api_key
+    # Cloudflare credentials are deliberately *not* exported. Our CF path injects
+    # api_key/api_base per-call through cloudflare.make_cloudflare_*_call, while
+    # exporting CLOUDFLARE_API_KEY/ACCOUNT_ID would let litellm's native
+    # `cloudflare/...` provider pick them up on the generic openai path and
+    # bypass the CLOUDFLARE_ALLOWED_MODELS allowlist.
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None]:
+    settings = get_settings()
+    export_provider_credentials(settings)
 
     logger.info("Initializing database pool...")
     app.state.db_pool = await init_db_pool(
@@ -125,22 +186,77 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if app.state.redis:
         logger.info("Redis connected")
 
+    product_throttle = ProductCostThrottle(redis=app.state.redis)
+    denial_capturer: PosthogDenialCapturer | None = None
+    if settings.posthog_project_token:
+        denial_capturer = PosthogDenialCapturer(
+            api_key=settings.posthog_project_token,
+            host=settings.posthog_host,
+        )
     app.state.throttle_runner = ThrottleRunner(
         throttles=[
-            ProductCostThrottle(redis=app.state.redis),
-            UserCostThrottle(redis=app.state.redis),
-        ]
+            BillableCreditThrottle(),
+            product_throttle,
+            UserCostBurstThrottle(redis=app.state.redis),
+            UserCostSustainedThrottle(redis=app.state.redis),
+            SandboxTaskCostThrottle(redis=app.state.redis),
+        ],
+        denial_capturer=denial_capturer,
     )
-    logger.info("Throttle runner initialized")
+    logger.info("Throttle runner initialized", denial_capture_enabled=denial_capturer is not None)
+
+    app.state.cost_gauge_task = asyncio.create_task(publish_product_cost_gauges_loop(product_throttle))
+
+    app.state.anthropic_circuit_breaker = build_anthropic_circuit_breaker(app.state.redis)
+    logger.info(
+        "anthropic_circuit_breaker_initialized",
+        enabled=settings.anthropic_circuit_breaker_enabled,
+        failure_threshold=settings.anthropic_circuit_breaker_failure_threshold,
+        window_seconds=settings.anthropic_circuit_breaker_window_seconds,
+        bypass_probability=settings.anthropic_circuit_breaker_bypass_probability,
+        min_requests=settings.anthropic_circuit_breaker_min_requests,
+    )
+    app.state.anthropic_breaker_gauge_task = asyncio.create_task(
+        publish_anthropic_breaker_gauges_loop(app.state.anthropic_circuit_breaker)
+    )
+
+    app.state.http_client = httpx.AsyncClient()
+    app.state.desktop_access_http_client = httpx.AsyncClient(
+        limits=httpx.Limits(
+            max_connections=settings.desktop_access_max_connections,
+            max_keepalive_connections=settings.desktop_access_max_connections,
+        )
+    )
+    app.state.desktop_access_resolver = DesktopAccessResolver(
+        redis=app.state.redis,
+        http_client=app.state.desktop_access_http_client,
+    )
+    app.state.quota_resolver = QuotaResolver(
+        redis=app.state.redis,
+        http_client=app.state.http_client,
+    )
+    app.state.billing_period_resolver = BillingPeriodResolver(
+        redis=app.state.redis,
+        http_client=app.state.http_client,
+    )
+    logger.info("Plan resolver initialized", posthog_api_base_url=settings.posthog_api_base_url or "(not configured)")
 
     logger.info(
-        "product_cost_limits_configured",
-        limits={
+        "rate_limits_configured",
+        product_cost_limits={
             k: {"limit_usd": v.limit_usd, "window_seconds": v.window_seconds}
             for k, v in settings.product_cost_limits.items()
         },
-        default_user_limit_usd=settings.default_user_cost_limit_usd,
-        default_user_window_seconds=settings.default_user_cost_window_seconds,
+        user_cost_limits={
+            k: {
+                "burst_limit_usd": v.burst_limit_usd,
+                "burst_window_seconds": v.burst_window_seconds,
+                "sustained_limit_usd": v.sustained_limit_usd,
+                "sustained_window_seconds": v.sustained_window_seconds,
+            }
+            for k, v in settings.user_cost_limits.items()
+        },
+        user_cost_limits_disabled=settings.user_cost_limits_disabled,
     )
 
     init_callbacks()
@@ -150,6 +266,26 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     yield
 
+    cost_gauge_task = getattr(app.state, "cost_gauge_task", None)
+    if cost_gauge_task is not None:
+        cost_gauge_task.cancel()
+        try:
+            await cost_gauge_task
+        except asyncio.CancelledError:
+            pass
+    breaker_gauge_task = getattr(app.state, "anthropic_breaker_gauge_task", None)
+    if breaker_gauge_task is not None:
+        breaker_gauge_task.cancel()
+        try:
+            await breaker_gauge_task
+        except asyncio.CancelledError:
+            pass
+    if app.state.desktop_access_http_client:
+        await app.state.desktop_access_http_client.aclose()
+        logger.info("Desktop access HTTP client closed")
+    if app.state.http_client:
+        await app.state.http_client.aclose()
+        logger.info("HTTP client closed")
     if app.state.redis:
         await app.state.redis.aclose()
         logger.info("Redis closed")
@@ -168,9 +304,24 @@ class ContentSizeLimitMiddleware(BaseHTTPMiddleware):
         if content_length and int(content_length) > self.max_content_size:
             return JSONResponse(
                 status_code=413,
-                content={"detail": "Request body too large"},
+                content={"error": {"message": "Request body too large", "type": "request_too_large"}},
             )
         return await call_next(request)
+
+
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    content = exc.detail
+    if isinstance(content, dict) and "error" in content:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=content,
+            headers=exc.headers,
+        )
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": content},
+        headers=exc.headers,
+    )
 
 
 def create_app() -> FastAPI:
@@ -190,6 +341,8 @@ def create_app() -> FastAPI:
         allow_methods=["POST", "GET", "OPTIONS"],
         allow_headers=["*"],
     )
+
+    app.exception_handler(HTTPException)(http_exception_handler)
 
     app.include_router(health_router)
     app.include_router(router)

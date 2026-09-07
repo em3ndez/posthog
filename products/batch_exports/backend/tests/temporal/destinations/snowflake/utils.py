@@ -16,12 +16,13 @@ import responses
 import snowflake.connector
 from requests.models import PreparedRequest
 
-from posthog.batch_exports.service import BackfillDetails, BatchExportModel, BatchExportSchema
 from posthog.temporal.common.clickhouse import ClickHouseClient
 
+from products.batch_exports.backend.service import BackfillDetails, BatchExportModel, BatchExportSchema
 from products.batch_exports.backend.temporal.destinations.snowflake_batch_export import snowflake_default_fields
+from products.batch_exports.backend.temporal.queue import RecordBatchQueue
 from products.batch_exports.backend.temporal.record_batch_model import SessionsRecordBatchModel
-from products.batch_exports.backend.temporal.spmc import Producer, RecordBatchQueue
+from products.batch_exports.backend.tests.temporal.utils.clickhouse_test_producer import ClickHouseTestProducer
 from products.batch_exports.backend.tests.temporal.utils.records import (
     get_record_batch_from_queue,
     remove_duplicates_from_records,
@@ -382,6 +383,7 @@ async def assert_clickhouse_records_in_snowflake(
     timestamp_columns: collections.abc.Sequence[str] = (),
     uppercase_columns: list[str] | None = None,
     extra_fields: dict[str, t.Any] | None = None,
+    min_ingested_timestamp: dt.datetime | None = None,
 ):
     """Assert ClickHouse records are written to Snowflake table.
 
@@ -398,6 +400,7 @@ async def assert_clickhouse_records_in_snowflake(
         expected_fields: List of fields expected to be in the destination table.
         expect_duplicates: Whether duplicates are expected (e.g. when testing retrying logic).
         extra_fields: Additional fields present in the Snowflake table (that are not present in the ClickHouse table).
+        min_ingested_timestamp: If set, assert all `snowflake_ingested_timestamp` values are >= this.
     """
     snowflake_cursor.execute(f'SELECT * FROM "{table_name}"')
 
@@ -410,10 +413,15 @@ async def assert_clickhouse_records_in_snowflake(
     # We rely on the order of the columns in each row matching the order set in cursor.description.
     # This seems to be the case, at least for now.
     inserted_records = []
+    inserted_snowflake_ingested_timestamps = []
     for row in rows:
         record = {}
 
         for index in columns.keys():
+            if columns[index] == "snowflake_ingested_timestamp":
+                inserted_snowflake_ingested_timestamps.append(row[index])
+                continue
+
             if columns[index] in json_columns and row[index] is not None:
                 record[columns[index]] = json.loads(row[index])
             elif isinstance(row[index], int) and columns[index] in timestamp_columns:
@@ -444,16 +452,15 @@ async def assert_clickhouse_records_in_snowflake(
     expected_records = []
     queue = RecordBatchQueue()
     if model_name == "sessions":
-        producer = Producer(model=SessionsRecordBatchModel(team_id))
+        producer = ClickHouseTestProducer(model=SessionsRecordBatchModel(team_id))
     else:
-        producer = Producer()
+        producer = ClickHouseTestProducer()
 
     producer_task = await producer.start(
         queue=queue,
         model_name=model_name,
         team_id=team_id,
         full_range=(data_interval_start, data_interval_end),
-        done_ranges=[],
         fields=fields,
         filters=filters,
         destination_default_fields=snowflake_default_fields(),
@@ -477,8 +484,9 @@ async def assert_clickhouse_records_in_snowflake(
             expected_record = {}
 
             for k, v in record.items():
-                if k == "_inserted_at":
+                if k == "_inserted_at" or k == "snowflake_ingested_timestamp":
                     # _inserted_at is not exported, only used for tracking progress.
+                    # snowflake_ingested_timestamp cannot be compared as it comes from an unstable function.
                     continue
 
                 if k in json_columns and isinstance(v, str):
@@ -520,3 +528,10 @@ async def assert_clickhouse_records_in_snowflake(
     assert inserted_records[0] == expected_records[0]
     assert inserted_records == expected_records
     assert len(inserted_column_names) > 0
+
+    if len(inserted_snowflake_ingested_timestamps) > 0:
+        assert min_ingested_timestamp is not None, (
+            "Must set `min_ingested_timestamp` for comparison with exported value"
+        )
+        assert all(ts is not None for ts in inserted_snowflake_ingested_timestamps)
+        assert all(ts >= min_ingested_timestamp for ts in inserted_snowflake_ingested_timestamps)

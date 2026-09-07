@@ -5,10 +5,13 @@ from datetime import UTC, datetime, timedelta
 import dagster
 from dagster import BackfillPolicy, DailyPartitionsDefinition
 
+from posthog.schema import ProductKey
+
 from posthog.clickhouse import query_tagging
 from posthog.clickhouse.client import sync_execute
 from posthog.clickhouse.cluster import ClickhouseCluster
-from posthog.dags.common import JobOwners, dagster_tags
+from posthog.clickhouse.query_tagging import Feature, tags_context
+from posthog.dags.common import JobOwners, dagster_tags, skip_on_kill_switch
 from posthog.models.web_preaggregated.sql import (
     REPLACE_WEB_BOUNCES_V2_STAGING_SQL,
     REPLACE_WEB_STATS_V2_STAGING_SQL,
@@ -84,8 +87,10 @@ def pre_aggregate_web_analytics_data(
         )
 
         context.log.info(f"Populating staging table with hourly data from {date_start} to {date_end}")
+        context.log.info(f"Processing {len(team_ids) if team_ids else 0} team_ids: {team_ids}")
         context.log.info(insert_query)
-        sync_execute(insert_query)
+        with tags_context(product=ProductKey.WEB_ANALYTICS, feature=Feature.PREAGGREGATION):
+            sync_execute(insert_query)
 
         # 3. Sync replicas before partition swapping to ensure consistency
         sync_partitions_on_replicas(context, cluster, staging_table_name)
@@ -188,8 +193,8 @@ web_pre_aggregate_job = dagster.define_asset_job(
     execution_timezone="UTC",
     tags={"owner": JobOwners.TEAM_WEB_ANALYTICS.value},
 )
+@skip_on_kill_switch
 def web_pre_aggregate_historical_schedule(context: dagster.ScheduleEvaluationContext):
-    # Check for existing runs of the same job to prevent concurrent execution
     skip_reason = check_for_concurrent_runs(context)
     if skip_reason:
         return skip_reason
@@ -207,8 +212,8 @@ def web_pre_aggregate_historical_schedule(context: dagster.ScheduleEvaluationCon
     execution_timezone="UTC",
     tags={"owner": JobOwners.TEAM_WEB_ANALYTICS.value},
 )
+@skip_on_kill_switch
 def web_pre_aggregate_current_day_schedule(context: dagster.ScheduleEvaluationContext):
-    # Check for existing runs of the same job to prevent concurrent execution
     skip_reason = check_for_concurrent_runs(context)
     if skip_reason:
         return skip_reason
@@ -244,6 +249,7 @@ def ensure_web_analytics_tables_exist(context: dagster.ScheduleEvaluationContext
     tags={"owner": JobOwners.TEAM_WEB_ANALYTICS.value},
     default_status=dagster.DefaultScheduleStatus.RUNNING if DEBUG else dagster.DefaultScheduleStatus.STOPPED,
 )
+@skip_on_kill_switch
 def web_analytics_v2_backfill_schedule(context: dagster.ScheduleEvaluationContext):
     """
     Schedule that materializes web analytics v2 assets for today's partition.
@@ -255,7 +261,6 @@ def web_analytics_v2_backfill_schedule(context: dagster.ScheduleEvaluationContex
     if not DEBUG:
         return dagster.SkipReason("Schedule only runs in DEBUG mode")
 
-    # Ensure tables exist with production schema before running backfill
     ensure_web_analytics_tables_exist(context)
 
     try:

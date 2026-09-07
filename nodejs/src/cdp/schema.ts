@@ -7,7 +7,7 @@ export const CdpInternalEventSchema = z.object({
         event: z.string(),
         // In this context distinct_id should be whatever we want to use if doing follow up things (like tracking a standard event)
         distinct_id: z.string(),
-        properties: z.record(z.any()),
+        properties: z.record(z.string(), z.any()),
         timestamp: z.string(),
         url: z.string().optional().nullable(),
     }),
@@ -15,7 +15,7 @@ export const CdpInternalEventSchema = z.object({
     person: z
         .object({
             id: z.string(),
-            properties: z.record(z.any()),
+            properties: z.record(z.string(), z.any()),
             name: z.string().optional().nullable(),
             url: z.string().optional().nullable(),
         })
@@ -28,6 +28,14 @@ export type CdpInternalEvent = z.infer<typeof CdpInternalEventSchema>
 
 export const CdpDataWarehouseEventSchema = z.object({
     team_id: z.number(),
+    // Dot-notated table name the row was synced into, or a materialized view's own name. Optional
+    // for backwards compatibility with messages produced before the producer started including it.
+    table_name: z.string().optional(),
+    // Which kind of warehouse table the row came from. Absent means a source-synced table, which is
+    // all the producer emitted before materialized views could trigger.
+    table_type: z.enum(['source', 'view']).optional(),
+    // Deterministic id, unique per row (see CDPProducer._build_event_id)
+    event_id: z.string(),
     properties: z.record(z.string(), z.any()),
 })
 

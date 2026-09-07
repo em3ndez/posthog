@@ -7,7 +7,8 @@ import React from 'react'
 import { IconChevronDown, IconChevronRight } from '@posthog/icons'
 
 import { Tooltip } from 'lib/lemon-ui/Tooltip'
-import { gradateColor, humanFriendlyNumber } from 'lib/utils'
+import { gradateColor } from 'lib/utils/colors'
+import { humanFriendlyNumber } from 'lib/utils/numbers'
 import { insightLogic } from 'scenes/insights/insightLogic'
 
 import { themeLogic } from '~/layout/navigation-3000/themeLogic'
@@ -41,9 +42,10 @@ export function RetentionTable({
     const { hoveredColumn } = useValues(retentionTableLogic(insightProps))
     const { updateInsightFilter } = useActions(retentionLogic(insightProps))
     const { openModal } = useActions(retentionModalLogic(insightProps))
+    const { canOpenPersonModal } = useValues(retentionModalLogic(insightProps))
 
     const selectedInterval = retentionFilter?.selectedInterval ?? null
-    const allowSelectingColumns = !insightProps.dashboardId && !inSharedMode && !embedded
+    const allowSelectingColumns = !inSharedMode && !embedded
 
     const backgroundColor = theme?.['preset-1'] || '#000000' // Default to black if no color found
     const backgroundColorMean = theme?.['preset-2'] || '#000000' // Default to black if no color found
@@ -51,9 +53,6 @@ export function RetentionTable({
 
     // only one breakdown value so don't need to highlight using different colors/autoexpand it
     const isSingleBreakdown = Object.keys(tableRowsSplitByBreakdownValue).length === 1
-
-    const aggregationType = retentionFilter?.aggregationType
-    const showSizeColumn = !hideSizeColumn && (!aggregationType || aggregationType === 'count')
 
     return (
         <table
@@ -72,7 +71,7 @@ export function RetentionTable({
             <tbody>
                 <tr>
                     <th className="bg whitespace-nowrap">Cohort</th>
-                    {showSizeColumn && <th className="bg">Size</th>}
+                    {!hideSizeColumn && <th className="bg">Size</th>}
                     {tableHeaders.map((header, columnIndex) => (
                         <th
                             key={header}
@@ -136,7 +135,7 @@ export function RetentionTable({
                                     </div>
                                 </td>
 
-                                {showSizeColumn && (
+                                {!hideSizeColumn && (
                                     <td>
                                         <span className="RetentionTable__TextTab">
                                             {noBreakdown
@@ -177,7 +176,7 @@ export function RetentionTable({
                                     <tr
                                         key={rowIndex}
                                         onClick={() => {
-                                            if (!inSharedMode) {
+                                            if (!inSharedMode && canOpenPersonModal) {
                                                 openModal(
                                                     rowIndex,
                                                     breakdownValue === NO_BREAKDOWN_VALUE ? null : breakdownValue
@@ -191,7 +190,7 @@ export function RetentionTable({
                                         <td className={clsx('pl-2 whitespace-nowrap', { 'pl-6': !isSingleBreakdown })}>
                                             {row.label}
                                         </td>
-                                        {showSizeColumn && (
+                                        {!hideSizeColumn && (
                                             <td>
                                                 <span className="RetentionTable__TextTab">{row.cohortSize}</span>
                                             </td>
@@ -201,6 +200,20 @@ export function RetentionTable({
                                             return (
                                                 <td
                                                     key={columnIndex}
+                                                    onClick={(e) => {
+                                                        // Open the modal for this cohort and tell it which
+                                                        // interval column was clicked so it can highlight it.
+                                                        e.stopPropagation()
+                                                        if (!inSharedMode && canOpenPersonModal) {
+                                                            openModal(
+                                                                rowIndex,
+                                                                breakdownValue === NO_BREAKDOWN_VALUE
+                                                                    ? null
+                                                                    : breakdownValue,
+                                                                columnIndex
+                                                            )
+                                                        }
+                                                    }}
                                                     className={clsx({
                                                         'RetentionTable__SelectedColumn--cell':
                                                             columnIndex === selectedInterval,
@@ -212,9 +225,11 @@ export function RetentionTable({
                                                         <CohortDay
                                                             percentage={column.percentage}
                                                             value={
-                                                                isPropertyValueAggregation ? column.count : undefined
+                                                                isPropertyValueAggregation
+                                                                    ? (column.aggregation_value ?? 0)
+                                                                    : undefined
                                                             }
-                                                            clickable={true}
+                                                            clickable={canOpenPersonModal}
                                                             isCurrentPeriod={column.isCurrentPeriod}
                                                             backgroundColor={backgroundColor}
                                                         />

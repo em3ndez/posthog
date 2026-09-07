@@ -1,4 +1,4 @@
-from typing import Literal, get_origin
+from typing import Literal, assert_never, get_origin
 
 from pydantic import BaseModel, ValidationError
 
@@ -8,12 +8,13 @@ from posthog.schema import (
     FunnelsQuery,
     LifecycleQuery,
     PathsQuery,
+    PathsV2Query,
     RetentionQuery,
     StickinessQuery,
     TrendsQuery,
 )
 
-from posthog.hogql_queries.insights.utils.utils import series_should_be_set_to_dau
+from posthog.hogql_queries.utils.utils import series_should_be_set_to_dau
 from posthog.types import InsightQueryNode
 
 
@@ -47,7 +48,7 @@ def to_dict(query: BaseModel) -> dict:
 
     if isinstance(
         query,
-        (TrendsQuery | FunnelsQuery | RetentionQuery | PathsQuery | StickinessQuery | LifecycleQuery),
+        (TrendsQuery | FunnelsQuery | RetentionQuery | PathsQuery | PathsV2Query | StickinessQuery | LifecycleQuery),
     ):
         insightFilterKey = filter_key_for_query(query)
 
@@ -85,17 +86,23 @@ def to_dict(query: BaseModel) -> dict:
                     not in [
                         "showLegend",
                         "showPercentStackView",
+                        "stackBreakdownValues",
                         "showValuesOnSeries",
                         "aggregationAxisFormat",
                         "aggregationAxisPrefix",
                         "aggregationAxisPostfix",
                         "decimalPlaces",
+                        "xAxisLabel",
+                        "yAxisLabel",
                         "layout",
                         "toggledLifecycles",
                         "showLabelsOnSeries",
                         "showMean",
                         "meanRetentionCalculation",
                         "yAxisScaleType",
+                        "yAxisStartAtZero",
+                        "yAxisMin",
+                        "yAxisMax",
                         "hiddenLegendIndexes",
                         "hiddenLegendBreakdowns",
                         "resultCustomizations",
@@ -109,10 +116,14 @@ def to_dict(query: BaseModel) -> dict:
                         "movingAverageIntervals",
                         "stacked",
                         "detailedResultsAggregationType",
+                        "excludeBoxPlotOutliers",
+                        "showAnnotations",
                         "showFullUrls",
                         "selectedInterval",
                         "funnelStepReference",
                         "breakdownSorting",
+                        "legendPosition",
+                        "chartStyle",
                     ]
                 }
 
@@ -146,6 +157,8 @@ def filter_key_for_query(node: InsightQueryNode) -> str:
         return "retentionFilter"
     elif isinstance(node, PathsQuery):
         return "pathsFilter"
+    elif isinstance(node, PathsV2Query):
+        return "pathsV2Filter"
     elif isinstance(node, StickinessQuery):
         return "stickinessFilter"
     elif isinstance(node, LifecycleQuery):
@@ -154,17 +167,54 @@ def filter_key_for_query(node: InsightQueryNode) -> str:
         raise ValidationError(f"Expected an insight node, got {node.__name__}")
 
 
-def grouped_chart_display_types(display: ChartDisplayType) -> ChartDisplayType | None:
-    if display in [
-        ChartDisplayType.ACTIONS_LINE_GRAPH,
-        ChartDisplayType.ACTIONS_BAR,
-        ChartDisplayType.ACTIONS_AREA_GRAPH,
-    ]:
-        # time series
-        return ChartDisplayType.ACTIONS_LINE_GRAPH
-    elif display in [ChartDisplayType.ACTIONS_LINE_GRAPH_CUMULATIVE]:
-        # cumulative time series
-        return ChartDisplayType.ACTIONS_LINE_GRAPH_CUMULATIVE
-    else:
-        # total value
-        return ChartDisplayType.ACTIONS_BAR_VALUE
+# keep in sync with frontend/src/scenes/insights/utils/queryUtils.ts `groupedChartDisplayTypes` object
+def grouped_chart_display_types(display: ChartDisplayType) -> ChartDisplayType:
+    match display:
+        case (
+            ChartDisplayType.ACTIONS_LINE_GRAPH
+            | ChartDisplayType.ACTIONS_AREA_GRAPH
+            | ChartDisplayType.ACTIONS_BAR
+            | ChartDisplayType.ACTIONS_UNSTACKED_BAR
+            | ChartDisplayType.ACTIONS_STACKED_BAR
+            | ChartDisplayType.TWO_DIMENSIONAL_HEATMAP
+            | ChartDisplayType.SCATTER_PLOT
+            | ChartDisplayType.METRIC
+        ):
+            # standard time series
+            return ChartDisplayType.ACTIONS_LINE_GRAPH
+
+        case ChartDisplayType.ACTIONS_LINE_GRAPH_CUMULATIVE:
+            # cumulative time series
+            return ChartDisplayType.ACTIONS_LINE_GRAPH_CUMULATIVE
+
+        case (
+            ChartDisplayType.ACTIONS_BAR_VALUE
+            | ChartDisplayType.BOLD_NUMBER
+            | ChartDisplayType.ACTIONS_PIE
+            | ChartDisplayType.ACTIONS_DONUT
+            | ChartDisplayType.ACTIONS_TABLE
+        ):
+            # total value
+            return ChartDisplayType.ACTIONS_BAR_VALUE
+
+        case ChartDisplayType.WORLD_MAP:
+            # separate: different breakdown limit (250)
+            return ChartDisplayType.WORLD_MAP
+
+        case ChartDisplayType.CALENDAR_HEATMAP:
+            # separate runner
+            return ChartDisplayType.CALENDAR_HEATMAP
+
+        case ChartDisplayType.BOX_PLOT:
+            # separate runner
+            return ChartDisplayType.BOX_PLOT
+
+        case ChartDisplayType.SLOPE_GRAPH:
+            # separate runner — only the two range endpoints, cached on its own key
+            return ChartDisplayType.SLOPE_GRAPH
+
+        case ChartDisplayType.AUTO:
+            return ChartDisplayType.AUTO
+
+        case _:
+            assert_never(display)

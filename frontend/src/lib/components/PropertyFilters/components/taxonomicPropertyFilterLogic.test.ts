@@ -57,6 +57,30 @@ describe('taxonomicPropertyFilterLogic', () => {
             expect(logic.values.activeTaxonomicGroup?.type).toBe(TaxonomicFilterGroupType.EventProperties)
         })
 
+        it('selects ErrorTrackingIssues group and its values endpoint for an issue property filter', () => {
+            logic.unmount()
+            logic = taxonomicPropertyFilterLogic({
+                filters: [
+                    {
+                        key: 'severity',
+                        type: PropertyFilterType.ErrorTrackingIssue,
+                        value: null,
+                        operator: PropertyOperator.Exact,
+                    },
+                ],
+                setFilter: () => {},
+                taxonomicGroupTypes: [TaxonomicFilterGroupType.ErrorTrackingIssues],
+                filterIndex: 0,
+                pageKey: 'test-active-group-error-tracking-issue',
+            })
+            logic.mount()
+
+            expect(logic.values.activeTaxonomicGroup?.type).toBe(TaxonomicFilterGroupType.ErrorTrackingIssues)
+            expect(logic.values.activeTaxonomicGroup?.valuesEndpoint?.('severity')).toContain(
+                '/error_tracking/issues/values?key=severity'
+            )
+        })
+
         it('defaults to first group when filter is empty', () => {
             logic.unmount()
             logic = taxonomicPropertyFilterLogic({
@@ -181,6 +205,65 @@ describe('taxonomicPropertyFilterLogic', () => {
             logic.actions.selectItem(group, undefined)
             expect(setFilterSpy).not.toHaveBeenCalled()
         })
+
+        // The full matchedOn/matchedValue matrix is covered in utils.test.ts.
+        it('forwards matchedValue to the new filter when the row matched on value', () => {
+            selectAndExpect(
+                TaxonomicFilterGroupType.EventProperties,
+                'user.email',
+                PropertyFilterType.Event,
+                {
+                    key: 'user.email',
+                    type: PropertyFilterType.Event,
+                    value: ['frank@posthog.com'],
+                    operator: PropertyOperator.Exact,
+                },
+                { matchedOn: 'value', matchedValue: 'frank@posthog.com' }
+            )
+        })
+    })
+
+    it('restores a complete property filter from a recent filter item', async () => {
+        const setFilter = jest.fn()
+        const recentLogic = taxonomicPropertyFilterLogic({
+            filters: [],
+            setFilter,
+            taxonomicGroupTypes: [TaxonomicFilterGroupType.EventProperties],
+            filterIndex: 0,
+            pageKey: 'testRecent',
+        })
+        recentLogic.mount()
+
+        const recentGroup = {
+            type: TaxonomicFilterGroupType.RecentFilters,
+            name: 'Recent',
+            searchPlaceholder: 'recent filters',
+        } as TaxonomicFilterGroup
+
+        const recentItem = {
+            name: '$browser',
+            _recentContext: {
+                sourceGroupType: TaxonomicFilterGroupType.EventProperties,
+                sourceGroupName: 'Event properties',
+                propertyFilter: {
+                    key: '$browser',
+                    value: 'Chrome',
+                    operator: PropertyOperator.Exact,
+                    type: PropertyFilterType.Event,
+                },
+            },
+        }
+
+        recentLogic.actions.selectItem(recentGroup, '$browser', undefined, recentItem)
+
+        expect(setFilter).toHaveBeenCalledWith(0, {
+            key: '$browser',
+            value: 'Chrome',
+            operator: PropertyOperator.Exact,
+            type: PropertyFilterType.Event,
+        })
+
+        recentLogic.unmount()
     })
 
     it('creates a complete property filter from a QuickFilterItem', async () => {

@@ -3,8 +3,14 @@
     "scripts": {
         "backend:test": "pytest -c ../../pytest.ini --rootdir ../.. backend/ -v --tb=short"
     },
+    "dependencies": {
+        "fuse.js": "catalog:"
+    },
+    "devDependencies": {
+        "kea-test-utils": "catalog:"
+    },
     "peerDependencies": {
-        "@posthog/icons": "*",
+        "@posthog/icons": "catalog:",
         "@posthog/lemon-ui": "*",
         "@types/react": "*",
         "@types/react-dom": "*",
@@ -13,11 +19,5 @@
         "kea-loaders": "catalog:",
         "react": "*",
         "react-dom": "*"
-    },
-    "dependencies": {
-        "fuse.js": "catalog:"
-    },
-    "devDependencies": {
-        "kea-test-utils": "catalog:"
     }
 }

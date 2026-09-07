@@ -1,9 +1,18 @@
 from django.conf import settings
 
 from posthog.clickhouse.base_sql import COPY_ROWS_BETWEEN_TEAMS_BASE_SQL
+from posthog.clickhouse.client.connection import ClickHouseUser, get_clickhouse_creds
 from posthog.clickhouse.cluster import ON_CLUSTER_CLAUSE
 from posthog.clickhouse.indexes import index_by_kafka_timestamp
-from posthog.clickhouse.kafka_engine import KAFKA_COLUMNS, KAFKA_COLUMNS_WITH_PARTITION, STORAGE_POLICY, kafka_engine
+from posthog.clickhouse.kafka_engine import (
+    CONSUMER_GROUP_PERSON_DISTINCT_ID2_WS,
+    CONSUMER_GROUP_PERSON_DISTINCT_ID_OVERRIDES_WS,
+    CONSUMER_GROUP_PERSON_WS,
+    KAFKA_COLUMNS,
+    KAFKA_COLUMNS_WITH_PARTITION,
+    STORAGE_POLICY,
+    kafka_engine,
+)
 from posthog.clickhouse.table_engines import CollapsingMergeTree, Distributed, ReplacingMergeTree
 from posthog.kafka_client.topics import KAFKA_PERSON, KAFKA_PERSON_DISTINCT_ID, KAFKA_PERSON_UNIQUE_ID
 
@@ -22,6 +31,9 @@ KAFKA_PERSONS_TABLE = f"kafka_{PERSONS_TABLE}"
 DROP_PERSONS_TABLE_MV_SQL = f"DROP TABLE IF EXISTS {PERSONS_TABLE_MV}"
 DROP_KAFKA_PERSONS_TABLE_SQL = f"DROP TABLE IF EXISTS {KAFKA_PERSONS_TABLE}"
 
+# Also rendered as a Distributed shim on NodeRole.AI_EVENTS — see
+# posthog/models/ai_events/person_shims.py. Column ALTERs on the main
+# cluster must be mirrored by a migration targeting NodeRole.AI_EVENTS.
 PERSONS_TABLE_BASE_SQL = """
 CREATE TABLE IF NOT EXISTS {table_name} {on_cluster_clause}
 (
@@ -61,6 +73,7 @@ def PERSONS_TABLE_SQL(on_cluster=True):
 
 
 def KAFKA_PERSONS_TABLE_SQL(on_cluster=True):
+    # Kafka tables cannot have DEFAULT expressions
     return PERSONS_TABLE_BASE_SQL.format(
         table_name=KAFKA_PERSONS_TABLE,
         on_cluster_clause=ON_CLUSTER_CLAUSE(on_cluster),
@@ -69,7 +82,12 @@ def KAFKA_PERSONS_TABLE_SQL(on_cluster=True):
     )
 
 
-def PERSONS_TABLE_MV_SQL(on_cluster=True, target_table=PERSONS_WRITABLE_TABLE):
+def PERSONS_TABLE_MV_SQL(
+    on_cluster=True,
+    target_table=PERSONS_WRITABLE_TABLE,
+    mv_name=PERSONS_TABLE_MV,
+    kafka_table=KAFKA_PERSONS_TABLE,
+):
     return """
 CREATE MATERIALIZED VIEW IF NOT EXISTS {mv_name} {on_cluster_clause}
 TO {target_table}
@@ -86,10 +104,10 @@ _timestamp,
 _offset
 FROM {kafka_table}
 """.format(
-        mv_name=PERSONS_TABLE_MV,
+        mv_name=mv_name,
         on_cluster_clause=ON_CLUSTER_CLAUSE(on_cluster),
         target_table=target_table,
-        kafka_table=KAFKA_PERSONS_TABLE,
+        kafka_table=kafka_table,
     )
 
 
@@ -99,6 +117,37 @@ def PERSONS_WRITABLE_TABLE_SQL():
         on_cluster_clause=ON_CLUSTER_CLAUSE(False),
         engine=Distributed(data_table=PERSONS_TABLE, cluster=settings.CLICKHOUSE_SINGLE_SHARD_CLUSTER),
         extra_fields=KAFKA_COLUMNS,
+    )
+
+
+# WarpStream Kafka engine tables (coexist alongside MSK tables, same target)
+
+KAFKA_PERSONS_WS_TABLE = "kafka_person_ws"
+PERSONS_WS_MV = "person_ws_mv"
+
+DROP_KAFKA_PERSONS_WS_TABLE_SQL = f"DROP TABLE IF EXISTS {KAFKA_PERSONS_WS_TABLE}"
+DROP_PERSONS_WS_MV_SQL = f"DROP TABLE IF EXISTS {PERSONS_WS_MV}"
+
+
+def KAFKA_PERSONS_WS_TABLE_SQL():
+    return PERSONS_TABLE_BASE_SQL.format(
+        table_name=KAFKA_PERSONS_WS_TABLE,
+        on_cluster_clause=ON_CLUSTER_CLAUSE(False),
+        engine=kafka_engine(
+            topic=KAFKA_PERSON,
+            group=CONSUMER_GROUP_PERSON_WS,
+            named_collection=settings.CLICKHOUSE_KAFKA_WARPSTREAM_INGESTION_NAMED_COLLECTION,
+        ),
+        extra_fields="",
+    )
+
+
+def PERSONS_WS_TABLE_MV_SQL(target_table=PERSONS_WRITABLE_TABLE):
+    return PERSONS_TABLE_MV_SQL(
+        on_cluster=False,
+        target_table=target_table,
+        mv_name=PERSONS_WS_MV,
+        kafka_table=KAFKA_PERSONS_WS_TABLE,
     )
 
 
@@ -157,8 +206,7 @@ def PERSONS_DISTINCT_ID_TABLE_SQL(on_cluster=True):
 
 # :KLUDGE: We default is_deleted to 0 for backwards compatibility for when we drop `is_deleted` from message schema.
 #    Can't make DEFAULT if(_sign==-1, 1, 0) because Cyclic aliases error.
-KAFKA_PERSONS_DISTINCT_ID_TABLE_SQL = (
-    lambda on_cluster=True: """
+KAFKA_PERSONS_DISTINCT_ID_TABLE_SQL = lambda on_cluster=True: """
 CREATE TABLE IF NOT EXISTS {table_name} {on_cluster_clause}
 (
     distinct_id VARCHAR,
@@ -168,10 +216,9 @@ CREATE TABLE IF NOT EXISTS {table_name} {on_cluster_clause}
     is_deleted Nullable(Int8)
 ) ENGINE = {engine}
 """.format(
-        table_name="kafka_" + PERSONS_DISTINCT_ID_TABLE,
-        on_cluster_clause=ON_CLUSTER_CLAUSE(on_cluster),
-        engine=kafka_engine(KAFKA_PERSON_UNIQUE_ID),
-    )
+    table_name="kafka_" + PERSONS_DISTINCT_ID_TABLE,
+    on_cluster_clause=ON_CLUSTER_CLAUSE(on_cluster),
+    engine=kafka_engine(KAFKA_PERSON_UNIQUE_ID),
 )
 
 
@@ -209,6 +256,9 @@ DROP_KAFKA_PERSON_DISTINCT_ID2_TABLE_SQL = f"DROP TABLE IF EXISTS {KAFKA_PERSON_
 DROP_PERSON_DISTINCT_ID2_TABLE_MV_SQL = f"DROP TABLE IF EXISTS {PERSON_DISTINCT_ID2_TABLE_MV}"
 
 # NOTE: This table base SQL is also used for distinct ID overrides!
+# Also rendered as a Distributed shim on NodeRole.AI_EVENTS — see
+# posthog/models/ai_events/person_shims.py. Column ALTERs on the main
+# cluster must be mirrored by a migration targeting NodeRole.AI_EVENTS.
 PERSON_DISTINCT_ID2_TABLE_BASE_SQL = """
 CREATE TABLE IF NOT EXISTS {table_name} {on_cluster_clause}
 (
@@ -254,7 +304,12 @@ def KAFKA_PERSON_DISTINCT_ID2_TABLE_SQL(on_cluster=True):
     )
 
 
-def PERSON_DISTINCT_ID2_MV_SQL(on_cluster=True, target_table=PERSON_DISTINCT_ID2_WRITABLE_TABLE):
+def PERSON_DISTINCT_ID2_MV_SQL(
+    on_cluster=True,
+    target_table=PERSON_DISTINCT_ID2_WRITABLE_TABLE,
+    mv_name=PERSON_DISTINCT_ID2_TABLE_MV,
+    kafka_table=KAFKA_PERSON_DISTINCT_ID2_TABLE,
+):
     return """
 CREATE MATERIALIZED VIEW IF NOT EXISTS {mv_name} {on_cluster_clause}
 TO {target_table}
@@ -269,10 +324,10 @@ _offset,
 _partition
 FROM {kafka_table}
 """.format(
-        mv_name=PERSON_DISTINCT_ID2_TABLE_MV,
+        mv_name=mv_name,
         on_cluster_clause=ON_CLUSTER_CLAUSE(on_cluster),
         target_table=target_table,
-        kafka_table=KAFKA_PERSON_DISTINCT_ID2_TABLE,
+        kafka_table=kafka_table,
     )
 
 
@@ -285,6 +340,37 @@ def PERSON_DISTINCT_ID2_WRITABLE_TABLE_SQL():
         extra_fields=f"""
     {KAFKA_COLUMNS_WITH_PARTITION}
     """,
+    )
+
+
+# WarpStream Kafka engine tables for person_distinct_id2 (coexist alongside MSK tables, same target)
+
+KAFKA_PERSON_DISTINCT_ID2_WS_TABLE = "kafka_person_distinct_id2_ws"
+PERSON_DISTINCT_ID2_WS_MV = "person_distinct_id2_ws_mv"
+
+DROP_KAFKA_PERSON_DISTINCT_ID2_WS_TABLE_SQL = f"DROP TABLE IF EXISTS {KAFKA_PERSON_DISTINCT_ID2_WS_TABLE}"
+DROP_PERSON_DISTINCT_ID2_WS_MV_SQL = f"DROP TABLE IF EXISTS {PERSON_DISTINCT_ID2_WS_MV}"
+
+
+def KAFKA_PERSON_DISTINCT_ID2_WS_TABLE_SQL():
+    return PERSON_DISTINCT_ID2_TABLE_BASE_SQL.format(
+        table_name=KAFKA_PERSON_DISTINCT_ID2_WS_TABLE,
+        on_cluster_clause=ON_CLUSTER_CLAUSE(False),
+        engine=kafka_engine(
+            topic=KAFKA_PERSON_DISTINCT_ID,
+            group=CONSUMER_GROUP_PERSON_DISTINCT_ID2_WS,
+            named_collection=settings.CLICKHOUSE_KAFKA_WARPSTREAM_INGESTION_NAMED_COLLECTION,
+        ),
+        extra_fields="",
+    )
+
+
+def PERSON_DISTINCT_ID2_WS_MV_SQL(target_table=PERSON_DISTINCT_ID2_WRITABLE_TABLE):
+    return PERSON_DISTINCT_ID2_MV_SQL(
+        on_cluster=False,
+        target_table=target_table,
+        mv_name=PERSON_DISTINCT_ID2_WS_MV,
+        kafka_table=KAFKA_PERSON_DISTINCT_ID2_WS_TABLE,
     )
 
 
@@ -328,8 +414,8 @@ def PERSON_DISTINCT_ID_OVERRIDES_TABLE_SQL(on_cluster=True):
     )
 
 
-KAFKA_PERSON_DISTINCT_ID_OVERRIDES_TABLE_SQL = (
-    lambda on_cluster=True: PERSON_DISTINCT_ID_OVERRIDES_TABLE_BASE_SQL.format(
+KAFKA_PERSON_DISTINCT_ID_OVERRIDES_TABLE_SQL = lambda on_cluster=True: (
+    PERSON_DISTINCT_ID_OVERRIDES_TABLE_BASE_SQL.format(
         table_name=KAFKA_PERSON_DISTINCT_ID_OVERRIDES_TABLE,
         on_cluster_clause=ON_CLUSTER_CLAUSE(on_cluster),
         engine=kafka_engine(KAFKA_PERSON_DISTINCT_ID, group="clickhouse-person-distinct-id-overrides"),
@@ -338,7 +424,12 @@ KAFKA_PERSON_DISTINCT_ID_OVERRIDES_TABLE_SQL = (
 )
 
 
-def PERSON_DISTINCT_ID_OVERRIDES_MV_SQL(on_cluster=True, target_table=PERSON_DISTINCT_ID_OVERRIDES_WRITABLE_TABLE):
+def PERSON_DISTINCT_ID_OVERRIDES_MV_SQL(
+    on_cluster=False,
+    target_table=PERSON_DISTINCT_ID_OVERRIDES_WRITABLE_TABLE,
+    mv_name=PERSON_DISTINCT_ID_OVERRIDES_TABLE_MV,
+    kafka_table=KAFKA_PERSON_DISTINCT_ID_OVERRIDES_TABLE,
+):
     return """
 CREATE MATERIALIZED VIEW IF NOT EXISTS {mv_name} {on_cluster_clause}
 TO {target_table}
@@ -354,10 +445,10 @@ _partition
 FROM {kafka_table}
 WHERE version > 0 -- only store updated rows, not newly inserted ones
 """.format(
-        mv_name=PERSON_DISTINCT_ID_OVERRIDES_TABLE_MV,
+        mv_name=mv_name,
         on_cluster_clause=ON_CLUSTER_CLAUSE(on_cluster),
         target_table=target_table,
-        kafka_table=KAFKA_PERSON_DISTINCT_ID_OVERRIDES_TABLE,
+        kafka_table=kafka_table,
     )
 
 
@@ -376,7 +467,35 @@ def PERSON_DISTINCT_ID_OVERRIDES_WRITABLE_TABLE_SQL():
 
 
 def TRUNCATE_PERSON_DISTINCT_ID_OVERRIDES_TABLE_SQL():
-    return f"TRUNCATE TABLE IF EXISTS {PERSON_DISTINCT_ID_OVERRIDES_TABLE} ON CLUSTER '{settings.CLICKHOUSE_CLUSTER}'"
+    return f"TRUNCATE TABLE IF EXISTS {PERSON_DISTINCT_ID_OVERRIDES_TABLE} {ON_CLUSTER_CLAUSE()}"
+
+
+# WarpStream Kafka engine tables for person_distinct_id_overrides (coexist alongside MSK tables, same target)
+
+KAFKA_PERSON_DISTINCT_ID_OVERRIDES_WS_TABLE = "kafka_person_distinct_id_overrides_ws"
+PERSON_DISTINCT_ID_OVERRIDES_WS_MV = "person_distinct_id_overrides_ws_mv"
+
+
+def KAFKA_PERSON_DISTINCT_ID_OVERRIDES_WS_TABLE_SQL():
+    return PERSON_DISTINCT_ID_OVERRIDES_TABLE_BASE_SQL.format(
+        table_name=KAFKA_PERSON_DISTINCT_ID_OVERRIDES_WS_TABLE,
+        on_cluster_clause=ON_CLUSTER_CLAUSE(False),
+        engine=kafka_engine(
+            topic=KAFKA_PERSON_DISTINCT_ID,
+            group=CONSUMER_GROUP_PERSON_DISTINCT_ID_OVERRIDES_WS,
+            named_collection=settings.CLICKHOUSE_KAFKA_WARPSTREAM_INGESTION_NAMED_COLLECTION,
+        ),
+        extra_fields="",
+    )
+
+
+def PERSON_DISTINCT_ID_OVERRIDES_WS_MV_SQL(target_table=PERSON_DISTINCT_ID_OVERRIDES_WRITABLE_TABLE):
+    return PERSON_DISTINCT_ID_OVERRIDES_MV_SQL(
+        on_cluster=False,
+        target_table=target_table,
+        mv_name=PERSON_DISTINCT_ID_OVERRIDES_WS_MV,
+        kafka_table=KAFKA_PERSON_DISTINCT_ID_OVERRIDES_WS_TABLE,
+    )
 
 
 #
@@ -416,7 +535,7 @@ def PERSON_STATIC_COHORT_TABLE_SQL(on_cluster=True):
 
 
 def TRUNCATE_PERSON_STATIC_COHORT_TABLE_SQL():
-    return f"TRUNCATE TABLE IF EXISTS {PERSON_STATIC_COHORT_TABLE} ON CLUSTER '{settings.CLICKHOUSE_CLUSTER}'"
+    return f"TRUNCATE TABLE IF EXISTS {PERSON_STATIC_COHORT_TABLE} {ON_CLUSTER_CLAUSE()}"
 
 
 INSERT_PERSON_STATIC_COHORT = (
@@ -453,32 +572,6 @@ SELECT_PERSON_DISTINCT_ID2S_OF_TEAM = """SELECT * FROM {table_name} WHERE team_i
 # Other queries
 #
 
-# `relevant_events_filter`` in the form of "AND event IN (...)" allows us to cut down memory usage by a lot at scale
-GET_TEAM_PERSON_DISTINCT_IDS = """
-SELECT distinct_id, argMax(person_id, version) as person_id
-FROM person_distinct_id2
-WHERE team_id = %(team_id)s
-{relevant_events_filter}
-GROUP BY distinct_id
-HAVING argMax(is_deleted, version) = 0
-"""
-
-GET_PERSON_IDS_BY_FILTER = """
-SELECT DISTINCT p.id
-FROM ({latest_person_sql}) AS p
-INNER JOIN ({GET_TEAM_PERSON_DISTINCT_IDS}) AS pdi ON p.id = pdi.person_id
-WHERE team_id = %(team_id)s
-  {distinct_query}
-{limit}
-{offset}
-""".format(
-    latest_person_sql=GET_LATEST_PERSON_SQL,
-    distinct_query="{distinct_query}",
-    limit="{limit}",
-    offset="{offset}",
-    GET_TEAM_PERSON_DISTINCT_IDS="{GET_TEAM_PERSON_DISTINCT_IDS}",
-)
-
 INSERT_PERSON_SQL = """
 INSERT INTO person (id, created_at, team_id, properties, is_identified, _timestamp, _offset, is_deleted, version, last_seen_at) SELECT %(id)s, %(created_at)s, %(team_id)s, %(properties)s, %(is_identified)s, %(_timestamp)s, 0, %(is_deleted)s, %(version)s, %(last_seen_at)s
 """
@@ -499,115 +592,18 @@ INSERT INTO person_distinct_id2 (distinct_id, person_id, team_id, is_deleted, ve
 INSERT_COHORT_ALL_PEOPLE_THROUGH_PERSON_ID = """
 INSERT INTO {cohort_table} SELECT generateUUIDv4(), actor_id, %(cohort_id)s, %(team_id)s, %(_timestamp)s, 0 FROM (
     SELECT DISTINCT actor_id FROM ({query})
+) AS new_actors
+WHERE actor_id NOT IN (
+    SELECT person_id FROM {cohort_table}
+    WHERE team_id = %(team_id)s AND cohort_id = %(cohort_id)s
 )
 """
 
-INSERT_COHORT_ALL_PEOPLE_SQL = """
-INSERT INTO {cohort_table} SELECT generateUUIDv4(), id, %(cohort_id)s, %(team_id)s, %(_timestamp)s, 0 FROM (
-    SELECT id FROM (
-        {latest_person_sql}
-    ) as person INNER JOIN (
-        SELECT person_id, distinct_id FROM ({GET_TEAM_PERSON_DISTINCT_IDS}) WHERE person_id IN ({content_sql})
-    ) as pdi ON person.id = pdi.person_id
-    WHERE team_id = %(team_id)s
-    GROUP BY id
-)
-"""
 
-GET_DISTINCT_IDS_BY_PROPERTY_SQL = """
-SELECT distinct_id
-FROM (
-    {GET_TEAM_PERSON_DISTINCT_IDS}
-)
-WHERE person_id IN
-(
-    SELECT id
-    FROM (
-        SELECT id, argMax(properties, person._timestamp) as properties, max(is_deleted) as is_deleted
-        FROM person
-        WHERE team_id = %(team_id)s
-        GROUP BY id
-        HAVING is_deleted = 0
-    )
-    WHERE {filters}
-)
-"""
-
-GET_DISTINCT_IDS_BY_PERSON_ID_FILTER = """
-SELECT distinct_id
-FROM ({GET_TEAM_PERSON_DISTINCT_IDS})
-WHERE {filters}
-"""
-
-GET_ACTORS_FROM_EVENT_QUERY = """
-SELECT
-    {id_field} AS actor_id,
-    {actor_value_expression} AS actor_value
-    {matching_events_select_statement}
-FROM ({events_query})
-GROUP BY actor_id
-ORDER BY actor_value DESC, actor_id DESC /* Also sorting by ID for determinism */
-{limit}
-{offset}
-"""
-
-COMMENT_DISTINCT_ID_COLUMN_SQL = (
-    lambda: "ALTER TABLE person_distinct_id COMMENT COLUMN distinct_id 'skip_0003_fill_person_distinct_id2'"
+COMMENT_DISTINCT_ID_COLUMN_SQL = lambda: (
+    "ALTER TABLE person_distinct_id COMMENT COLUMN distinct_id 'skip_0003_fill_person_distinct_id2'"
 )
 
-
-# Tricky: the person table uses a ReplacingMergeTree, but it is not guaranteed by Clickhouse that the replacement has
-# actually happened. This means we can have multiple rows for a particular person ID. This can happen if a property has
-# changed, or if the user was deleted.
-# The following query will make an attempt to hide values that come from deleted users, however it will only hide the
-# values that are set at the time of deletion (or after). This is to avoid needing to GROUP BY id on the persons table,
-# which would make this query take ~20x as long and be unacceptable in the UI.
-SELECT_PERSON_PROP_VALUES_SQL = """
-SELECT
-    value,
-    uniq(id) - uniqIf(id, is_deleted != 0)  as c
-FROM (
-    SELECT
-        {property_field} as value,
-        is_deleted,
-        id
-    FROM
-        person
-    WHERE
-        team_id = %(team_id)s AND
-        value IS NOT NULL AND
-        value != ''
-    ORDER BY id DESC
-    LIMIT 100000
-)
-GROUP BY value
-HAVING c > 0
-ORDER BY c DESC
-LIMIT 20
-"""
-
-SELECT_PERSON_PROP_VALUES_SQL_WITH_FILTER = """
-SELECT
-    value,
-    uniq(id) - uniqIf(id, is_deleted != 0)  as c
-FROM (
-    SELECT
-        {property_field} as value,
-        is_deleted,
-        id
-    FROM
-        person
-    WHERE
-        team_id = %(team_id)s AND
-        value ILIKE %(value)s
-    ORDER BY id DESC
-    LIMIT 100000
-)
-GROUP BY value
-HAVING c > 0
-ORDER BY c DESC
-LIMIT 20
-"""
 
 GET_PERSON_COUNT_FOR_TEAM = "SELECT count() AS count FROM person WHERE team_id = %(team_id)s"
 GET_PERSON_DISTINCT_ID2_COUNT_FOR_TEAM = "SELECT count() AS count FROM person_distinct_id2 WHERE team_id = %(team_id)s"
@@ -619,6 +615,7 @@ def CREATE_PERSON_DISTINCT_ID_OVERRIDES_DICTIONARY():
     This must be a function to ensure CLICKHOUSE_DATABASE is evaluated at runtime,
     not at module import time (which causes issues in E2E tests where env vars aren't loaded yet).
     """
+    dict_reader_creds = get_clickhouse_creds(ClickHouseUser.DICT_READER)
     return """
 CREATE OR REPLACE DICTIONARY {database}.person_distinct_id_overrides_dict ON CLUSTER {cluster} (
     `team_id` Int64, -- team_id could be made hierarchical to save some space.
@@ -628,7 +625,7 @@ CREATE OR REPLACE DICTIONARY {database}.person_distinct_id_overrides_dict ON CLU
 PRIMARY KEY team_id, distinct_id
 -- For our own sanity, we explicitly write out the group by query.
 SOURCE(CLICKHOUSE(
-    query 'SELECT team_id, distinct_id, argMax(person_id, version) AS person_id FROM {database}.person_distinct_id_overrides GROUP BY team_id, distinct_id'
+    query 'SELECT team_id, distinct_id, argMax(person_id, version) AS person_id FROM {database}.person_distinct_id_overrides GROUP BY team_id, distinct_id' USER '{clickhouse_user}' PASSWORD '{clickhouse_password}'
 ))
 LAYOUT(complex_key_hashed())
 -- ClickHouse will choose a time uniformly within 1 to 5 hours to reload the dictionary (update if necessary to meet SLAs).
@@ -636,4 +633,6 @@ LIFETIME(MIN 3600 MAX 18000)
 """.format(
         cluster=settings.CLICKHOUSE_CLUSTER,
         database=settings.CLICKHOUSE_DATABASE,
+        clickhouse_user=dict_reader_creds.user,
+        clickhouse_password=dict_reader_creds.password,
     )

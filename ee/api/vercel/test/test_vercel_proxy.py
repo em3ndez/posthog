@@ -4,6 +4,7 @@ from posthog.test.base import APIBaseTest, BaseTest
 from unittest.mock import MagicMock, patch
 
 import jwt
+import requests as req
 from rest_framework import status
 from rest_framework.test import APIClient
 
@@ -31,6 +32,8 @@ class TestVercelProxyAPI(APIBaseTest):
             config={
                 "billing_plan_id": "free",
                 "scopes": ["read", "write"],
+            },
+            sensitive_config={
                 "credentials": {"access_token": self.vercel_access_token, "token_type": "Bearer"},
             },
             created_by=self.user,
@@ -218,7 +221,8 @@ class TestVercelProxyAPI(APIBaseTest):
     def test_proxy_returns_500_when_no_access_token_in_config(self, mock_license):
         mock_license.return_value = self.license
 
-        self.integration.config = {"credentials": {}}
+        self.integration.config = {}
+        self.integration.sensitive_config = {"credentials": {}}
         self.integration.save()
 
         response = self.unauthenticated_client.post(
@@ -321,8 +325,6 @@ class TestVercelProxyAPI(APIBaseTest):
 
     @patch("ee.api.vercel.vercel_proxy.forward_to_vercel")
     def test_proxy_handles_network_errors(self, mock_forward, mock_license):
-        import requests as req
-
         mock_license.return_value = self.license
         mock_forward.side_effect = req.RequestException("Network error")
 

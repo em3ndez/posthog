@@ -1,39 +1,10 @@
-venv
-env
-.venv
-__pycache__/
-staticfiles
-.env
-*.code-workspace
-.mypy_cache
-.cache/
-*Type.ts
-.idea
-.yalc
-.python-version
-storybook-static
-common/storybook/dist/
-dist/
-node_modules/
-pnpm-lock.yaml
-posthog/templates/**/*
+# Read by oxfmt as a default ignore file. Entries here stay unformatted even when a tool
+# passes the path explicitly (hogli format:js via lint-staged does), unlike .oxfmtrc.json's
+# ignorePatterns, which explicit arguments bypass.
+# CI regenerates this file and requires it byte-identical to the compiler's output (ci-hog.yml).
 common/hogvm/typescript/src/stl/bytecode.ts
-common/hogvm/__tests__/__snapshots__/*
-common/hogql_parser/build_wasm/
-common/hogql_parser/build/
-common/hogql_parser/dist/
-rust/
-livestream/
-cli/target/
-cli/tests/_cases/**/*
-frontend/src/products.tsx
-frontend/src/products.json
-frontend/src/layout.html
-**/fixtures/**
-services/mcp/**/generated.ts
-services/mcp/worker-configuration.d.ts
-frontend/src/taxonomy/core-filter-definitions-by-group.json
-frontend/dist/
-frontend/**/*LogicType.ts
-bin/validate-setup-tasks.mjs
-frontend/bin/docs/build-survey-sdk-docs.ts
+
+# The MCP server's generated Zod modules keep the generator's layout; a formatter
+# pass would re-indent every schema body under the builder arrow (see
+# services/mcp/scripts/generate-orval-schemas.mjs).
+services/mcp/src/generated/

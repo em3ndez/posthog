@@ -1,6 +1,7 @@
-import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/OnboardingDocsContentWrapper'
+import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/shared/OnboardingDocsContentWrapper'
 
 import { StepDefinition } from '../steps'
+import { SDK_DEFAULTS_DATE } from './_snippets/sdkDefaults'
 
 export const getSvelteClientSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
     const { CodeBlock, Markdown, CalloutBox, dedent } = ctx
@@ -35,6 +36,13 @@ export const getSvelteClientSteps = (ctx: OnboardingComponentsContext): StepDefi
                                     pnpm add posthog-js
                                 `,
                             },
+                            {
+                                language: 'bash',
+                                file: 'bun',
+                                code: dedent`
+                                    bun add posthog-js
+                                `,
+                            },
                         ]}
                     />
                 </>
@@ -62,10 +70,10 @@ export const getSvelteClientSteps = (ctx: OnboardingComponentsContext): StepDefi
                                     export const load = async () => {
                                       if (browser) {
                                         posthog.init(
-                                          '<ph_project_api_key>',
+                                          '<ph_project_token>',
                                           {
                                             api_host: '<ph_client_api_host>',
-                                            defaults: '2026-01-30'
+                                            defaults: '${SDK_DEFAULTS_DATE}'
                                           }
                                         )
                                       }
@@ -123,7 +131,7 @@ export const getSvelteServerSteps = (ctx: OnboardingComponentsContext): StepDefi
                             },
                             {
                                 language: 'bash',
-                                file: 'Bun',
+                                file: 'bun',
                                 code: dedent`
                                     bun add posthog-node
                                 `,
@@ -143,7 +151,7 @@ export const getSvelteServerSteps = (ctx: OnboardingComponentsContext): StepDefi
                                     import { PostHog } from 'posthog-node';
 
                                     export async function load() {
-                                      const posthog = new PostHog('<ph_project_api_key>', { host: '<ph_client_api_host>' });
+                                      const posthog = new PostHog('<ph_project_token>', { host: '<ph_client_api_host>' });
 
                                       posthog.capture({
                                         distinctId: 'distinct_id_of_the_user',
@@ -169,19 +177,24 @@ export const getSvelteServerSteps = (ctx: OnboardingComponentsContext): StepDefi
     ]
 }
 
-export const getSvelteSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
-    const { snippets } = ctx
-    const JSEventCapture = snippets?.JSEventCapture
+export const getSvelteInstallSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => [
+    ...getSvelteClientSteps(ctx),
+    ...getSvelteServerSteps(ctx),
+]
 
-    return [
-        ...getSvelteClientSteps(ctx),
-        ...getSvelteServerSteps(ctx),
-        {
-            title: 'Send events',
-            badge: undefined,
-            content: <>{JSEventCapture && <JSEventCapture />}</>,
-        },
-    ]
+export const getSvelteEventStep = (ctx: OnboardingComponentsContext): StepDefinition => {
+    const JSEventCapture = ctx.snippets?.JSEventCapture
+
+    return {
+        title: 'Send events',
+        badge: undefined,
+        content: <>{JSEventCapture && <JSEventCapture />}</>,
+    }
 }
+
+export const getSvelteSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => [
+    ...getSvelteInstallSteps(ctx),
+    getSvelteEventStep(ctx),
+]
 
 export const SvelteInstallation = createInstallation(getSvelteSteps)

@@ -1,12 +1,12 @@
 import { dayjs } from 'lib/dayjs'
 import { LemonMarkdown } from 'lib/lemon-ui/LemonMarkdown'
-import { fullName } from 'lib/utils'
+import { fullName } from 'lib/utils/strings'
 
 import { ActivityScope, InsightShortId, PersonType, UserBasicType } from '~/types'
 
 export interface ActivityChange {
     type: ActivityScope
-    action: 'changed' | 'created' | 'deleted' | 'exported' | 'split'
+    action: 'changed' | 'created' | 'deleted' | 'exported' | 'split' | 'merged' | 'copied'
     field?: string
     before?: string | number | any[] | Record<string, any> | boolean | null
     after?: string | number | any[] | Record<string, any> | boolean | null
@@ -36,12 +36,15 @@ export interface ActivityLogDetail {
 }
 
 export type ActivityLogItem = {
+    id?: string
     user?: Pick<UserBasicType, 'email' | 'first_name' | 'last_name'>
     activity: string
     created_at: string
     scope: ActivityScope | string
     item_id?: string
     detail: ActivityLogDetail
+    /** Team (project) the activity belongs to; null for organization-scoped activities. */
+    team_id?: number | null
     /** Present if the log is used as a notification. Whether the notification is unread. */
     unread?: boolean
     /** Whether the activity was initiated by a PostHog staff member impersonating a user. */
@@ -50,6 +53,10 @@ export type ActivityLogItem = {
     is_system?: boolean
     /** Whether a PostHog team member was impersonating the user when this activity was logged. */
     was_impersonated?: boolean
+    /** SDK or integration that triggered this action (from x-posthog-client header). */
+    client?: string | null
+    /** Client IP address captured at request time. Null for non-HTTP activity (system, background jobs). */
+    ip_address?: string | null
 }
 
 // the description of a single activity log is a sentence describing one or more changes that makes up the entry
@@ -64,10 +71,13 @@ export type ChangeMapping = {
 export type HumanizedChange = { description: Description | null; extendedDescription?: ExtendedDescription }
 
 export type HumanizedActivityLogItem = {
+    id?: string
     email?: string | null
     name?: string
     isSystem?: boolean
     wasImpersonated?: boolean
+    /** SDK or integration that triggered this action (from x-posthog-client header). */
+    client?: string | null
     description: Description
     extendedDescription?: ExtendedDescription // e.g. an insight's filters summary
     created_at: dayjs.Dayjs
@@ -108,12 +118,14 @@ export function humanize(
         if (description !== null) {
             const impersonatedUserName = logItem.user ? fullName(logItem.user) : undefined
             logLines.push({
+                id: logItem.id,
                 email: logItem.was_impersonated ? undefined : logItem.user?.email,
                 name: logItem.was_impersonated
                     ? `PostHog Support${impersonatedUserName ? ` (as ${impersonatedUserName})` : ''}`
                     : impersonatedUserName,
                 isSystem: logItem.is_system,
                 wasImpersonated: logItem.was_impersonated,
+                client: logItem.client,
                 description,
                 extendedDescription,
                 created_at: dayjs(logItem.created_at),
@@ -130,10 +142,21 @@ export function userNameForLogItem(logItem: ActivityLogItem): string {
         return 'PostHog'
     }
     if (logItem.was_impersonated) {
-        const impersonatedUserName = logItem.user ? fullName(logItem.user) : 'a user'
-        return `PostHog Support (as ${impersonatedUserName})`
+        return `PostHog Support (as ${nameOrEmailForUser(logItem.user, 'a user')})`
     }
-    return logItem.user ? fullName(logItem.user) : 'A user'
+    return nameOrEmailForUser(logItem.user, 'A user')
+}
+
+// The user's name can be blank (e.g. SCIM-provisioned members whose IdP omits a name), so fall
+// back to their email — which is always in the payload — before the generic placeholder.
+function nameOrEmailForUser(
+    user: Pick<UserBasicType, 'email' | 'first_name' | 'last_name'> | undefined,
+    fallback: string
+): string {
+    if (!user) {
+        return fallback
+    }
+    return fullName(user) || user.email || fallback
 }
 
 const NO_PLURAL_SCOPES: ActivityScope[] = [ActivityScope.DATA_MANAGEMENT]
@@ -142,10 +165,17 @@ const NO_PLURAL_SCOPES: ActivityScope[] = [ActivityScope.DATA_MANAGEMENT]
 const SCOPE_DISPLAY_NAMES: Partial<Record<ActivityScope, { singular: string; plural: string }>> = {
     [ActivityScope.ALERT_CONFIGURATION]: { singular: 'Alert', plural: 'Alerts' },
     [ActivityScope.BATCH_EXPORT]: { singular: 'Destination', plural: 'Destinations' },
+    [ActivityScope.CANVAS]: { singular: 'Canvas', plural: 'Canvases' },
     [ActivityScope.EXTERNAL_DATA_SOURCE]: { singular: 'Source', plural: 'Sources' },
     [ActivityScope.HOG_FUNCTION]: { singular: 'Data pipeline', plural: 'Data pipelines' },
-    [ActivityScope.PERSONAL_API_KEY]: { singular: 'Personal API Key', plural: 'Personal API Keys' },
+    [ActivityScope.PERSONAL_API_KEY]: { singular: 'Personal API key', plural: 'Personal API keys' },
     [ActivityScope.LLM_TRACE]: { singular: 'LLM trace', plural: 'LLM traces' },
+    [ActivityScope.LOG]: { singular: 'Log', plural: 'Logs' },
+    [ActivityScope.PROJECT_SECRET_API_KEY]: {
+        singular: 'Project secret API key',
+        plural: 'Project secret API keys',
+    },
+    [ActivityScope.TICKET]: { singular: 'Support ticket', plural: 'Support tickets' },
 }
 
 export function humanizeScope(scope: ActivityScope | string, singular = false): string {
@@ -212,6 +242,17 @@ export function defaultDescriber(
             description: (
                 <>
                     <strong className="ph-no-capture">{userNameForLogItem(logItem)}</strong> updated <b>{resource}</b>
+                </>
+            ),
+        }
+    }
+
+    if (logItem.activity == 'copied_to_project') {
+        return {
+            description: (
+                <>
+                    <strong className="ph-no-capture">{userNameForLogItem(logItem)}</strong> copied <b>{resource}</b> to
+                    another project
                 </>
             ),
         }

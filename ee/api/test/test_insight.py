@@ -10,31 +10,44 @@ from django.test import override_settings
 from rest_framework import status
 
 from posthog.api.test.dashboards import DashboardAPI
-from posthog.models import Dashboard, DashboardTile, Insight, OrganizationMembership, User
+from posthog.constants import AvailableFeature
+from posthog.models import OrganizationMembership, User
 from posthog.test.db_context_capturing import capture_db_queries
+
+from products.access_control.backend.models.access_control import AccessControl
+from products.dashboards.backend.models.dashboard import Dashboard
+from products.dashboards.backend.models.dashboard_tile import DashboardTile
+from products.product_analytics.backend.facade.models import Insight
 
 from ee.api.test.base import APILicensedTest
 from ee.models import DashboardPrivilege
 
 
 class TestInsightEnterpriseAPI(APILicensedTest):
+    CONFIG_FORCE_ACCESS_CONTROL_ON_SETUP = True
+
     def setUp(self) -> None:
         super().setUp()
         self.dashboard_api = DashboardAPI(self.client, self.team, self.assertEqual)
 
+    def _require_access_control(self) -> None:
+        if not self.organization.is_feature_available(AvailableFeature.ACCESS_CONTROL):
+            self.skipTest("This insight RBAC test requires access control")
+
+    def _set_project_default_member_access(self) -> None:
+        AccessControl.objects.create(
+            team=self.team,
+            resource="project",
+            resource_id=str(self.team.id),
+            organization_member=None,
+            role=None,
+            access_level="member",
+        )
+
     @override_settings(IN_UNIT_TESTING=True)
     def test_can_add_and_remove_tags(self) -> None:
         with freeze_time("2012-01-14T03:21:34.000Z"):
-            insight_id, response_data = self.dashboard_api.create_insight(
-                {
-                    "name": "a created dashboard",
-                    "filters": {
-                        "events": [{"id": "$pageview"}],
-                        "properties": [{"key": "$browser", "value": "Mac OS X"}],
-                        "date_from": "-90d",
-                    },
-                }
-            )
+            insight_id, response_data = self.dashboard_api.create_insight({"name": "a created dashboard"})
         insight_short_id = response_data["short_id"]
         self.assertEqual(response_data["tags"], [])
 
@@ -200,6 +213,7 @@ class TestInsightEnterpriseAPI(APILicensedTest):
     def test_non_admin_user_with_privilege_can_add_an_insight_to_a_restricted_dashboard(
         self,
     ) -> None:
+        self._require_access_control()
         # create insight and dashboard separately with default user
         dashboard_restricted: Dashboard = Dashboard.objects.create(
             team=self.team,
@@ -231,6 +245,7 @@ class TestInsightEnterpriseAPI(APILicensedTest):
     def test_an_insight_on_both_restricted_dashboard_does_not_restrict_with_explicit_privilege(
         self,
     ) -> None:
+        self._require_access_control()
         dashboard_restricted: Dashboard = Dashboard.objects.create(
             team=self.team,
             restriction_level=Dashboard.RestrictionLevel.ONLY_COLLABORATORS_CAN_EDIT,
@@ -258,6 +273,8 @@ class TestInsightEnterpriseAPI(APILicensedTest):
         )
 
     def test_cannot_update_restricted_insight_as_other_user_who_is_project_member(self):
+        self._require_access_control()
+        self._set_project_default_member_access()
         creator = User.objects.create_and_join(self.organization, "y@x.com", None)
         self.organization_membership.level = OrganizationMembership.Level.MEMBER
         self.organization_membership.save()
@@ -304,20 +321,12 @@ class TestInsightEnterpriseAPI(APILicensedTest):
         self.assertListEqual(sorted(response.json()["tags"]), ["a", "b"])
 
     def test_searching_insights_includes_tags_and_description(self) -> None:
-        insight_one_id, _ = self.dashboard_api.create_insight(
-            {
-                "name": "needle in a haystack",
-                "filters": {"events": [{"id": "$pageview"}]},
-            }
-        )
-        insight_two_id, _ = self.dashboard_api.create_insight(
-            {"name": "not matching", "filters": {"events": [{"id": "$pageview"}]}}
-        )
+        insight_one_id, _ = self.dashboard_api.create_insight({"name": "needle in a haystack"})
+        insight_two_id, _ = self.dashboard_api.create_insight({"name": "not matching"})
 
         insight_three_id, _ = self.dashboard_api.create_insight(
             {
                 "name": "not matching name",
-                "filters": {"events": [{"id": "$pageview"}]},
                 "tags": ["needle"],
             }
         )
@@ -326,7 +335,6 @@ class TestInsightEnterpriseAPI(APILicensedTest):
             {
                 "name": "not matching name",
                 "description": "another needle",
-                "filters": {"events": [{"id": "$pageview"}]},
                 "tags": ["not matching"],
             }
         )
@@ -341,21 +349,22 @@ class TestInsightEnterpriseAPI(APILicensedTest):
         ]
 
     def test_cannot_update_an_insight_if_on_restricted_dashboard(self) -> None:
+        self._require_access_control()
+        self._set_project_default_member_access()
         dashboard_restricted: Dashboard = Dashboard.objects.create(
             team=self.team,
             restriction_level=Dashboard.RestrictionLevel.ONLY_COLLABORATORS_CAN_EDIT,
         )
 
-        insight_id, response_data = self.dashboard_api.create_insight(
-            data={
-                "name": "on a restricted and unrestricted dashboard",
-                "dashboards": [dashboard_restricted.pk],
-            }
+        # Attach via ORM: the create API now blocks attaching to a dashboard the user can't edit,
+        # and this test is about the resulting edit restriction, not the attach permission.
+        insight: Insight = Insight.objects.create(
+            team=self.team, name="on a restricted and unrestricted dashboard", created_by=self.user
         )
-        assert [t["dashboard_id"] for t in response_data["dashboard_tiles"]] == [dashboard_restricted.pk]
+        DashboardTile.objects.create(dashboard=dashboard_restricted, insight=insight)
 
         response = self.client.patch(
-            f"/api/projects/{self.team.id}/insights/{insight_id}",
+            f"/api/projects/{self.team.id}/insights/{insight.id}",
             {"name": "changing when restricted"},
         )
         self.assertEqual(response.status_code, status.HTTP_403_FORBIDDEN)
@@ -363,6 +372,8 @@ class TestInsightEnterpriseAPI(APILicensedTest):
     def test_non_admin_user_cannot_add_an_insight_to_a_restricted_dashboard(
         self,
     ) -> None:
+        self._require_access_control()
+        self._set_project_default_member_access()
         # create insight and dashboard separately with default user
         dashboard_restricted_id, _ = self.dashboard_api.create_dashboard(
             {"restriction_level": Dashboard.RestrictionLevel.ONLY_COLLABORATORS_CAN_EDIT}
@@ -392,7 +403,45 @@ class TestInsightEnterpriseAPI(APILicensedTest):
         )
         assert response.status_code == status.HTTP_200_OK
 
+    def test_non_admin_user_cannot_create_an_insight_on_a_restricted_dashboard(
+        self,
+    ) -> None:
+        self._require_access_control()
+        self._set_project_default_member_access()
+        dashboard_restricted_id, _ = self.dashboard_api.create_dashboard(
+            {"restriction_level": Dashboard.RestrictionLevel.ONLY_COLLABORATORS_CAN_EDIT}
+        )
+
+        user_without_permissions = User.objects.create_and_join(
+            organization=self.organization,
+            email="no_access_user@posthog.com",
+            password=None,
+        )
+        self.client.force_login(user_without_permissions)
+
+        self.dashboard_api.create_insight(
+            data={"name": "blocked on create", "dashboards": [dashboard_restricted_id]},
+            expected_status=status.HTTP_403_FORBIDDEN,
+        )
+        assert not DashboardTile.objects.filter(dashboard_id=dashboard_restricted_id).exists()
+        # the rejected request must not leave an orphaned insight behind
+        assert not Insight.objects.filter(created_by=user_without_permissions).exists()
+
+    def test_admin_user_can_create_an_insight_on_a_restricted_dashboard(self) -> None:
+        self._require_access_control()
+        self._set_project_default_member_access()
+        dashboard_restricted_id, _ = self.dashboard_api.create_dashboard(
+            {"restriction_level": Dashboard.RestrictionLevel.ONLY_COLLABORATORS_CAN_EDIT}
+        )
+
+        self.client.force_login(self.user)
+        self.dashboard_api.create_insight(
+            data={"name": "allowed on create", "dashboards": [dashboard_restricted_id]},
+        )
+        assert DashboardTile.objects.filter(dashboard_id=dashboard_restricted_id).exists()
+
     def test_admin_user_can_add_an_insight_to_a_restricted_dashboard(self) -> None:
+        self._require_access_control()
         # create insight and dashboard separately with default user
         dashboard_restricted: Dashboard = Dashboard.objects.create(
             team=self.team,
@@ -444,13 +493,20 @@ class TestInsightEnterpriseAPI(APILicensedTest):
     def test_an_insight_on_restricted_dashboard_has_restrictions_cannot_edit_without_explicit_privilege(
         self,
     ) -> None:
+        self._require_access_control()
+        self._set_project_default_member_access()
         dashboard: Dashboard = Dashboard.objects.create(
             team=self.team,
             restriction_level=Dashboard.RestrictionLevel.ONLY_COLLABORATORS_CAN_EDIT,
         )
-        _, response_data = self.dashboard_api.create_insight(
-            data={"name": "on a restricted dashboard", "dashboards": [dashboard.pk]}
+        # Attach via ORM: the create API now blocks attaching to a dashboard the user can't edit,
+        # and this test is about the inherited restriction, not the attach permission.
+        insight: Insight = Insight.objects.create(
+            team=self.team, name="on a restricted dashboard", created_by=self.user
         )
+        DashboardTile.objects.create(dashboard=dashboard, insight=insight)
+
+        response_data = self.client.get(f"/api/projects/{self.team.id}/insights/{insight.id}").json()
         self.assertEqual(
             response_data["effective_restriction_level"],
             Dashboard.RestrictionLevel.ONLY_COLLABORATORS_CAN_EDIT,
@@ -463,6 +519,7 @@ class TestInsightEnterpriseAPI(APILicensedTest):
     def test_an_insight_on_both_restricted_and_unrestricted_dashboard_has_no_restrictions(
         self,
     ) -> None:
+        self._require_access_control()
         dashboard_restricted: Dashboard = Dashboard.objects.create(
             team=self.team,
             restriction_level=Dashboard.RestrictionLevel.ONLY_COLLABORATORS_CAN_EDIT,
@@ -487,6 +544,7 @@ class TestInsightEnterpriseAPI(APILicensedTest):
         )
 
     def test_an_insight_on_restricted_dashboard_does_not_restrict_admin(self) -> None:
+        self._require_access_control()
         dashboard_restricted: Dashboard = Dashboard.objects.create(
             team=self.team,
             restriction_level=Dashboard.RestrictionLevel.ONLY_COLLABORATORS_CAN_EDIT,
@@ -530,7 +588,6 @@ class TestInsightEnterpriseAPI(APILicensedTest):
                     data={
                         "short_id": f"insight{i}",
                         "dashboards": [dashboard.pk],
-                        "filters": {"events": [{"id": "$pageview"}]},
                     }
                 )
 
@@ -561,6 +618,8 @@ class TestInsightEnterpriseAPI(APILicensedTest):
     def test_non_admin_user_cannot_remove_an_insight_from_a_restricted_dashboard(
         self,
     ) -> None:
+        self._require_access_control()
+        self._set_project_default_member_access()
         # create a restricted dashboard with the default user (who has edit permission)
         dashboard_restricted_id, _ = self.dashboard_api.create_dashboard(
             {"restriction_level": Dashboard.RestrictionLevel.ONLY_COLLABORATORS_CAN_EDIT}
@@ -599,6 +658,10 @@ class TestInsightEnterpriseAPI(APILicensedTest):
         activity_response = self.dashboard_api.get_insight_activity(insight_id)
 
         activity: list[dict] = activity_response["results"]
+        for item in activity:
+            item.pop("id", None)
+            for envelope_key in ("is_system", "was_impersonated", "client"):
+                item.pop(envelope_key, None)
 
         self.maxDiff = None
         assert activity == expected

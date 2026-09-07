@@ -27,6 +27,15 @@ SESSION_RECORDING_V2_S3_BUCKET = os.getenv("SESSION_RECORDING_V2_S3_BUCKET", "po
 SESSION_RECORDING_V2_S3_PREFIX = os.getenv("SESSION_RECORDING_V2_S3_PREFIX", "session_recordings")
 
 if TEST or DEBUG:
-    RECORDING_API_URL = os.getenv("RECORDING_API_URL", "http://localhost:6738")
+    RECORDING_API_URL = os.getenv("RECORDING_API_URL", "http://localhost:6741")
 else:
     RECORDING_API_URL = os.getenv("RECORDING_API_URL", "")
+
+# Dedicated signing secret for the team-scoped JWTs that authorize recording-api calls.
+# Kept off SECRET_KEY/JWT_SIGNING_KEY (which are fleet-wide) so only the designated minters
+# — Django web and the Python Temporal workers — can mint recording-api tokens. Comma-separated
+# `new_key,old_key` for rotation: callers sign with the first key, recording-api verifies against
+# all. Dev/test default matches the recording-api Node default so local end-to-end calls validate.
+RECORDING_API_JWT_SECRET = os.getenv(
+    "RECORDING_API_JWT_SECRET", "dev-recording-api-jwt-secret" if (TEST or DEBUG) else ""
+)

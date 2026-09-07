@@ -18,9 +18,12 @@ The service is configured using environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| HOST | 0.0.0.0 | Host to bind the HTTP server |
-| PORT | 8000 | Port for the HTTP server |
-| JWT_SECRET | posthog_default_jwt_secret | Secret key for JWT validation |
+| BIND_HOST | :: | Host to bind the HTTP server |
+| BIND_PORT | 4318 | Port for the HTTP server |
+| MANAGEMENT_BIND_HOST | :: | Host to bind the health check and metrics server |
+| MANAGEMENT_BIND_PORT | 8080 | Port for the health check and metrics server |
+| MAX_REQUEST_BODY_SIZE_BYTES | 2097152 | Rejects larger request bodies, before and after gzip decompression |
+| DROP_EVENTS_BY_TOKEN | (none) | Comma-separated tokens to drop |
 
 ## Authentication
 
@@ -35,10 +38,34 @@ Authorization: Bearer your-project-api-key
 2. As a query parameter:
 
 ```http
-POST /v1/logs?token=your-project-api-key
+POST /v1/logs?token=your-project-token
 ```
 
-The token is your PostHog project API key.
+The token is your PostHog project token.
+
+## Response codes
+
+| Status | Meaning | Client behavior |
+|--------|---------|-----------------|
+| 200 | Accepted | — |
+| 400 | Body could not be decoded as OTLP protobuf or JSON | Permanent |
+| 401 | No token, or a token that cannot be a project API key (for example a `phx_` personal API key) | Permanent, so the client stops and surfaces the misconfiguration |
+| 413 | Body over `MAX_REQUEST_BODY_SIZE_BYTES` | Permanent |
+
+The 401 covers shape only: empty, over 64 characters, non-ASCII, containing a null byte, or
+prefixed `phx_`. None of those can be a project API key, so answering 200 and dropping the
+records downstream only hides the misconfiguration from whoever is sending the data. This is
+the same check, and the same status, that event capture applies to the same input.
+
+One misconfiguration is still answered 200: a well-formed token that belongs to no project.
+Resolving a token to a team needs Postgres, which this service does not have, so those records
+are still dropped by the ingestion consumer. Event capture does not validate this at the edge
+either.
+
+A project over its billing quota is also still answered 200 and dropped by the consumer.
+
+Rejections are counted on `capture_logs_requests_rejected_total{reason, signal}`, where `reason`
+is one of `missing_token`, `dropped_token` or `invalid_token`.
 
 ## Running the Service
 
@@ -88,7 +115,7 @@ Standard OTLP protobuf encoding is also supported.
 Requirements:
 
 1. Set the HTTP endpoint to `http://your-service-host:8000/v1/logs`
-2. Include your PostHog project API key in the Authorization header or as a query parameter
+2. Include your PostHog project token in the Authorization header or as a query parameter
 3. Use standard OTLP log format (JSON, JSONL, or Protobuf)
 
 ## Endpoints

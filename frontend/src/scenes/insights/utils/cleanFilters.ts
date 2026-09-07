@@ -4,12 +4,13 @@ import {
     NON_TIME_SERIES_DISPLAY_TYPES,
     NON_VALUES_ON_SERIES_DISPLAY_TYPES,
     PERCENT_STACK_VIEW_DISPLAY_TYPE,
+    PIE_DISPLAY_TYPES,
     RETENTION_FIRST_OCCURRENCE_MATCHING_FILTERS,
     RETENTION_MEAN_NONE,
     ShownAsValue,
 } from 'lib/constants'
-import { clamp } from 'lib/utils'
 import { getDefaultEventName } from 'lib/utils/getAppContext'
+import { clamp } from 'lib/utils/numbers'
 import { isURLNormalizeable } from 'scenes/insights/filters/BreakdownFilter/taxonomicBreakdownFilterUtils'
 import {
     isFunnelsFilter,
@@ -318,7 +319,7 @@ export function cleanFilters(
                 : { mean_retention_calculation: 'simple' }),
             cumulative: filters.cumulative,
             total_intervals: Math.min(Math.max(filters.total_intervals ?? 11, 0), 100),
-            ...(filters.aggregation_group_type_index != undefined
+            ...(filters.aggregation_group_type_index != null
                 ? { aggregation_group_type_index: filters.aggregation_group_type_index }
                 : {}),
             ...commonFilters,
@@ -367,7 +368,7 @@ export function cleanFilters(
             funnel_correlation_person_entity: filters.funnel_correlation_person_entity || undefined,
             funnel_correlation_person_converted: filters.funnel_correlation_person_converted || undefined,
             funnel_custom_steps: filters.funnel_custom_steps || undefined,
-            ...(filters.aggregation_group_type_index != undefined
+            ...(filters.aggregation_group_type_index != null
                 ? { aggregation_group_type_index: filters.aggregation_group_type_index }
                 : {}),
             ...commonFilters,
@@ -454,7 +455,7 @@ export function cleanFilters(
 
         if (
             !!trendLikeFilter.display &&
-            trendLikeFilter.display === ChartDisplayType.ActionsPie &&
+            PIE_DISPLAY_TYPES.includes(trendLikeFilter.display) &&
             trendLikeFilter.show_values_on_series === undefined
         ) {
             trendLikeFilter.show_values_on_series = true
@@ -470,7 +471,7 @@ export function cleanFilters(
 
         if (
             !!trendLikeFilter.display &&
-            trendLikeFilter.display === ChartDisplayType.ActionsPie &&
+            PIE_DISPLAY_TYPES.includes(trendLikeFilter.display) &&
             trendLikeFilter.show_percent_stack_view === undefined
         ) {
             trendLikeFilter.show_percent_stack_view = true

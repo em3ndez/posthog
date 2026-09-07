@@ -7,26 +7,33 @@ from posthog.test.base import APIBaseTest
 from unittest.mock import ANY, Mock, call, patch
 
 from django.core.cache import cache
+from django.test import SimpleTestCase
 from django.utils.timezone import now
 
 from parameterized import parameterized
 from rest_framework import status
 
 from posthog import models, rate_limit
-from posthog.api.feature_flag import LocalEvaluationThrottle, RemoteConfigThrottle
 from posthog.api.test.test_team import create_team
 from posthog.api.test.test_user import create_user
+from posthog.auth import ProjectSecretAPIKeyAuthentication
 from posthog.models import Team
 from posthog.models.instance_setting import override_instance_config
-from posthog.models.personal_api_key import PersonalAPIKey, hash_key_value
-from posthog.models.utils import generate_random_token_personal
+from posthog.models.personal_api_key import PersonalAPIKey
+from posthog.models.utils import generate_random_token_personal, hash_key_value
 from posthog.rate_limit import (
     AIBurstRateThrottle,
     AIResearchBurstRateThrottle,
     AIResearchSustainedRateThrottle,
     AISustainedRateThrottle,
     HogQLQueryThrottle,
+    LLMPromptPublishBurstRateThrottle,
     get_route_from_path,
+)
+
+from products.feature_flags.backend.api.feature_flag import (
+    RemoteConfigProjectSecretApiKeyTeamThrottle,
+    RemoteConfigThrottle,
 )
 
 
@@ -43,6 +50,7 @@ class TestUserAPI(APIBaseTest):
             label="X",
             user=self.user,
             secure_value=hash_key_value(self.personal_api_key),
+            scopes=["*"],
         )
 
     def tearDown(self):
@@ -155,6 +163,78 @@ class TestUserAPI(APIBaseTest):
             },
         )
 
+    @parameterized.expand(
+        [
+            ("body",),
+            ("query_string",),
+        ]
+    )
+    @patch("posthog.rate_limit.BurstRateThrottle.rate", new="5/minute")
+    @patch("posthog.rate_limit.is_rate_limit_enabled", return_value=True)
+    def test_burst_rate_limit_applies_to_every_personal_api_key_source(self, source, rate_limit_enabled_mock):
+        # The client is logged in by default, and a session would authenticate the request on its own,
+        # hiding whether the personal API key was picked up at all.
+        self.client.logout()
+
+        url = f"/api/projects/{self.team.pk}/feature_flags/"
+        body: dict = {}
+        if source == "body":
+            body["personal_api_key"] = self.personal_api_key
+        else:
+            url = f"{url}?personal_api_key={quote(self.personal_api_key)}"
+
+        for _ in range(5):
+            response = self.client.post(url, body, format="json")
+            # The body omits the required fields, so the endpoint rejects it. What matters is that
+            # the request reached the endpoint, which means it authenticated and was not throttled.
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.content)
+
+        response = self.client.post(url, body, format="json")
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS, response.content)
+
+    @patch("posthog.rate_limit.BurstRateThrottle.rate", new="5/minute")
+    @patch("posthog.rate_limit.is_rate_limit_enabled", return_value=True)
+    def test_burst_rate_limit_shares_one_bucket_across_key_sources(self, rate_limit_enabled_mock):
+        # One key gets one budget. If each source got its own bucket, alternating between them
+        # would multiply what a single key is allowed.
+        self.client.logout()
+
+        url = f"/api/projects/{self.team.pk}/feature_flags/"
+        requests = [
+            lambda: self.client.post(url, {"personal_api_key": self.personal_api_key}, format="json"),
+            lambda: self.client.post(url, {}, headers={"authorization": f"Bearer {self.personal_api_key}"}),
+        ]
+
+        for index in range(5):
+            response = requests[index % 2]()
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.content)
+
+        response = requests[1]()
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS, response.content)
+
+    @patch("posthog.rate_limit.BurstRateThrottle.rate", new="5/minute")
+    @patch("posthog.rate_limit.is_rate_limit_enabled", return_value=True)
+    def test_burst_rate_limit_ignores_an_unvalidated_query_string_key(self, rate_limit_enabled_mock):
+        # Authentication reads the header, then the body, then the query string, and stops at the
+        # first hit. A request that authenticates on its body key never validates the query string,
+        # so bucketing on that value would let a caller mint a fresh budget on every request.
+        self.client.logout()
+
+        for index in range(5):
+            response = self.client.post(
+                f"/api/projects/{self.team.pk}/feature_flags/?personal_api_key=junk-{index}",
+                {"personal_api_key": self.personal_api_key},
+                format="json",
+            )
+            self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST, response.content)
+
+        response = self.client.post(
+            f"/api/projects/{self.team.pk}/feature_flags/?personal_api_key=junk-5",
+            {"personal_api_key": self.personal_api_key},
+            format="json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS, response.content)
+
     @patch("posthog.rate_limit.SustainedRateThrottle.rate", new="5/hour")
     @patch("posthog.rate_limit.statsd.incr")
     @patch("posthog.rate_limit.is_rate_limit_enabled", return_value=True)
@@ -266,7 +346,9 @@ class TestUserAPI(APIBaseTest):
         # Create a new user
         new_user = create_user(email="test@posthog.com", password="1234", organization=self.organization)
         new_personal_api_key = generate_random_token_personal()
-        PersonalAPIKey.objects.create(label="X", user=new_user, secure_value=hash_key_value(new_personal_api_key))
+        PersonalAPIKey.objects.create(
+            label="X", user=new_user, secure_value=hash_key_value(new_personal_api_key), scopes=["*"]
+        )
         self.client.force_login(new_user)
 
         incr_mock.reset_mock()
@@ -281,7 +363,9 @@ class TestUserAPI(APIBaseTest):
         new_team = create_team(organization=self.organization)
         new_user = create_user(email="test2@posthog.com", password="1234", organization=self.organization)
         new_personal_api_key = generate_random_token_personal()
-        PersonalAPIKey.objects.create(label="X", user=new_user, secure_value=hash_key_value(new_personal_api_key))
+        PersonalAPIKey.objects.create(
+            label="X", user=new_user, secure_value=hash_key_value(new_personal_api_key), scopes=["*"]
+        )
 
         incr_mock.reset_mock()
 
@@ -485,7 +569,7 @@ class TestUserAPI(APIBaseTest):
             self.assertFalse(result)
 
             # Should call report_user_action with correct parameters
-            mock_report_user_action.assert_called_once_with(self.user, "ai burst rate limited")
+            mock_report_user_action.assert_called_once_with(self.user, "ai burst rate limited", request=mock_request)
 
     @patch("posthog.rate_limit.report_user_action")
     def test_ai_sustained_rate_throttle_calls_report_user_action(self, mock_report_user_action):
@@ -505,7 +589,9 @@ class TestUserAPI(APIBaseTest):
             self.assertFalse(result)
 
             # Should call report_user_action with correct parameters
-            mock_report_user_action.assert_called_once_with(self.user, "ai sustained rate limited")
+            mock_report_user_action.assert_called_once_with(
+                self.user, "ai sustained rate limited", request=mock_request
+            )
 
     @patch("posthog.rate_limit.report_user_action")
     def test_ai_research_burst_rate_throttle_calls_report_user_action(self, mock_report_user_action):
@@ -525,7 +611,9 @@ class TestUserAPI(APIBaseTest):
             self.assertFalse(result)
 
             # Should call report_user_action with correct parameters
-            mock_report_user_action.assert_called_once_with(self.user, "ai research burst rate limited")
+            mock_report_user_action.assert_called_once_with(
+                self.user, "ai research burst rate limited", request=mock_request
+            )
 
     @patch("posthog.rate_limit.report_user_action")
     def test_ai_research_sustained_rate_throttle_calls_report_user_action(self, mock_report_user_action):
@@ -545,7 +633,9 @@ class TestUserAPI(APIBaseTest):
             self.assertFalse(result)
 
             # Should call report_user_action with correct parameters
-            mock_report_user_action.assert_called_once_with(self.user, "ai research sustained rate limited")
+            mock_report_user_action.assert_called_once_with(
+                self.user, "ai research sustained rate limited", request=mock_request
+            )
 
     def test_ai_research_burst_rate_throttle_has_correct_scope_and_rate(self):
         """Test that AIResearchBurstRateThrottle has correct scope and rate"""
@@ -559,78 +649,75 @@ class TestUserAPI(APIBaseTest):
         self.assertEqual(throttle.scope, "ai_research_sustained")
         self.assertEqual(throttle.rate, "10/day")
 
-    def test_local_evaluation_throttle_uses_default_rate_when_no_custom_limit(self):
-        throttle = LocalEvaluationThrottle()
-
-        # Mock view and request
-        mock_view = Mock()
+    @patch("posthog.rate_limit.team_is_allowed_to_bypass_throttle", return_value=False)
+    @patch(
+        "posthog.rate_limit.get_route_from_path", return_value="/api/environments/TEAM_ID/llm_prompts/name/PROMPT_NAME/"
+    )
+    @patch("posthog.rate_limit.statsd.incr")
+    @patch("posthog.rate_limit.is_rate_limit_enabled", return_value=True)
+    def test_llm_prompt_publish_burst_throttle_limits_web_authenticated_requests(
+        self, rate_limit_enabled_mock, incr_mock, route_mock, bypass_mock
+    ):
+        throttle = LLMPromptPublishBurstRateThrottle()
         mock_request = Mock()
+        mock_request.user = Mock(is_authenticated=True, pk=self.user.pk)
+        mock_request.path = f"/api/environments/{self.team.pk}/llm_prompts/name/my-prompt/"
+        mock_view = Mock(team_id=self.team.pk)
 
         with (
-            patch("posthog.api.feature_flag.LOCAL_EVAL_RATE_LIMITS", {}),
-            patch.object(throttle, "safely_get_team_id_from_view", return_value=123),
-            patch.object(throttle.__class__.__bases__[0], "allow_request", return_value=True),
+            patch("posthog.rate_limit.PersonalAPIKeyAuthentication.find_key_with_source", return_value=None),
+            patch("rest_framework.throttling.SimpleRateThrottle.allow_request", return_value=False),
         ):
             result = throttle.allow_request(mock_request, mock_view)
 
-            self.assertTrue(result)
-            # Rate should remain default
-            self.assertEqual(throttle.rate, "600/minute")
+        self.assertFalse(result)
+        incr_mock.assert_any_call(
+            "rate_limit_exceeded",
+            tags={
+                "team_id": self.team.pk,
+                "scope": "llm_prompt_publish_burst",
+                "rate": "30/minute",
+                "route": "/api/environments/TEAM_ID/llm_prompts/name/PROMPT_NAME/",
+                "hashed_personal_api_key": None,
+            },
+        )
 
-    def test_local_evaluation_throttle_handles_empty_settings(self):
-        throttle = LocalEvaluationThrottle()
-
-        # Mock view and request
-        mock_view = Mock()
+    @patch("posthog.rate_limit.team_is_allowed_to_bypass_throttle", return_value=False)
+    @patch(
+        "posthog.rate_limit.get_route_from_path", return_value="/api/environments/TEAM_ID/llm_prompts/name/PROMPT_NAME/"
+    )
+    @patch("posthog.rate_limit.statsd.incr")
+    @patch("posthog.rate_limit.is_rate_limit_enabled", return_value=True)
+    def test_llm_prompt_publish_burst_throttle_limits_personal_api_key_requests(
+        self, rate_limit_enabled_mock, incr_mock, route_mock, bypass_mock
+    ):
+        throttle = LLMPromptPublishBurstRateThrottle()
         mock_request = Mock()
+        mock_request.user = Mock(is_authenticated=True, pk=self.user.pk)
+        mock_request.path = f"/api/environments/{self.team.pk}/llm_prompts/name/my-prompt/"
+        mock_view = Mock(team_id=self.team.pk)
+        personal_api_key = "phx_test_personal_api_key"
 
         with (
-            patch("posthog.api.feature_flag.LOCAL_EVAL_RATE_LIMITS", {}),
-            patch("posthog.rate_limit.is_rate_limit_enabled", return_value=True),
-            patch.object(throttle, "safely_get_team_id_from_view", return_value=123),
-            patch.object(throttle.__class__.__bases__[0], "allow_request", return_value=True),
+            patch(
+                "posthog.rate_limit.PersonalAPIKeyAuthentication.find_key_with_source",
+                return_value=(personal_api_key, "header"),
+            ),
+            patch("rest_framework.throttling.SimpleRateThrottle.allow_request", return_value=False),
         ):
             result = throttle.allow_request(mock_request, mock_view)
 
-            self.assertTrue(result)
-            # Should use default rate
-            self.assertEqual(throttle.rate, "600/minute")
-
-    def test_local_evaluation_throttle_handles_missing_team_gracefully(self):
-        throttle = LocalEvaluationThrottle()
-
-        # Mock view without team_id
-        mock_view = Mock()
-        mock_view.team_id = None
-
-        # Test with missing team
-        with patch("posthog.rate_limit.is_rate_limit_enabled", return_value=True):
-            with patch.object(throttle.__class__.__bases__[0], "allow_request", return_value=True):
-                result = throttle.allow_request(Mock(), mock_view)
-
-                self.assertTrue(result)
-                # Should keep default rate
-                self.assertEqual(throttle.rate, "600/minute")
-
-    def test_local_evaluation_throttle_uses_custom_rate_for_team(self):
-        throttle = LocalEvaluationThrottle()
-
-        # Mock view and request
-        mock_view = Mock()
-        mock_request = Mock()
-
-        with (
-            patch("posthog.api.feature_flag.LOCAL_EVAL_RATE_LIMITS", {123: "1200/minute"}),
-            patch.object(throttle, "safely_get_team_id_from_view", return_value=123),
-            patch.object(throttle.__class__.__bases__[0], "allow_request", return_value=True),
-        ):
-            result = throttle.allow_request(mock_request, mock_view)
-
-            self.assertTrue(result)
-            # Should use custom rate
-            self.assertEqual(throttle.rate, "1200/minute")
-            self.assertEqual(throttle.num_requests, 1200)
-            self.assertEqual(throttle.duration, 60)  # 1 minute in seconds
+        self.assertFalse(result)
+        incr_mock.assert_any_call(
+            "rate_limit_exceeded",
+            tags={
+                "team_id": self.team.pk,
+                "scope": "llm_prompt_publish_burst",
+                "rate": "30/minute",
+                "route": "/api/environments/TEAM_ID/llm_prompts/name/PROMPT_NAME/",
+                "hashed_personal_api_key": hash_key_value(personal_api_key),
+            },
+        )
 
     def test_remote_config_throttle_uses_default_rate_when_no_custom_limit(self):
         throttle = RemoteConfigThrottle()
@@ -640,7 +727,7 @@ class TestUserAPI(APIBaseTest):
         mock_request = Mock()
 
         with (
-            patch("posthog.api.feature_flag.REMOTE_CONFIG_RATE_LIMITS", {}),
+            patch("products.feature_flags.backend.api.feature_flag.REMOTE_CONFIG_RATE_LIMITS", {}),
             patch.object(throttle, "safely_get_team_id_from_view", return_value=123),
             patch.object(throttle.__class__.__bases__[0], "allow_request", return_value=True),
         ):
@@ -658,7 +745,7 @@ class TestUserAPI(APIBaseTest):
         mock_request = Mock()
 
         with (
-            patch("posthog.api.feature_flag.REMOTE_CONFIG_RATE_LIMITS", {}),
+            patch("products.feature_flags.backend.api.feature_flag.REMOTE_CONFIG_RATE_LIMITS", {}),
             patch("posthog.rate_limit.is_rate_limit_enabled", return_value=True),
             patch.object(throttle, "safely_get_team_id_from_view", return_value=123),
             patch.object(throttle.__class__.__bases__[0], "allow_request", return_value=True),
@@ -693,7 +780,7 @@ class TestUserAPI(APIBaseTest):
         mock_request = Mock()
 
         with (
-            patch("posthog.api.feature_flag.REMOTE_CONFIG_RATE_LIMITS", {123: "1200/minute"}),
+            patch("products.feature_flags.backend.api.feature_flag.REMOTE_CONFIG_RATE_LIMITS", {123: "1200/minute"}),
             patch.object(throttle, "safely_get_team_id_from_view", return_value=123),
             patch.object(throttle.__class__.__bases__[0], "allow_request", return_value=True),
         ):
@@ -704,6 +791,26 @@ class TestUserAPI(APIBaseTest):
             self.assertEqual(throttle.rate, "1200/minute")
             self.assertEqual(throttle.num_requests, 1200)
             self.assertEqual(throttle.duration, 60)  # 1 minute in seconds
+
+    def test_remote_config_team_throttle_uses_custom_rate_for_team(self):
+        throttle = RemoteConfigProjectSecretApiKeyTeamThrottle()
+
+        mock_view = Mock()
+        mock_request = Mock()
+
+        with (
+            patch("products.feature_flags.backend.api.feature_flag.REMOTE_CONFIG_RATE_LIMITS", {123: "1200/minute"}),
+            patch.object(throttle, "safely_get_team_id_from_view", return_value=123),
+            patch.object(throttle.__class__.__bases__[0], "allow_request", return_value=True),
+        ):
+            result = throttle.allow_request(mock_request, mock_view)
+
+            self.assertTrue(result)
+            # The per-team throttle must apply the team's REMOTE_CONFIG_RATE_LIMITS override too, not
+            # just the per-key throttle, otherwise a configured per-team cap silently has no effect.
+            self.assertEqual(throttle.rate, "1200/minute")
+            self.assertEqual(throttle.num_requests, 1200)
+            self.assertEqual(throttle.duration, 60)
 
     @parameterized.expand(
         [
@@ -778,3 +885,181 @@ class TestUserAPI(APIBaseTest):
 
         self.assertEqual(num_requests, 6)
         self.assertEqual(duration, 1200)  # 20 minutes * 60 seconds
+
+    def test_health_issue_refresh_throttle_parses_15_minute_window(self):
+        throttle = rate_limit.HealthIssueRefreshThrottle()
+        num_requests, duration = throttle.parse_rate("1/15minutes")
+
+        self.assertEqual(num_requests, 1)
+        self.assertEqual(duration, 15 * 60)
+
+    def test_health_issue_refresh_throttle_falls_back_to_default_parser(self):
+        throttle = rate_limit.HealthIssueRefreshThrottle()
+        num_requests, duration = throttle.parse_rate("5/hour")
+
+        self.assertEqual(num_requests, 5)
+        self.assertEqual(duration, 3600)
+
+
+class _PSAKThrottleForTest(rate_limit.PersonalOrProjectSecretApiKeyRateThrottle):
+    scope = "test_psak"
+    rate = "100/minute"
+
+
+class TestPersonalOrProjectSecretApiKeyRateThrottle(APIBaseTest):
+    def _psak_request(self, key_id=1):
+        auth = ProjectSecretAPIKeyAuthentication()
+        auth.project_secret_api_key = Mock(id=key_id)
+        return Mock(successful_authenticator=auth)
+
+    def test_psak_requests_do_not_bypass_throttle(self):
+        # PSAK carries no personal API key; the throttle must not let it through the
+        # personal_api_key_only gate that PersonalApiKeyRateThrottle uses.
+        throttle = _PSAKThrottleForTest()
+        request = self._psak_request()
+        with patch.object(throttle, "_allow_request_internal", return_value=True) as spy:
+            throttle.allow_request(request, Mock())
+        spy.assert_called_once_with(request, ANY, personal_api_key_only=False)
+
+    def test_non_psak_request_uses_personal_api_key_only_gate(self):
+        throttle = _PSAKThrottleForTest()
+        request = Mock(successful_authenticator=Mock())
+        with patch.object(throttle, "_allow_request_internal", return_value=True) as spy:
+            throttle.allow_request(request, Mock())
+        spy.assert_called_once_with(ANY, ANY, personal_api_key_only=True)
+
+    def test_psak_requests_use_per_key_cache_bucket(self):
+        self.assertTrue(_PSAKThrottleForTest().get_cache_key(self._psak_request(key_id=42), Mock()).endswith("psak:42"))
+
+
+class TestUserVerifyEmailThrottle(SimpleTestCase):
+    CANONICAL_UUID = "12345678-1234-5678-1234-567812345678"
+
+    def _request(self, uuid_value):
+        return Mock(data={"uuid": uuid_value}, user=None)
+
+    @parameterized.expand(
+        [
+            ("uppercase", "12345678-1234-5678-1234-567812345678".upper()),
+            ("hyphen_free", "12345678123456781234567812345678"),
+            ("brace_wrapped", "{12345678-1234-5678-1234-567812345678}"),
+            ("urn_prefixed", "urn:uuid:12345678-1234-5678-1234-567812345678"),
+        ]
+    )
+    def test_alternate_uuid_spellings_share_one_bucket(self, _name, variant):
+        throttle = rate_limit.UserVerifyEmailThrottle()
+        self.assertEqual(
+            throttle.get_cache_key(self._request(self.CANONICAL_UUID), Mock()),
+            throttle.get_cache_key(self._request(variant), Mock()),
+        )
+
+    def test_distinct_uuids_use_distinct_buckets(self):
+        throttle = rate_limit.UserVerifyEmailThrottle()
+        self.assertNotEqual(
+            throttle.get_cache_key(self._request(self.CANONICAL_UUID), Mock()),
+            throttle.get_cache_key(self._request("87654321-4321-8765-4321-876543218765"), Mock()),
+        )
+
+    def test_unparseable_uuid_falls_back_without_raising(self):
+        throttle = rate_limit.UserVerifyEmailThrottle()
+        self.assertIsNotNone(throttle.get_cache_key(self._request("not-a-uuid"), Mock()))
+
+
+class TestAIObservabilitySummarizationRateThrottle(SimpleTestCase):
+    def setUp(self) -> None:
+        cache.clear()
+
+    def tearDown(self) -> None:
+        cache.clear()
+
+    @parameterized.expand(
+        [
+            ("burst", rate_limit.AIObservabilitySummarizationBurstThrottle),
+            ("sustained", rate_limit.AIObservabilitySummarizationSustainedThrottle),
+            ("daily", rate_limit.AIObservabilitySummarizationDailyThrottle),
+        ]
+    )
+    @patch("posthog.rate_limit.team_is_allowed_to_bypass_throttle", return_value=False)
+    @patch("posthog.rate_limit.PersonalAPIKeyAuthentication.find_key_with_source", return_value=None)
+    @patch("posthog.rate_limit.is_rate_limit_enabled", return_value=True)
+    def test_session_requests_are_rate_limited(
+        self,
+        _name: str,
+        throttle_class: type[rate_limit.PersonalApiKeyRateThrottle],
+        _rate_limit_enabled: Mock,
+        _find_personal_api_key: Mock,
+        _team_can_bypass: Mock,
+    ) -> None:
+        request = Mock(user=Mock(is_authenticated=True), path="/api/projects/1/llm_analytics/summarization/")
+        view = Mock(team_id=1)
+
+        with patch.object(throttle_class, "rate", "1/minute"):
+            self.assertTrue(throttle_class().allow_request(request, view))
+            self.assertFalse(throttle_class().allow_request(request, view))
+
+
+class TestLeakedKeyReportThrottle(SimpleTestCase):
+    def setUp(self) -> None:
+        cache.clear()
+
+    def tearDown(self) -> None:
+        cache.clear()
+
+    def test_scope_and_rate(self) -> None:
+        throttle = rate_limit.LeakedKeyReportThrottle()
+        self.assertEqual(throttle.scope, "leaked_key_report")
+        self.assertEqual(throttle.rate, "10/minute")
+
+    def test_limits_requests_per_ip(self) -> None:
+        request = Mock(headers={}, META={"REMOTE_ADDR": "203.0.113.5"})
+        other_request = Mock(headers={}, META={"REMOTE_ADDR": "203.0.113.6"})
+        view = Mock()
+
+        with patch.object(rate_limit.LeakedKeyReportThrottle, "rate", "1/minute"):
+            self.assertTrue(rate_limit.LeakedKeyReportThrottle().allow_request(request, view))
+            self.assertFalse(rate_limit.LeakedKeyReportThrottle().allow_request(request, view))
+            self.assertTrue(rate_limit.LeakedKeyReportThrottle().allow_request(other_request, view))
+
+
+class _PSAKTeamThrottleForTest(rate_limit.ProjectSecretApiKeyTeamRateThrottle):
+    scope = "test_psak_team"
+    rate = "100/minute"
+
+
+class TestProjectSecretApiKeyTeamRateThrottle(APIBaseTest):
+    def _psak_request(self, team_id=7):
+        auth = ProjectSecretAPIKeyAuthentication()
+        auth.project_secret_api_key = Mock(team_id=team_id)
+        return Mock(successful_authenticator=auth)
+
+    def test_psak_request_is_throttled(self):
+        throttle = _PSAKTeamThrottleForTest()
+        with patch.object(throttle, "_allow_request_internal", return_value=True) as spy:
+            throttle.allow_request(self._psak_request(), Mock())
+        spy.assert_called_once_with(ANY, ANY, personal_api_key_only=False)
+
+    def test_non_psak_request_bypasses(self):
+        throttle = _PSAKTeamThrottleForTest()
+        with patch.object(throttle, "_allow_request_internal") as spy:
+            self.assertTrue(throttle.allow_request(Mock(successful_authenticator=Mock()), Mock()))
+        spy.assert_not_called()
+
+    def test_cache_key_is_keyed_per_team(self):
+        self.assertIn("psak-team:7", _PSAKTeamThrottleForTest().get_cache_key(self._psak_request(team_id=7), Mock()))
+
+
+class TestWidgetTeamPollWriteThrottleSplit(SimpleTestCase):
+    def setUp(self) -> None:
+        cache.clear()
+
+    def tearDown(self) -> None:
+        cache.clear()
+
+    def test_exhausted_poll_bucket_does_not_block_write(self) -> None:
+        request = Mock(headers={"X-Conversations-Token": "widget-token"})
+        view = Mock()
+        with patch.object(rate_limit.WidgetTeamPollThrottle, "rate", "1/minute"):
+            poll = rate_limit.WidgetTeamPollThrottle()
+            self.assertTrue(poll.allow_request(request, view))
+            self.assertFalse(poll.allow_request(request, view))
+        self.assertTrue(rate_limit.WidgetTeamWriteThrottle().allow_request(request, view))

@@ -1,21 +1,21 @@
 import { useActions, useValues } from 'kea'
 
 import { ActivitySceneTabs } from 'scenes/activity/ActivitySceneTabs'
-import { Scene, SceneExport } from 'scenes/sceneTypes'
 import { sceneConfigurations } from 'scenes/scenes'
+import { Scene, SceneExport } from 'scenes/sceneTypes'
 
 import { SceneContent } from '~/layout/scenes/components/SceneContent'
 import { SceneTitleSection } from '~/layout/scenes/components/SceneTitleSection'
-import { Query } from '~/queries/Query/Query'
 import { QueryFeature } from '~/queries/nodes/DataTable/queryFeatures'
+import { Query } from '~/queries/Query/Query'
 import { ProductKey } from '~/queries/schema/schema-general'
 import { ActivityTab } from '~/types'
 
 import { eventsSceneLogic } from './eventsSceneLogic'
 
-export function EventsScene({ tabId }: { tabId?: string } = {}): JSX.Element {
-    const { query } = useValues(eventsSceneLogic)
-    const { setQuery } = useActions(eventsSceneLogic)
+export function EventsScene(): JSX.Element {
+    const { query } = useValues(eventsSceneLogic())
+    const { setQuery } = useActions(eventsSceneLogic())
 
     return (
         <SceneContent>
@@ -28,8 +28,8 @@ export function EventsScene({ tabId }: { tabId?: string } = {}): JSX.Element {
                 }}
             />
             <Query
-                attachTo={eventsSceneLogic({ tabId })}
-                uniqueKey={`events-scene-${tabId}`}
+                attachTo={eventsSceneLogic()}
+                uniqueKey="events-scene"
                 query={query}
                 setQuery={setQuery}
                 context={{

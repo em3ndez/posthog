@@ -11,14 +11,20 @@ import { LemonModal, LemonTag, Link } from '@posthog/lemon-ui'
 import { FEATURE_FLAGS } from 'lib/constants'
 import { Tooltip } from 'lib/lemon-ui/Tooltip'
 import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
-import { getProductIcon } from 'scenes/onboarding/productSelection/ProductSelection'
+import { getProductIcon } from 'scenes/onboarding/shared/utils'
 
-import { BillingFeatureType, BillingPlanType, BillingProductV2AddonType, BillingProductV2Type } from '~/types'
+import {
+    AvailableFeature,
+    BillingFeatureType,
+    BillingPlanType,
+    BillingProductV2AddonType,
+    BillingProductV2Type,
+} from '~/types'
 
-import { UnsubscribeSurveyModal } from './UnsubscribeSurveyModal'
 import { convertLargeNumberToWords, getProration } from './billing-utils'
 import { billingLogic } from './billingLogic'
 import { billingProductLogic } from './billingProductLogic'
+import { UnsubscribeSurveyModal } from './UnsubscribeSurveyModal'
 
 export function PlanIcon({
     feature,
@@ -125,6 +131,16 @@ export const PlanComparison = ({
         return null
     }
     const fullyFeaturedPlan = plans[plans.length - 1]
+
+    const productAnalyticsPlans = billing?.products?.find((product) => product.type === 'product_analytics')?.plans
+    const eventsRetentionOf = (plan?: BillingPlanType): BillingFeatureType | undefined =>
+        plan?.features?.find((feature) => feature.key === AvailableFeature.PRODUCT_ANALYTICS_DATA_RETENTION)
+    const freeEventsRetention = eventsRetentionOf(
+        productAnalyticsPlans?.find((plan) => !!plan.free_allocation && !plan.tiers)
+    )
+    const paidEventsRetention = eventsRetentionOf(productAnalyticsPlans?.at(-1))
+    const showEventsRetention =
+        product.type === 'platform_and_support' && !!freeEventsRetention && !!paidEventsRetention
 
     return (
         <table className="PlanComparison w-full table-fixed" ref={planComparisonRef}>
@@ -269,7 +285,9 @@ export const PlanComparison = ({
                     <tr
                         key={`tr-${feature.key}`}
                         className={clsx(
-                            i == fullyFeaturedPlan?.features?.length - 1 && !billing?.has_active_subscription
+                            i == fullyFeaturedPlan?.features?.length - 1 &&
+                                !showEventsRetention &&
+                                !billing?.has_active_subscription
                                 ? 'PlanTable__tr__border'
                                 : ''
                         )}
@@ -278,7 +296,9 @@ export const PlanComparison = ({
                             className={clsx(
                                 'PlanTable__th__feature',
                                 width && width < 600 && 'PlanTable__th__feature--reduced_padding',
-                                i == fullyFeaturedPlan?.features?.length - 1 && 'PlanTable__th__last-feature'
+                                i == fullyFeaturedPlan?.features?.length - 1 &&
+                                    !showEventsRetention &&
+                                    'PlanTable__th__last-feature'
                             )}
                         >
                             <Tooltip title={feature.description}>
@@ -305,6 +325,33 @@ export const PlanComparison = ({
                         ))}
                     </tr>
                 ))}
+                {showEventsRetention && (
+                    <tr className={clsx(!billing?.has_active_subscription && 'PlanTable__tr__border')}>
+                        <th
+                            className={clsx(
+                                'PlanTable__th__feature',
+                                width && width < 600 && 'PlanTable__th__feature--reduced_padding',
+                                'PlanTable__th__last-feature'
+                            )}
+                        >
+                            <Tooltip title="How far back your insights can query events. Older events aren't included in the results.">
+                                <span>Events data retention</span>
+                            </Tooltip>
+                        </th>
+                        {plans?.map((plan) => (
+                            <td key={`${plan.plan_key}-events-data-retention`}>
+                                <PlanIcon
+                                    feature={
+                                        plan.included_if === 'no_active_subscription'
+                                            ? freeEventsRetention
+                                            : paidEventsRetention
+                                    }
+                                    className="text-base"
+                                />
+                            </td>
+                        ))}
+                    </tr>
+                )}
                 {!billing?.has_active_subscription && !product.inclusion_only && (
                     <>
                         <tr>
@@ -332,6 +379,7 @@ export const PlanComparison = ({
                                                 <div className="flex items-center gap-x-2 my-2">
                                                     {getProductIcon(includedProduct.icon_key, {
                                                         className: 'text-2xl',
+                                                        productType: includedProduct.type,
                                                     })}
                                                     <Tooltip title={includedProduct.description}>
                                                         <span className="font-bold">{includedProduct.name}</span>
@@ -366,7 +414,7 @@ export const PlanComparison = ({
                                                     </th>
                                                     {includedPlans?.map((plan) => (
                                                         <React.Fragment key={`${plan.plan_key}-${feature.key}`}>
-                                                            {/* Some products don't have a free plan, so we need to pretend there is one 
+                                                            {/* Some products don't have a free plan, so we need to pretend there is one
                                                                         so the features line up in the correct columns in the UI. This is kind of 
                                                                         hacky because it assumes we only have 2 plans total, but it works for now.
                                                                     */}

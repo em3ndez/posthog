@@ -3,7 +3,7 @@ import { useActions, useValues } from 'kea'
 import { LemonBanner } from '@posthog/lemon-ui'
 
 import { ProfilePicture } from 'lib/lemon-ui/ProfilePicture'
-import { humanFriendlyDetailedTime } from 'lib/utils'
+import { humanFriendlyDetailedTime } from 'lib/utils/datetime'
 import { getApprovalActionDescription } from 'scenes/approvals/utils'
 
 import { ChangeRequestActions } from './ChangeRequestActions'
@@ -18,7 +18,7 @@ export function PendingChangeRequestBanner(props: ChangeRequestsLogicProps): JSX
         return null
     }
 
-    const actionDescription = getApprovalActionDescription(pendingChangeRequest.action_key)
+    const actionDescription = getApprovalActionDescription(pendingChangeRequest.action_key, props.context)
     const requesterName = pendingChangeRequest.created_by.first_name || pendingChangeRequest.created_by.email
 
     return (

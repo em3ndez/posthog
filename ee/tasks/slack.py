@@ -6,11 +6,12 @@ from django.conf import settings
 
 import structlog
 
-from posthog.models.exported_asset import ExportedAsset
 from posthog.models.integration import Integration, SlackIntegration
 from posthog.models.sharing_configuration import SharingConfiguration
 
-from ee.tasks.subscriptions.subscription_utils import generate_assets
+from products.exports.backend.models.exported_asset import ExportedAsset
+
+from ee.tasks.subscriptions.subscription_utils import DEBUG_PLACEHOLDER_IMAGE_URL, generate_assets
 
 logger = structlog.get_logger(__name__)
 
@@ -25,7 +26,7 @@ def _block_for_asset(asset: ExportedAsset) -> dict:
         alt_text = asset.insight.name or asset.insight.derived_name
 
     if settings.DEBUG:
-        image_url = "https://source.unsplash.com/random"
+        image_url = DEBUG_PLACEHOLDER_IMAGE_URL
 
     return {"type": "image", "image_url": image_url, "alt_text": alt_text}
 
@@ -69,6 +70,17 @@ def _handle_slack_event(event_payload: Any) -> None:
                 continue
 
             # With both the integration and the resource we are good to go!!
+
+            # Usage breadcrumb: this legacy Celery-backed image unfurl is believed superseded by the
+            # metadata-only products/slack_app unfurl. It renders a PNG via the EXPORTS Celery queue,
+            # which has no in-container Chromium (removed) and no BROWSERLESS_CDP_URL — so a real hit
+            # here both proves the path is live AND would fail to render. Logged at warning so it's
+            # impossible to miss while we decide whether to keep/retire it.
+            logger.warning(
+                "slack_legacy_image_unfurl.invoked",
+                team_id=team_id,
+                sharing_configuration_id=sharing_config.id,
+            )
 
             insights, assets = generate_assets(sharing_config, 1)
 

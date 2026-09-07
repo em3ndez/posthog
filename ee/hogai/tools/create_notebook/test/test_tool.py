@@ -1,12 +1,17 @@
 from posthog.test.base import BaseTest
+from unittest.mock import patch
 
 from asgiref.sync import async_to_sync
 from langchain_core.runnables import RunnableConfig
+from parameterized import parameterized
+
+from products.notebooks.backend.models import Notebook
+from products.posthog_ai.backend.models.assistant import Conversation
 
 from ee.hogai.context import AssistantContextManager
+from ee.hogai.context.notebook.prompts import LEGACY_CELL_GUIDANCE, SQL_V2_CELL_GUIDANCE
 from ee.hogai.tools.create_notebook.tool import CreateNotebookTool
 from ee.hogai.utils.types.base import AssistantState, NodePath
-from ee.models.assistant import Conversation
 
 
 class TestCreateNotebookTool(BaseTest):
@@ -25,6 +30,30 @@ class TestCreateNotebookTool(BaseTest):
             context_manager=self.context_manager,
             node_path=self.node_path,
         )
+
+    def test_description_includes_object_widget_views(self) -> None:
+        assert "FeatureFlag" in self.tool.description
+        assert "summary: Show the flag status" in self.tool.description
+        assert "editor: Edit the flag status" in self.tool.description
+        assert "Cohort" in self.tool.description
+
+    @parameterized.expand(
+        [
+            ("sql_v2 enabled", True, SQL_V2_CELL_GUIDANCE, LEGACY_CELL_GUIDANCE),
+            ("sql_v2 disabled", False, LEGACY_CELL_GUIDANCE, SQL_V2_CELL_GUIDANCE),
+        ]
+    )
+    def test_description_offers_only_runnable_cell_tags(
+        self, _name: str, sql_v2_enabled: bool, expected: str, unexpected: str
+    ) -> None:
+        with patch(
+            "products.notebooks.backend.facade.api.is_sql_v2_enabled",
+            return_value=sql_v2_enabled,
+        ):
+            tool = async_to_sync(CreateNotebookTool.create_tool_class)(team=self.team, user=self.user)
+
+        assert expected in tool.description
+        assert unexpected not in tool.description
 
     def test_returns_error_when_both_content_and_draft_content_provided(self):
         result, artifact = async_to_sync(self.tool._arun_impl)(
@@ -85,7 +114,7 @@ class TestCreateNotebookTool(BaseTest):
             title="Original Notebook",
             content="# Original",
         )
-        original_artifact_id = create_artifact.messages[1].content.split("artifact_id: ")[1]
+        original_artifact_id = create_artifact.messages[1].content.split("artifact_id: ")[1].split(".")[0]
 
         update_result, update_artifact = async_to_sync(self.tool._arun_impl)(
             title="Updated Notebook",
@@ -98,3 +127,72 @@ class TestCreateNotebookTool(BaseTest):
         tool_call_message = update_artifact.messages[1]
         assert "has been updated" in tool_call_message.content
         assert "Failed" not in tool_call_message.content
+
+    def test_transient_notebook_message_mentions_transient(self):
+        result, artifact = async_to_sync(self.tool._arun_impl)(
+            title="Test Notebook",
+            content="# Hello World",
+        )
+
+        assert artifact is not None
+        tool_call_message = artifact.messages[1]
+        assert "transient" in tool_call_message.content
+        assert Notebook.objects.filter(team=self.team).count() == 0
+
+    def test_save_to_notebook_creates_real_notebook(self):
+        result, artifact = async_to_sync(self.tool._arun_impl)(
+            title="Saved Notebook",
+            content="# Hello World",
+            save_to_notebook=True,
+        )
+
+        assert artifact is not None
+        tool_call_message = artifact.messages[1]
+        assert "saved" in tool_call_message.content.lower()
+        assert "/notebooks/" in tool_call_message.content
+
+        notebooks = Notebook.objects.filter(team=self.team)
+        assert notebooks.count() == 1
+        notebook = notebooks.first()
+        assert notebook.title == "Saved Notebook"
+        assert notebook.content is not None
+        assert notebook.content["type"] == "doc"
+
+    def test_save_to_notebook_uses_artifact_short_id(self):
+        result, artifact = async_to_sync(self.tool._arun_impl)(
+            title="Linked Notebook",
+            content="# Hello",
+            save_to_notebook=True,
+        )
+
+        assert artifact is not None
+        from products.posthog_ai.backend.models.assistant import AgentArtifact
+
+        agent_artifact = AgentArtifact.objects.filter(team=self.team).last()
+        notebook = Notebook.objects.filter(team=self.team).first()
+        assert notebook is not None
+        assert agent_artifact is not None
+        assert notebook.short_id == agent_artifact.short_id
+
+    def test_update_already_saved_notebook_auto_updates_db(self):
+        # First create and save
+        _, create_artifact = async_to_sync(self.tool._arun_impl)(
+            title="Original",
+            content="# Original",
+            save_to_notebook=True,
+        )
+        short_id = create_artifact.messages[1].content.split("short_id: ")[1].split(".")[0]
+
+        # Now update without save_to_notebook -- should auto-update because already saved
+        _, update_artifact = async_to_sync(self.tool._arun_impl)(
+            title="Updated",
+            content="# Updated Content",
+            artifact_id=short_id,
+        )
+
+        assert update_artifact is not None
+        tool_call_message = update_artifact.messages[1]
+        assert "updated" in tool_call_message.content.lower()
+
+        notebook = Notebook.objects.get(team=self.team, short_id=short_id)
+        assert notebook.title == "Updated"

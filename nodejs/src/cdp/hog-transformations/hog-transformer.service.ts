@@ -1,87 +1,35 @@
-import { Counter, Gauge, Histogram } from 'prom-client'
+import { Counter, Gauge } from 'prom-client'
 
-import { PluginEvent } from '@posthog/plugin-scaffold'
-
-import { RedisV2, createRedisV2PoolFromConfig } from '~/common/redis/redis-v2'
+import { HogTransformationResult, HogTransformer } from '~/common/hog-transformations/hog-transformer.interface'
+import { IngestionOutputs } from '~/common/outputs/ingestion-outputs'
 import { instrumentFn } from '~/common/tracing/tracing-utils'
+import { PostgresRouter } from '~/common/utils/db/postgres'
+import { GeoIPService, GeoIp } from '~/common/utils/geoip'
+import { logger } from '~/common/utils/logger'
+import { PubSub } from '~/common/utils/pubsub'
+import { PluginEvent } from '~/plugin-scaffold'
 
 import { CyclotronJobInvocationResult, HogFunctionInvocationGlobals, HogFunctionType } from '../../cdp/types'
 import { isLegacyPluginHogFunction } from '../../cdp/utils'
-import { Hub } from '../../types'
-import { GeoIp } from '../../utils/geoip'
-import { logger } from '../../utils/logger'
+import type { CommonConfig } from '../../common/config'
 import { HogExecutorService } from '../services/hog-executor.service'
+import { HogInputsService } from '../services/hog-inputs.service'
 import { LegacyPluginExecutorService } from '../services/legacy-plugin-executor.service'
 import { HogFunctionManagerService } from '../services/managers/hog-function-manager.service'
-import { HogFunctionMonitoringService } from '../services/monitoring/hog-function-monitoring.service'
-import { HogWatcherService, HogWatcherState } from '../services/monitoring/hog-watcher.service'
+import { IntegrationManagerService } from '../services/managers/integration-manager.service'
+import { HogFunctionMonitoringService, MonitoringOutput } from '../services/monitoring/hog-function-monitoring.service'
+import { EncryptedFields } from '../utils/encryption-utils'
 import { convertToHogFunctionFilterGlobal, filterFunctionInstrumented } from '../utils/hog-function-filtering'
 import { createInvocation } from '../utils/invocation-utils'
+import { RustVmExecutor } from './rust-vm-executor'
 import { getTransformationFunctions } from './transformation-functions'
 
-/**
- * Narrowed Hub type for HogTransformerService.
- * This includes all fields needed by HogTransformerService and its dependencies:
- * - HogFunctionManagerService
- * - HogExecutorService
- * - LegacyPluginExecutorService
- * - HogFunctionMonitoringService
- * - HogWatcherService
- * - createRedisV2Pool
- */
-export type HogTransformerHub = Pick<
-    Hub,
-    // Direct usage in HogTransformerService
-    | 'CDP_HOG_WATCHER_SAMPLE_RATE'
-    | 'geoipService'
-    | 'SITE_URL'
-    // Redis pool config
-    | 'REDIS_URL'
-    | 'REDIS_POOL_MIN_SIZE'
-    | 'REDIS_POOL_MAX_SIZE'
-    | 'CDP_REDIS_HOST'
-    | 'CDP_REDIS_PORT'
-    | 'CDP_REDIS_PASSWORD'
-    // HogFunctionManagerService
-    | 'postgres'
-    | 'pubSub'
-    | 'encryptedFields'
-    // HogExecutorService + EmailService
-    | 'CDP_WATCHER_HOG_COST_TIMING_UPPER_MS'
-    | 'CDP_GOOGLE_ADWORDS_DEVELOPER_TOKEN'
-    | 'CDP_FETCH_BACKOFF_BASE_MS'
-    | 'CDP_FETCH_BACKOFF_MAX_MS'
-    | 'CDP_FETCH_RETRIES'
-    | 'integrationManager'
-    | 'ENCRYPTION_SALT_KEYS'
-    | 'SES_ACCESS_KEY_ID'
-    | 'SES_SECRET_ACCESS_KEY'
-    | 'SES_REGION'
-    | 'SES_ENDPOINT'
-    // LegacyPluginExecutorService
-    | 'postgres'
-    // HogFunctionMonitoringService
-    | 'kafkaProducer'
-    | 'teamManager'
-    | 'internalCaptureService'
-    | 'HOG_FUNCTION_MONITORING_APP_METRICS_TOPIC'
-    | 'HOG_FUNCTION_MONITORING_LOG_ENTRIES_TOPIC'
-    // HogWatcherService
-    | 'CDP_WATCHER_HOG_COST_TIMING_LOWER_MS'
-    | 'CDP_WATCHER_HOG_COST_TIMING'
-    | 'CDP_WATCHER_ASYNC_COST_TIMING_LOWER_MS'
-    | 'CDP_WATCHER_ASYNC_COST_TIMING_UPPER_MS'
-    | 'CDP_WATCHER_ASYNC_COST_TIMING'
-    | 'CDP_WATCHER_SEND_EVENTS'
-    | 'CDP_WATCHER_BUCKET_SIZE'
-    | 'CDP_WATCHER_REFILL_RATE'
-    | 'CDP_WATCHER_TTL'
-    | 'CDP_WATCHER_AUTOMATICALLY_DISABLE_FUNCTIONS'
-    | 'CDP_WATCHER_THRESHOLD_DEGRADED'
-    | 'CDP_WATCHER_STATE_LOCK_TTL'
-    | 'CDP_WATCHER_OBSERVE_RESULTS_BUFFER_TIME_MS'
-    | 'CDP_WATCHER_OBSERVE_RESULTS_BUFFER_MAX_RESULTS'
->
+export interface HogTransformerConfig {
+    siteUrl: string
+    hogRustVmExecutionEnabled: boolean
+    hogRustVmBatchExecutionEnabled: boolean
+    mmdbFileLocation: string
+}
 
 export const hogTransformationDroppedEvents = new Counter({
     name: 'hog_transformation_dropped_events',
@@ -105,63 +53,44 @@ export const hogTransformationCompleted = new Counter({
     labelNames: ['type'],
 })
 
-export const hogWatcherLatency = new Histogram({
-    name: 'hog_watcher_latency_seconds',
-    help: 'Time spent in HogWatcher operations in seconds during ingestion',
-    labelNames: ['operation'],
-})
-
 export const hogTransformationPendingInvocationResults = new Gauge({
     name: 'hog_transformation_pending_invocation_results',
     help: 'Number of invocation results accumulated and waiting to be processed. High values indicate memory accumulation.',
 })
 
-export interface TransformationResult {
+export const hogTransformationUnexpectedErrors = new Counter({
+    name: 'hog_transformation_unexpected_errors_total',
+    help: 'Number of unexpected errors during transformation execution. Any occurrence should trigger an alert as the transformation is skipped.',
+})
+
+export interface TransformationResult extends HogTransformationResult {
     event: PluginEvent | null
     invocationResults: CyclotronJobInvocationResult[]
 }
 
-export class HogTransformerService {
-    private hogExecutor: HogExecutorService
-    private hogFunctionManager: HogFunctionManagerService
-    private hub: HogTransformerHub
-    private pluginExecutor: LegacyPluginExecutorService
-    private hogFunctionMonitoringService: HogFunctionMonitoringService
-    private hogWatcher: HogWatcherService
-    private redis: RedisV2
-    private cachedStates: Record<string, HogWatcherState> = {}
+export class HogTransformerService implements HogTransformer {
     private invocationResults: CyclotronJobInvocationResult[] = []
     private cachedGeoIp?: GeoIp
     private cachedTransformationFunctions?: ReturnType<typeof getTransformationFunctions>
+    private rustVmExecutor: RustVmExecutor | null
 
-    constructor(hub: HogTransformerHub) {
-        this.hub = hub
-        // Hog transformer uses CDP Redis instance with fallback to default
-        this.redis = createRedisV2PoolFromConfig({
-            connection: hub.CDP_REDIS_HOST
-                ? {
-                      url: hub.CDP_REDIS_HOST,
-                      options: { port: hub.CDP_REDIS_PORT, password: hub.CDP_REDIS_PASSWORD },
-                      name: 'hog-transformer-redis',
-                  }
-                : { url: hub.REDIS_URL, name: 'hog-transformer-redis-fallback' },
-            poolMinSize: hub.REDIS_POOL_MIN_SIZE,
-            poolMaxSize: hub.REDIS_POOL_MAX_SIZE,
-        })
-        this.hogFunctionManager = new HogFunctionManagerService(hub)
-        this.hogExecutor = new HogExecutorService(hub)
-        this.pluginExecutor = new LegacyPluginExecutorService(hub.postgres, hub.geoipService)
-        this.hogFunctionMonitoringService = new HogFunctionMonitoringService(hub)
-        this.hogWatcher = new HogWatcherService(hub, this.redis)
+    constructor(
+        private hogFunctionManager: HogFunctionManagerService,
+        private hogExecutor: HogExecutorService,
+        private hogFunctionMonitoringService: HogFunctionMonitoringService,
+        private pluginExecutor: LegacyPluginExecutorService,
+        private geoipService: GeoIPService,
+        private config: HogTransformerConfig
+    ) {
+        this.rustVmExecutor = config.hogRustVmExecutionEnabled
+            ? new RustVmExecutor({ mmdbPath: config.mmdbFileLocation })
+            : null
     }
 
     public async start(): Promise<void> {}
 
     public async stop(): Promise<void> {
         await this.processInvocationResults()
-        await this.redis.useClient({ name: 'cleanup' }, async (client) => {
-            await client.quit()
-        })
     }
 
     public async processInvocationResults(): Promise<void> {
@@ -169,24 +98,23 @@ export class HogTransformerService {
         this.invocationResults = []
         hogTransformationPendingInvocationResults.set(0)
 
-        const shouldRunHogWatcher = Math.random() < this.hub.CDP_HOG_WATCHER_SAMPLE_RATE
+        this.hogFunctionMonitoringService.queueInvocationResults(results)
 
-        await Promise.allSettled([
-            this.hogFunctionMonitoringService
-                .queueInvocationResults(results)
-                .then(() => this.hogFunctionMonitoringService.flush()),
+        await this.hogFunctionMonitoringService.flush()
+    }
 
-            shouldRunHogWatcher
-                ? this.hogWatcher.observeResults(results).catch((error) => {
-                      logger.warn('⚠️', 'HogWatcher observeResults failed', { error })
-                  })
-                : Promise.resolve(),
-        ])
+    public async prefetchHogFunctionsForTeams(teamIds: number[]): Promise<void> {
+        // Warm the by-team and by-id loaders directly, skipping the per-team assembly and sort
+        // that getHogFunctionsForTeams would do and the event path redoes anyway.
+        const idsByTeam = await this.hogFunctionManager.getHogFunctionIdsForTeams(teamIds, ['transformation'], {
+            flush: true,
+        })
+        await this.hogFunctionManager.getHogFunctions(Object.values(idsByTeam).flat(), { flush: true })
     }
 
     private async getTransformationFunctions() {
         if (!this.cachedTransformationFunctions) {
-            this.cachedGeoIp = await this.hub.geoipService.get()
+            this.cachedGeoIp = await this.geoipService.get()
             this.cachedTransformationFunctions = getTransformationFunctions(this.cachedGeoIp)
         }
         return this.cachedTransformationFunctions
@@ -197,14 +125,14 @@ export class HogTransformerService {
             project: {
                 id: event.team_id,
                 name: '',
-                url: this.hub.SITE_URL,
+                url: this.config.siteUrl,
             },
             event: {
                 uuid: event.uuid,
                 event: event.event,
                 distinct_id: event.distinct_id,
                 properties: event.properties || {},
-                elements_chain: event.properties?.elements_chain || '',
+                elements_chain: event.properties?.$elements_chain || '',
                 timestamp: event.timestamp || '',
                 url: event.properties?.$current_url || '',
             },
@@ -250,39 +178,11 @@ export class HogTransformerService {
         }
 
         const results: CyclotronJobInvocationResult[] = []
-        const transformationsSucceeded: string[] = []
-        const transformationsFailed: string[] = []
-        const transformationsSkipped: string[] = []
-
-        const shouldRunHogWatcher = Math.random() < this.hub.CDP_HOG_WATCHER_SAMPLE_RATE
 
         // Create globals once and update the event properties after each transformation
         const globals = this.createInvocationGlobals(event)
 
         for (const hogFunction of teamHogFunctions) {
-            // Check if function is in a degraded state, but only if hogwatcher is enabled
-            if (shouldRunHogWatcher) {
-                const functionState = this.cachedStates[hogFunction.id]
-
-                // If the function is in a degraded state, skip it
-                if (functionState && functionState === HogWatcherState.disabled) {
-                    this.hogFunctionMonitoringService.queueAppMetric(
-                        {
-                            team_id: event.team_id,
-                            app_source_id: hogFunction.id,
-                            metric_kind: 'failure',
-                            metric_name: 'disabled_permanently',
-                            count: 1,
-                        },
-                        'hog_function'
-                    )
-                    continue
-                }
-            }
-
-            // Create identifier after the disabled check passes to avoid string allocation for skipped functions
-            const transformationIdentifier = `${hogFunction.name} (${hogFunction.id})`
-
             // Create filterGlobals for each iteration - it references globals.event.properties
             // which gets updated after each successful transformation
             const filterGlobals = convertToHogFunctionFilterGlobal(globals)
@@ -300,17 +200,36 @@ export class HogTransformerService {
                 this.hogFunctionMonitoringService.queueLogs(filterResults.logs, 'hog_function')
 
                 if (!filterResults.match) {
-                    transformationsSkipped.push(transformationIdentifier)
                     continue
                 }
             }
 
-            const result = await this.executeHogFunction(hogFunction, globals)
+            let result: CyclotronJobInvocationResult
+            try {
+                result = await this.executeHogFunction(hogFunction, globals)
+            } catch (err) {
+                hogTransformationUnexpectedErrors.inc()
+                logger.error('⚠️', 'Unexpected error executing transformation', {
+                    function_id: hogFunction.id,
+                    team_id: event.team_id,
+                    error: String(err),
+                })
+                this.hogFunctionMonitoringService.queueAppMetric(
+                    {
+                        team_id: event.team_id,
+                        app_source_id: hogFunction.id,
+                        metric_kind: 'failure',
+                        metric_name: 'failed',
+                        count: 1,
+                    },
+                    'hog_function'
+                )
+                continue
+            }
 
             results.push(result)
 
             if (result.error) {
-                transformationsFailed.push(transformationIdentifier)
                 continue
             }
 
@@ -326,10 +245,10 @@ export class HogTransformerService {
                     },
                     'hog_function'
                 )
-                transformationsFailed.push(transformationIdentifier)
                 return {
                     event: null,
                     invocationResults: results,
+                    droppedBy: { id: hogFunction.id, name: hogFunction.name },
                 }
             }
 
@@ -345,7 +264,6 @@ export class HogTransformerService {
                 logger.error('⚠️', 'Invalid transformation result - missing or invalid properties', {
                     function_id: hogFunction.id,
                 })
-                transformationsFailed.push(transformationIdentifier)
                 continue
             }
 
@@ -358,7 +276,6 @@ export class HogTransformerService {
                         function_id: hogFunction.id,
                         event: transformedEvent.event,
                     })
-                    transformationsFailed.push(transformationIdentifier)
                     continue
                 }
                 event.event = transformedEvent.event
@@ -370,7 +287,6 @@ export class HogTransformerService {
                         function_id: hogFunction.id,
                         distinct_id: transformedEvent.distinct_id,
                     })
-                    transformationsFailed.push(transformationIdentifier)
                     continue
                 }
                 event.distinct_id = transformedEvent.distinct_id
@@ -380,26 +296,6 @@ export class HogTransformerService {
             globals.event.properties = event.properties
             globals.event.event = event.event
             globals.event.distinct_id = event.distinct_id
-
-            transformationsSucceeded.push(transformationIdentifier)
-        }
-
-        // Use direct property assignment instead of spreading to avoid copying the entire object
-        if (
-            transformationsFailed.length > 0 ||
-            transformationsSkipped.length > 0 ||
-            transformationsSucceeded.length > 0
-        ) {
-            event.properties = event.properties || {}
-            if (transformationsFailed.length > 0) {
-                event.properties.$transformations_failed = transformationsFailed
-            }
-            if (transformationsSkipped.length > 0) {
-                event.properties.$transformations_skipped = transformationsSkipped
-            }
-            if (transformationsSucceeded.length > 0) {
-                event.properties.$transformations_succeeded = transformationsSucceeded
-            }
         }
 
         return {
@@ -409,7 +305,7 @@ export class HogTransformerService {
     }
 
     public transformEvent(event: PluginEvent, teamHogFunctions: HogFunctionType[]): Promise<TransformationResult> {
-        // Sanitize transform event properties
+        // These properties are retired, so drop any a client sends rather than letting them through
         if (event.properties) {
             for (const key of ['$transformations_failed', '$transformations_skipped', '$transformations_succeeded']) {
                 if (key in event.properties) {
@@ -430,35 +326,73 @@ export class HogTransformerService {
 
         const invocation = createInvocation(globalsWithInputs, hogFunction)
 
-        const result = isLegacyPluginHogFunction(hogFunction)
-            ? await this.pluginExecutor.execute(invocation)
-            : await this.hogExecutor.execute(invocation, {
-                  functions: transformationFunctions,
-                  asyncFunctionsNames: [],
-              })
-        return result
-    }
-
-    public async fetchAndCacheHogFunctionStates(functionIds: string[]): Promise<void> {
-        const timer = hogWatcherLatency.startTimer({ operation: 'getStates' })
-        const states = await this.hogWatcher.getEffectiveStates(functionIds)
-        timer()
-
-        // Save only the state enum value to cache
-        Object.entries(states).forEach(([id, state]) => {
-            this.cachedStates[id] = state.state
-        })
-    }
-
-    public clearHogFunctionStates(functionIds?: string[]): void {
-        if (functionIds) {
-            // Clear specific function states
-            functionIds.forEach((id) => {
-                delete this.cachedStates[id]
-            })
-        } else {
-            // Clear all states if no IDs provided
-            this.cachedStates = {}
+        if (isLegacyPluginHogFunction(hogFunction)) {
+            return await this.pluginExecutor.execute(invocation)
         }
+
+        if (this.rustVmExecutor) {
+            const sensitiveValues = this.hogExecutor.getSensitiveValues(hogFunction, globalsWithInputs.inputs)
+            const rustResult = this.config.hogRustVmBatchExecutionEnabled
+                ? await this.rustVmExecutor.executeBatched(invocation, sensitiveValues)
+                : this.rustVmExecutor.execute(invocation, sensitiveValues)
+            // Null means the Rust VM can't run this program (addon not built, unsupported host
+            // function): fall through to the Node VM.
+            if (rustResult) {
+                return rustResult
+            }
+        }
+
+        return await this.hogExecutor.execute(invocation, { functions: transformationFunctions })
     }
+}
+
+/** Config read by createHogTransformerService when running inside ingestion. */
+export type HogTransformerServiceConfig = Pick<
+    CommonConfig,
+    | 'SITE_URL'
+    | 'CDP_HOG_RUST_VM_EXECUTION_ENABLED'
+    | 'CDP_HOG_RUST_VM_BATCH_EXECUTION_ENABLED'
+    | 'MMDB_FILE_LOCATION'
+    | 'TRANSFORMATIONS_HOG_TIMEOUT_MS'
+>
+
+export interface HogTransformerServiceDeps {
+    geoipService: GeoIPService
+    postgres: PostgresRouter
+    pubSub: PubSub
+    encryptedFields: EncryptedFields
+    integrationManager: IntegrationManagerService
+    monitoringOutputs: IngestionOutputs<MonitoringOutput>
+}
+
+/**
+ * Keep this factory's config and dependencies intentionally minimal. Transformations run only the synchronous Hog
+ * execution core and must not inherit Redis, fetch, email, push, or other CDP delivery infrastructure just to satisfy
+ * a shared service constructor. Anything that needs those belongs in HogExecutorAsyncService, not in HogExecutorService.
+ */
+export function createHogTransformerService(
+    config: HogTransformerServiceConfig,
+    deps: HogTransformerServiceDeps
+): HogTransformerService {
+    const hogFunctionManager = new HogFunctionManagerService(deps.postgres, deps.pubSub, deps.encryptedFields)
+    const hogInputsService = new HogInputsService(deps.integrationManager, undefined, deps.encryptedFields)
+    const hogExecutor = new HogExecutorService(
+        { executionTimeoutMs: config.TRANSFORMATIONS_HOG_TIMEOUT_MS },
+        hogInputsService
+    )
+    const pluginExecutor = new LegacyPluginExecutorService(deps.postgres, deps.geoipService)
+    const hogFunctionMonitoringService = new HogFunctionMonitoringService(deps.monitoringOutputs)
+    return new HogTransformerService(
+        hogFunctionManager,
+        hogExecutor,
+        hogFunctionMonitoringService,
+        pluginExecutor,
+        deps.geoipService,
+        {
+            siteUrl: config.SITE_URL,
+            hogRustVmExecutionEnabled: config.CDP_HOG_RUST_VM_EXECUTION_ENABLED,
+            hogRustVmBatchExecutionEnabled: config.CDP_HOG_RUST_VM_BATCH_EXECUTION_ENABLED,
+            mmdbFileLocation: config.MMDB_FILE_LOCATION,
+        }
+    )
 }

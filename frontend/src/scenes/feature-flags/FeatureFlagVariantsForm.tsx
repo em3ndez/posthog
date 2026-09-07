@@ -8,14 +8,15 @@ import ViewRecordingsPlaylistButton from 'lib/components/ViewRecordingButton/Vie
 import { LemonField } from 'lib/lemon-ui/LemonField'
 import { Lettermark, LettermarkColor } from 'lib/lemon-ui/Lettermark'
 import { Link } from 'lib/lemon-ui/Link'
-import { alphabet } from 'lib/utils'
+import { alphabet } from 'lib/utils/strings'
 import { JSONEditorInput } from 'scenes/feature-flags/JSONEditorInput'
+import { PercentageInput } from 'scenes/feature-flags/PercentageInput'
 import { getSurveyForFeatureFlagVariant } from 'scenes/surveys/utils'
 import { urls } from 'scenes/urls'
 
 import { FeatureFlagGroupType, MultivariateFlagVariant, Survey } from '~/types'
 
-import { VariantError, getRecordingFilterForFlagVariant } from './featureFlagLogic'
+import { VariantError, getRecordingFilterForFlagVariant, validateVariantRolloutSum } from './featureFlagLogic'
 
 export interface FeatureFlagVariantsFormProps {
     variants: MultivariateFlagVariant[]
@@ -69,8 +70,8 @@ export function FeatureFlagVariantsForm({
     variantErrors,
     surveys,
 }: FeatureFlagVariantsFormProps): JSX.Element {
-    const variantRolloutSum = variants.reduce((sum, variant) => sum + (variant.rollout_percentage || 0), 0)
-    const areVariantRolloutsValid = variantRolloutSum === 100
+    const rolloutSumError = validateVariantRolloutSum(variants)
+    const areVariantRolloutsValid = !rolloutSumError
 
     const experimentLink = experimentId ? (
         <Link target="_blank" to={urls.experiment(experimentId)}>
@@ -149,7 +150,7 @@ export function FeatureFlagVariantsForm({
                                     <span className="text-secondary">No payload associated with this variant</span>
                                 )}
                             </div>
-                            <div>{variant.rollout_percentage}%</div>
+                            <div className="tabular-nums">{variant.rollout_percentage}%</div>
                             {(flagKey || onGetFeedback) && (
                                 <div className="col-span-2 flex gap-2 items-start">
                                     {flagKey && (
@@ -254,22 +255,14 @@ export function FeatureFlagVariantsForm({
                     </div>
                     <div className="col-span-3">
                         <div>
-                            <LemonInput
-                                type="number"
-                                min={0}
-                                max={100}
-                                value={variant.rollout_percentage || 0}
-                                onChange={(changedValue) => {
-                                    const valueInt =
-                                        changedValue !== undefined && !isNaN(Number(changedValue))
-                                            ? parseInt(changedValue.toString())
-                                            : 0
-
-                                    onVariantChange?.(index, 'rollout_percentage', valueInt)
-                                }}
-                                suffix={<span>%</span>}
-                                data-attr="feature-flag-variant-rollout-percentage-input"
-                            />
+                            <LemonField.Pure error={!areVariantRolloutsValid}>
+                                <PercentageInput
+                                    value={variant.rollout_percentage}
+                                    onChange={(value) => onVariantChange?.(index, 'rollout_percentage', value)}
+                                    step={0.01}
+                                    data-attr="feature-flag-variant-rollout-percentage-input"
+                                />
+                            </LemonField.Pure>
                             {filterGroups.filter((group) => group.variant === variant.key).length > 0 && (
                                 <span className="text-secondary text-xs">
                                     Overridden by{' '}
@@ -308,11 +301,7 @@ export function FeatureFlagVariantsForm({
                     </div>
                 </div>
             ))}
-            {variants.length > 0 && !areVariantRolloutsValid && (
-                <p className="text-danger">
-                    Percentage rollouts for variants must sum to 100 (currently {variantRolloutSum}).
-                </p>
-            )}
+            {rolloutSumError && <p className="text-danger">{rolloutSumError}</p>}
             {onAddVariant && (
                 <LemonButton
                     type="secondary"

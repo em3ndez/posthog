@@ -1,19 +1,14 @@
+import { waitFor } from '@testing-library/react'
 import { router } from 'kea-router'
 import { expectLogic } from 'kea-test-utils'
+
+import api, { CountedPaginatedResponse } from 'lib/api'
 
 import { useMocks } from '~/mocks/jest'
 import { ProductIntentContext, ProductKey } from '~/queries/schema/schema-general'
 import { initKeaTests } from '~/test/init'
-import {
-    AccessControlLevel,
-    Survey,
-    SurveyQuestionDescriptionContentType,
-    SurveyQuestionType,
-    SurveySchedule,
-    SurveyType,
-} from '~/types'
+import { AccessControlLevel, Survey, SurveySchedule, SurveyType } from '~/types'
 
-import { SURVEY_CREATED_SOURCE, SURVEY_RATING_SCALE, SurveyTemplate, SurveyTemplateType } from './constants'
 import { surveysLogic } from './surveysLogic'
 
 const createTestSurvey = (id: string, name: string): Survey => ({
@@ -40,51 +35,51 @@ const createTestSurvey = (id: string, name: string): Survey => ({
     user_access_level: AccessControlLevel.Editor,
 })
 
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+    let resolve!: (value: T) => void
+    const promise = new Promise<T>((promiseResolve) => {
+        resolve = promiseResolve
+    })
+    return { promise, resolve }
+}
+
 describe('surveysLogic', () => {
     describe('search functionality', () => {
         let logic: ReturnType<typeof surveysLogic.build>
+        let surveyListRequests: URL[]
+        let responseCountRequests: URL[]
 
         beforeEach(async () => {
             initKeaTests()
+            surveyListRequests = []
+            responseCountRequests = []
             logic = surveysLogic()
-            logic.mount()
 
             useMocks({
                 get: {
-                    '/api/projects/:team/surveys/': () => [200, { count: 0, results: [], next: null, previous: null }],
-                    '/api/projects/:team/surveys/responses_count': () => [200, {}],
+                    '/api/projects/:team/surveys/': ({ request }) => {
+                        surveyListRequests.push(new URL(request.url))
+                        return [200, { count: 0, results: [], next: null, previous: null }]
+                    },
+                    '/api/projects/:team/surveys/responses_count': ({ request }) => {
+                        const url = new URL(request.url)
+                        responseCountRequests.push(url)
+                        const requestedSurveyIds = url.searchParams.get('survey_ids')?.split(',') ?? []
+
+                        return [200, requestedSurveyIds.includes('survey-1') ? { 'survey-1': 12 } : {}]
+                    },
                 },
             })
 
+            logic.mount()
             await expectLogic(logic).toFinishAllListeners()
         })
 
-        it('performs frontend search immediately', async () => {
-            await expectLogic(logic, () => {
-                logic.actions.loadSurveysSuccess({
-                    surveys: [
-                        createTestSurvey('1', 'Test Survey 1'),
-                        createTestSurvey('2', 'Another Survey'),
-                        createTestSurvey('3', 'Test Survey 3'),
-                    ],
-                    surveysCount: 150,
-                    searchSurveys: [],
-                    searchSurveysCount: 0,
-                })
-                logic.actions.setSearchTerm('Test')
-            }).toMatchValues({
-                searchedSurveys: expect.arrayContaining([
-                    expect.objectContaining({ id: '1' }),
-                    expect.objectContaining({ id: '3' }),
-                ]),
-            })
-        })
-
-        it('triggers backend search after debounce for large datasets', async () => {
+        it('triggers backend search after debounce', async () => {
             await expectLogic(logic, () => {
                 logic.actions.loadSurveysSuccess({
                     surveys: [createTestSurvey('1', 'Test Survey')],
-                    surveysCount: 150, // > SURVEY_PAGE_SIZE
+                    surveysCount: 150,
                     searchSurveys: [],
                     searchSurveysCount: 0,
                 })
@@ -92,24 +87,11 @@ describe('surveysLogic', () => {
             })
                 .delay(400)
                 .toDispatchActions(['loadSearchResults'])
+                // let the search request settle so its success action doesn't land after unmount
+                .toFinishAllListeners()
         })
 
-        it('performs only frontend search for small datasets', async () => {
-            await expectLogic(logic, () => {
-                logic.actions.loadSurveysSuccess({
-                    surveys: [createTestSurvey('1', 'Test Survey')],
-                    surveysCount: 50, // < SURVEY_PAGE_SIZE
-                    searchSurveys: [],
-                    searchSurveysCount: 0,
-                })
-                logic.actions.setSearchTerm('Test')
-            })
-                .delay(400)
-                .toNotHaveDispatchedActions(['loadSearchResults'])
-        })
-
-        it('merges and deduplicates frontend and backend results', async () => {
-            // Set initial state with frontend results and trigger search
+        it('searchedSurveys reflects backend results once loaded', async () => {
             await expectLogic(logic, () => {
                 logic.actions.loadSurveysSuccess({
                     surveys: [createTestSurvey('1', 'Test Survey'), createTestSurvey('2', 'Another Test')],
@@ -118,26 +100,14 @@ describe('surveysLogic', () => {
                     searchSurveysCount: 0,
                 })
                 logic.actions.setSearchTerm('Test')
-            }).toMatchValues({
-                // Verify frontend search results first
-                searchedSurveys: expect.arrayContaining([
-                    expect.objectContaining({ id: '1' }),
-                    expect.objectContaining({ id: '2' }),
-                ]),
-            })
-
-            // Then simulate backend search completion
-            await expectLogic(logic, () => {
                 logic.actions.loadSearchResultsSuccess({
                     ...logic.values.data,
                     searchSurveys: [createTestSurvey('1', 'Test Survey'), createTestSurvey('3', 'New Test')],
                     searchSurveysCount: 2,
                 })
             }).toMatchValues({
-                // Verify merged results
                 searchedSurveys: expect.arrayContaining([
                     expect.objectContaining({ id: '1' }),
-                    expect.objectContaining({ id: '2' }),
                     expect.objectContaining({ id: '3' }),
                 ]),
             })
@@ -188,6 +158,144 @@ describe('surveysLogic', () => {
                 hasNextPage: false,
             })
         })
+
+        it('filters on the server before paginating', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.setSurveysFilters({
+                    created_by: 42,
+                    status: 'running',
+                    type: SurveyType.Widget,
+                })
+            }).toFinishAllListeners()
+
+            const params = surveyListRequests.at(-1)?.searchParams
+            expect(params?.get('archived')).toEqual('false')
+            expect(params?.get('created_by')).toEqual('42')
+            expect(params?.get('status')).toEqual('running')
+            expect(params?.get('type')).toEqual(SurveyType.Widget)
+            expect(params?.get('limit')).toEqual('100')
+        })
+
+        it('keeps the latest filtered results when requests finish out of order', async () => {
+            const olderRequest = deferred<CountedPaginatedResponse<Survey>>()
+            const newerRequest = deferred<CountedPaginatedResponse<Survey>>()
+            const olderSurvey = createTestSurvey('older', 'Older filter result')
+            const newerSurvey = createTestSurvey('newer', 'Newer filter result')
+            const listSpy = jest
+                .spyOn(api.surveys, 'list')
+                .mockImplementationOnce(() => olderRequest.promise)
+                .mockImplementationOnce(() => newerRequest.promise)
+
+            logic.actions.setSurveysFilters({ created_by: 41 })
+            logic.actions.setSurveysFilters({ created_by: 42 })
+
+            expect(listSpy).toHaveBeenNthCalledWith(1, expect.objectContaining({ created_by: 41 }))
+            expect(listSpy).toHaveBeenNthCalledWith(2, expect.objectContaining({ created_by: 42 }))
+
+            newerRequest.resolve({ count: 1, results: [newerSurvey] })
+            await waitFor(() => expect(logic.values.data.surveys).toEqual([newerSurvey]))
+
+            olderRequest.resolve({ count: 1, results: [olderSurvey] })
+            await expectLogic(logic).toFinishAllListeners()
+
+            expect(logic.values.data.surveys).toEqual([newerSurvey])
+        })
+
+        it('loads response counts for each page and merges them', async () => {
+            useMocks({
+                get: {
+                    '/api/projects/:team/surveys/': ({ request }) => {
+                        const offset = new URL(request.url).searchParams.get('offset')
+                        const survey =
+                            offset === '1'
+                                ? createTestSurvey('survey-2', 'Second survey')
+                                : createTestSurvey('survey-1', 'First survey')
+
+                        return [200, { count: 2, results: [survey], next: null, previous: null }]
+                    },
+                },
+            })
+
+            await expectLogic(logic, () => logic.actions.loadSurveys()).toFinishAllListeners()
+
+            expect(responseCountRequests).toHaveLength(1)
+            expect(responseCountRequests[0].searchParams.get('survey_ids')).toEqual('survey-1')
+            expect(logic.values.surveysResponsesCount).toEqual({ 'survey-1': 12 })
+
+            await expectLogic(logic, () => logic.actions.loadNextPage()).toFinishAllListeners()
+
+            expect(responseCountRequests).toHaveLength(2)
+            expect(responseCountRequests[1].searchParams.get('survey_ids')).toEqual('survey-2')
+            expect(logic.values.surveysResponsesCount).toEqual({ 'survey-1': 12, 'survey-2': 0 })
+        })
+    })
+
+    describe('url syncing', () => {
+        let logic: ReturnType<typeof surveysLogic.build>
+
+        beforeEach(async () => {
+            initKeaTests()
+
+            useMocks({
+                get: {
+                    '/api/projects/:team/surveys/': () => [200, { count: 0, results: [], next: null, previous: null }],
+                    '/api/projects/:team/surveys/responses_count': () => [200, {}],
+                },
+            })
+
+            logic = surveysLogic()
+            logic.mount()
+            await expectLogic(logic).toFinishAllListeners()
+        })
+
+        it('writes the search term to the search query param', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.setSearchTerm('checkout')
+            }).toFinishAllListeners()
+
+            expect(router.values.searchParams.search).toEqual('checkout')
+        })
+
+        it('removes the search query param when the term is cleared', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.setSearchTerm('checkout')
+            }).toFinishAllListeners()
+            await expectLogic(logic, () => {
+                logic.actions.setSearchTerm('')
+            }).toFinishAllListeners()
+
+            expect(router.values.searchParams.search).toBeUndefined()
+        })
+
+        it('reads the search term from the search query param on navigation', async () => {
+            router.actions.push('/surveys', { search: 'onboarding' })
+
+            await expectLogic(logic).toFinishAllListeners().toMatchValues({
+                searchTerm: 'onboarding',
+            })
+        })
+
+        it('coerces a numeric search query param to a string without crashing searchedSurveys', async () => {
+            router.actions.push('/surveys', { search: 3 })
+
+            await expectLogic(logic).toFinishAllListeners().toMatchValues({
+                searchTerm: '3',
+            })
+
+            expect(logic.values.searchedSurveys).toEqual([])
+        })
+
+        it('clears a stale search term when navigating to surveys without a search param', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.setSearchTerm('onboarding')
+            }).toFinishAllListeners()
+
+            router.actions.push('/surveys')
+
+            await expectLogic(logic).toFinishAllListeners().toMatchValues({
+                searchTerm: '',
+            })
+        })
     })
 
     describe('product intent tracking', () => {
@@ -204,8 +312,8 @@ describe('surveysLogic', () => {
                     '/api/projects/:team/surveys/responses_count': () => [200, {}],
                 },
                 patch: {
-                    '/api/environments/@current/add_product_intent/': async (req) => {
-                        const data = await req.json()
+                    '/api/environments/:team_id/add_product_intent/': async ({ request }) => {
+                        const data = await request.json()
                         capturedIntentRequests.push(data)
                         return [200, {}]
                     },
@@ -230,50 +338,6 @@ describe('surveysLogic', () => {
             expect(capturedIntentRequests[0]).toEqual({
                 product_type: ProductKey.SURVEYS,
                 intent_context: ProductIntentContext.SURVEYS_VIEWED,
-            })
-        })
-
-        it('should track SURVEY_CREATED intent when creating survey from template', async () => {
-            const mockTemplate: SurveyTemplate = {
-                templateType: SurveyTemplateType.NPS,
-                questions: [
-                    {
-                        type: SurveyQuestionType.Rating,
-                        question: 'How likely are you to recommend us?',
-                        description: '',
-                        descriptionContentType: 'text' as SurveyQuestionDescriptionContentType,
-                        display: 'number',
-                        scale: SURVEY_RATING_SCALE.NPS_10_POINT,
-                        lowerBoundLabel: 'Not likely',
-                        upperBoundLabel: 'Very likely',
-                    },
-                ],
-                description: 'NPS survey',
-                type: SurveyType.Popover,
-            }
-
-            useMocks({
-                post: {
-                    '/api/projects/:team/surveys/': () => [200, { id: 'new-survey-123' }],
-                },
-            })
-
-            await expectLogic(logic, () => {
-                logic.actions.createSurveyFromTemplate(mockTemplate)
-            }).toFinishAllListeners()
-
-            const createIntent = capturedIntentRequests.find(
-                (req) => req.intent_context === ProductIntentContext.SURVEY_CREATED
-            )
-            expect(createIntent).toBeTruthy()
-            expect(createIntent).toMatchObject({
-                product_type: ProductKey.SURVEYS,
-                intent_context: ProductIntentContext.SURVEY_CREATED,
-                metadata: {
-                    survey_id: 'new-survey-123',
-                    source: SURVEY_CREATED_SOURCE.SURVEY_EMPTY_STATE,
-                    template_type: 'Net promoter score (NPS)',
-                },
             })
         })
 

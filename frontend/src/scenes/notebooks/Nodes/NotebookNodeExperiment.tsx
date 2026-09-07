@@ -1,128 +1,85 @@
-import { BindLogic, useActions, useValues } from 'kea'
+import { useActions, useValues } from 'kea'
 import { useEffect } from 'react'
 
-import { IconFlag, IconFlask } from '@posthog/icons'
-import { LemonDivider } from '@posthog/lemon-ui'
+import { IconFlag } from '@posthog/icons'
 
-import { NotFound } from 'lib/components/NotFound'
-import { LemonSkeleton } from 'lib/lemon-ui/LemonSkeleton'
-import { Info } from 'scenes/experiments/ExperimentView/Info'
-import { SummaryTable } from 'scenes/experiments/ExperimentView/SummaryTable'
-import { LegacyResultsQuery, ResultsTag, StatusTag } from 'scenes/experiments/ExperimentView/components'
-import { experimentLogic } from 'scenes/experiments/experimentLogic'
-import { getExperimentStatus } from 'scenes/experiments/experimentsLogic'
-import { createPostHogWidgetNode } from 'scenes/notebooks/Nodes/NodeWrapper'
-import { urls } from 'scenes/urls'
+import { experimentLogic } from '~/scenes/experiments/experimentLogic'
+import { NotebookExperimentComponent } from '~/scenes/experiments/notebook'
+import {
+    EXPERIMENT_NOTEBOOK_WIDGET_VIEWS,
+    ExperimentNotebookWidgetAttributes,
+} from '~/scenes/experiments/notebook/experimentNotebookWidgetViews'
+import { createPostHogWidgetNode } from '~/scenes/notebooks/Nodes/NodeWrapper'
+import { getNotebookWidgetDefaultView } from '~/scenes/notebooks/notebookWidgetCatalog'
+import { type NotebookNodeProps, NotebookNodeType } from '~/scenes/notebooks/types'
+import { urls } from '~/scenes/urls'
 
-import { NotebookNodeProps, NotebookNodeType } from '../types'
+import { getExperimentStatus } from 'products/experiments/frontend/experimentStatus'
+import {
+    getExperimentStatusColor,
+    getExperimentStatusLabel,
+} from 'products/experiments/frontend/scenes/experimentsLogic'
+
 import { buildFlagContent } from './NotebookNodeFlag'
 import { notebookNodeLogic } from './notebookNodeLogic'
-import { INTEGER_REGEX_MATCH_GROUPS, OPTIONAL_PROJECT_NON_CAPTURE_GROUP } from './utils'
 
-const Component = ({ attributes }: NotebookNodeProps<NotebookNodeExperimentAttributes>): JSX.Element => {
-    const { id } = attributes
-    const { experiment, experimentLoading, experimentMissing, isExperimentRunning, legacyPrimaryMetricsResults } =
-        useValues(experimentLogic({ experimentId: id }))
-    const { loadExperiment } = useActions(experimentLogic({ experimentId: id }))
-    const { expanded } = useValues(notebookNodeLogic)
-    const { insertAfter, setActions } = useActions(notebookNodeLogic)
+function ExperimentNotebookToolbar({ attributes }: NotebookNodeProps<ExperimentNotebookWidgetAttributes>): null {
+    const { experiment } = useValues(experimentLogic({ experimentId: attributes.id }))
+    const { nextNode } = useValues(notebookNodeLogic)
+    const { insertAfter, setActions, setTitlePlaceholder, setTitleStatus } = useActions(notebookNodeLogic)
+    const featureFlagId = experiment?.feature_flag?.id
 
     useEffect(() => {
-        setActions([
-            {
-                text: 'View feature flag',
-                icon: <IconFlag />,
-                onClick: () => insertAfter(buildFlagContent(experiment.feature_flag?.id || 'new')),
-            },
-        ])
+        setTitlePlaceholder(experiment?.name || 'Experiment')
+        const status = experiment ? getExperimentStatus(experiment) : null
+        setTitleStatus(
+            status
+                ? {
+                      label: getExperimentStatusLabel(status),
+                      type: getExperimentStatusColor(status),
+                  }
+                : null
+        )
+        setActions(
+            featureFlagId
+                ? [
+                      {
+                          text: 'View feature flag',
+                          icon: <IconFlag />,
+                          onClick: () => {
+                              if (nextNode?.type.name !== NotebookNodeType.FeatureFlag) {
+                                  insertAfter(buildFlagContent(featureFlagId))
+                              }
+                          },
+                      },
+                  ]
+                : []
+        )
+    }, [experiment, featureFlagId, insertAfter, nextNode?.type.name, setActions, setTitlePlaceholder, setTitleStatus])
 
-        loadExperiment()
-
-        // oxlint-disable-next-line exhaustive-deps
-    }, [id])
-
-    if (experimentMissing) {
-        return <NotFound object="experiment" />
-    }
-
-    if (!legacyPrimaryMetricsResults) {
-        return <></>
-    }
-
-    return (
-        <div>
-            <BindLogic logic={experimentLogic} props={{ experimentId: id }}>
-                <div className="flex items-center gap-2 p-3">
-                    <IconFlask className="text-lg" />
-                    {experimentLoading ? (
-                        <LemonSkeleton className="h-6 flex-1" />
-                    ) : (
-                        <>
-                            <span className="flex-1 font-semibold truncate">{experiment.name}</span>
-                            <StatusTag status={getExperimentStatus(experiment)} />
-                            <ResultsTag />
-                        </>
-                    )}
-                </div>
-
-                {expanded ? (
-                    <>
-                        {experiment.description && (
-                            <>
-                                <LemonDivider className="my-0" />
-                                <span className="p-2">{experiment.description}</span>
-                            </>
-                        )}
-                        {!experiment.start_date && (
-                            <>
-                                <LemonDivider className="my-0" />
-                                <div className="p-2">
-                                    <Info />
-                                </div>
-                            </>
-                        )}
-                        {isExperimentRunning && (
-                            <>
-                                <LemonDivider className="my-0" />
-                                <div className="p-2">
-                                    <SummaryTable metric={experiment.metrics[0]} />
-                                    {/* TODO: Only show results if the metric is a trends or funnels query. Not supported yet with new query runner */}
-                                    {legacyPrimaryMetricsResults[0] &&
-                                        (legacyPrimaryMetricsResults[0].kind === 'ExperimentTrendsQuery' ||
-                                            legacyPrimaryMetricsResults[0].kind === 'ExperimentFunnelsQuery') && (
-                                            <LegacyResultsQuery
-                                                result={legacyPrimaryMetricsResults[0]}
-                                                showTable={true}
-                                            />
-                                        )}
-                                </div>
-                            </>
-                        )}
-                    </>
-                ) : null}
-            </BindLogic>
-        </div>
-    )
+    return null
 }
 
-type NotebookNodeExperimentAttributes = {
-    id: number
+const Component = ({ attributes }: NotebookNodeProps<ExperimentNotebookWidgetAttributes>): JSX.Element => {
+    const { id } = attributes
+    const { expanded } = useValues(notebookNodeLogic)
+
+    return <NotebookExperimentComponent id={id} expanded={expanded} />
 }
 
-export const NotebookNodeExperiment = createPostHogWidgetNode<NotebookNodeExperimentAttributes>({
+export const NotebookNodeExperiment = createPostHogWidgetNode<ExperimentNotebookWidgetAttributes>({
     nodeType: NotebookNodeType.Experiment,
     titlePlaceholder: 'Experiment',
+    editableTitle: false,
     Component,
+    ToolbarComponent: ExperimentNotebookToolbar,
     heightEstimate: '3rem',
     href: (attrs) => urls.experiment(attrs.id),
     resizeable: false,
     attributes: {
         id: {},
+        view: {},
     },
-    pasteOptions: {
-        find: OPTIONAL_PROJECT_NON_CAPTURE_GROUP + urls.experiment(INTEGER_REGEX_MATCH_GROUPS),
-        getAttributes: async (match) => {
-            return { id: parseInt(match[1]) }
-        },
-    },
+    defaultView: getNotebookWidgetDefaultView('Experiment'),
+    views: EXPERIMENT_NOTEBOOK_WIDGET_VIEWS,
 })

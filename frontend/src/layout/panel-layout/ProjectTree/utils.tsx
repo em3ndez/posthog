@@ -13,7 +13,15 @@ import { iconForType } from './defaultTree'
 import { FolderState } from './types'
 
 // Hardcoded category order - categories not in this list will be sorted alphabetically after these
-export const CATEGORY_ORDER = ['Analytics', 'AI Analytics', 'Behavior', 'Features', 'Tools', 'Unreleased']
+export const CATEGORY_ORDER = [
+    'Analytics',
+    'AI engineering',
+    'Behavior',
+    'App monitoring',
+    'Features',
+    'Tools',
+    'Unreleased',
+]
 
 export function getCategoryOrder(category: string | undefined): number {
     if (!category) {
@@ -44,6 +52,8 @@ export interface ConvertProps {
     users?: Record<string, UserBasicType>
     foldersFirst?: boolean
     allShortcuts?: boolean
+    /** Skip injecting category header rows, listing all items in sequence instead. */
+    disableCategories?: boolean
 }
 
 export function getItemId(item: FileSystemImport | FileSystemEntry, protocol = 'project://'): string {
@@ -114,13 +124,17 @@ export function convertFileSystemEntryToTreeDataItem({
     users,
     foldersFirst = true,
     allShortcuts = false,
+    disableCategories = false,
 }: ConvertProps): TreeDataItem[] {
     function itemToTreeDataItem(item: FileSystemImport | FileSystemEntry): TreeDataItem {
         const pathSplit = splitPath(item.path)
         const lastPart = pathSplit.pop()
-        const itemName = unescapePath(
-            lastPart ? (item.href?.includes('new') ? `New ${lastPart.toLowerCase()}` : lastPart) : 'Unnamed'
-        )
+        const itemName =
+            'displayLabel' in item && item.displayLabel
+                ? item.displayLabel
+                : unescapePath(
+                      lastPart ? (item.href?.includes('new') ? `New ${lastPart.toLowerCase()}` : lastPart) : 'Unnamed'
+                  )
         const nodeId = getItemId(item, root)
         const displayName = <SearchHighlightMultiple string={itemName} substring={searchTerm ?? ''} />
         const user: UserBasicType | undefined = item.meta?.created_by ? users?.[item.meta.created_by] : undefined
@@ -249,7 +263,7 @@ export function convertFileSystemEntryToTreeDataItem({
         const node = itemToTreeDataItem(item)
 
         if (checkedItems[nodeId]) {
-            markIndeterminateFolders(joinPath(splitPath(item.path).slice(0, -1)))
+            markIndeterminateFolders(parentPath(item.path))
         }
 
         // Place the item in the current (deepest) folder.
@@ -361,7 +375,7 @@ export function convertFileSystemEntryToTreeDataItem({
         }
     }
 
-    if (rootNodes.find((node) => node.record?.category)) {
+    if (!disableCategories && rootNodes.find((node) => node.record?.category)) {
         const newRootNodes: TreeDataItem[] = []
         let lastCategory: string | null = null
         for (const node of rootNodes) {
@@ -391,7 +405,7 @@ export function convertFileSystemEntryToTreeDataItem({
  *   - splitPath("a")              => ["a"]
  *   - splitPath("")               => []
  */
-export function splitPath(path: string | undefined): string[] {
+export function splitPath(path: string | null | undefined): string[] {
     if (!path) {
         return []
     }
@@ -411,6 +425,44 @@ export function splitPath(path: string | undefined): string[] {
     }
     segments.push(current)
     return segments.filter((s) => s !== '')
+}
+
+/**
+ * Returns null when `path` sat outside the moved folder. Compares segment by segment, so a sibling whose
+ * name merely starts with the moved folder's name is left alone and an escaped separator inside a name is
+ * not mistaken for one.
+ */
+export function reparentPath(path: string | null | undefined, oldPath: string, newPath: string): string | null {
+    if (!isPathUnder(path, oldPath)) {
+        return null
+    }
+    return joinPath([...splitPath(newPath), ...splitPath(path).slice(splitPath(oldPath).length)])
+}
+
+/**
+ * True for `ancestor` itself as well as anything beneath it. Compares whole segments, so a sibling whose
+ * name merely starts the same does not match and an escaped separator is not read as a boundary.
+ */
+export function isPathUnder(path: string | null | undefined, ancestor: string): boolean {
+    const segments = splitPath(path)
+    const under = splitPath(ancestor)
+    return segments.length >= under.length && under.every((segment, index) => segments[index] === segment)
+}
+
+export function parentPath(path: string | null | undefined): string {
+    return joinPath(splitPath(path).slice(0, -1))
+}
+
+/**
+ * Whether a file system row is of `type`. A trailing slash makes `type` a prefix covering several
+ * internal types, e.g. "hog/" matches "hog/site_destination" (see `ProjectTreeRef`).
+ */
+export function matchesRefType(rowType: string | undefined, type: string): boolean {
+    return type.endsWith('/') ? !!rowType?.startsWith(type) : rowType === type
+}
+
+export function refTypeParams(type: string): { type?: string; type__startswith?: string } {
+    return type.endsWith('/') ? { type__startswith: type } : { type }
 }
 
 export function joinPath(path: string[]): string {
@@ -495,7 +547,7 @@ export function appendResultsToFolders(
         }
         processedIds.add(result.id)
 
-        const folder = joinPath(splitPath(result.path).slice(0, -1))
+        const folder = parentPath(result.path)
         if (newState[folder]) {
             const existingItem = newState[folder].find((item) => item.id === result.id)
             if (existingItem) {

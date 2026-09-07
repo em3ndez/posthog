@@ -1,16 +1,18 @@
 from posthog.test.base import FuzzyInt
 
 from posthog.api.test.test_team import EnvironmentToProjectRewriteClient
+from posthog.constants import AvailableFeature
 from posthog.models.organization import Organization, OrganizationMembership
 from posthog.models.project import Project
 from posthog.models.team.team import Team
 from posthog.models.user import User
 
+from products.access_control.backend.models.access_control import AccessControl
+
 from ee.api.test.test_team import team_enterprise_api_test_factory
-from ee.models.rbac.access_control import AccessControl
 
 
-class TestProjectEnterpriseAPI(team_enterprise_api_test_factory()):
+class TestProjectEnterpriseAPI(team_enterprise_api_test_factory()):  # type: ignore[misc]
     """
     We inherit from TestTeamEnterpriseAPI, as previously /api/projects/ referred to the Team model, which used to mean "project".
     Now as Team means "environment" and Project is separate, we must ensure backward compatibility of /api/projects/.
@@ -22,6 +24,16 @@ class TestProjectEnterpriseAPI(team_enterprise_api_test_factory()):
     def test_create_team(self):
         self.organization_membership.level = OrganizationMembership.Level.ADMIN
         self.organization_membership.save()
+
+        # Ensure project-creation limits don't block this test
+        self.organization.available_product_features = [
+            {
+                "key": AvailableFeature.ORGANIZATIONS_PROJECTS,
+                "name": AvailableFeature.ORGANIZATIONS_PROJECTS,
+                "limit": 10,
+            }
+        ]
+        self.organization.save()
         self.assertEqual(Team.objects.count(), 1)
         self.assertEqual(Project.objects.count(), 1)
         response = self.client.post("/api/projects/@current/environments/", {"name": "Test"})
@@ -46,6 +58,17 @@ class TestProjectEnterpriseAPI(team_enterprise_api_test_factory()):
 
         current_org, _, _ = Organization.objects.bootstrap(self.user, name="other_org")
         other_org = self.organization  # Bootstrapping above sets it to the current org
+
+        # Ensure project-creation limits don't block this test for both orgs we create under
+        for org in (current_org, other_org):
+            org.available_product_features = [
+                {
+                    "key": AvailableFeature.ORGANIZATIONS_PROJECTS,
+                    "name": AvailableFeature.ORGANIZATIONS_PROJECTS,
+                    "limit": 10,
+                }
+            ]
+            org.save()
         assert Team.objects.count() == 2
         assert Project.objects.count() == 2
 
@@ -67,10 +90,22 @@ class TestProjectEnterpriseAPI(team_enterprise_api_test_factory()):
         _, _, _ = Organization.objects.bootstrap(self.user, name="other_org")
         other_org = self.organization  # Bootstrapping above sets it to the current org
 
+        # Ensure project-creation limits don't block this test (we want to assert on access control)
+        other_org.available_product_features = [
+            {
+                "key": AvailableFeature.ORGANIZATIONS_PROJECTS,
+                "name": AvailableFeature.ORGANIZATIONS_PROJECTS,
+                "limit": 10,
+            }
+        ]
+        other_org.save()
+
         assert other_org.id != self.user.current_organization_id
         response = self.client.post(f"/api/organizations/{other_org.id}/projects/", {"name": "Via path org"})
         self.assertEqual(response.status_code, 403, msg=response.json())
-        assert response.json() == self.permission_denied_response("Your organization access level is insufficient.")
+        assert response.json() == self.permission_denied_response(
+            "You need to be an organization admin or above to create new projects."
+        )
 
     def test_user_that_does_not_belong_to_an_org_cannot_create_a_projec(self):
         user = User.objects.create(email="no_org@posthog.com")
@@ -88,15 +123,19 @@ class TestProjectEnterpriseAPI(team_enterprise_api_test_factory()):
             },
         )
 
-    def test_rename_project_as_org_member_allowed(self):
+    def test_rename_project_as_org_member_forbidden(self):
+        # Renaming is admin-only (mirrors the settings UI, which gates rename behind admin access).
         self.organization_membership.level = OrganizationMembership.Level.MEMBER
         self.organization_membership.save()
+        # In an access-control org, a member with no explicit project access defaults to effective admin;
+        # set default member access so the admin-only rename gate actually applies.
+        self._set_project_default_member_access(self.team)
 
         response = self.client.patch(f"/api/projects/@current/", {"name": "Erinaceus europaeus"})
         self.project.refresh_from_db()
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(self.project.name, "Erinaceus europaeus")
+        self.assertEqual(response.status_code, 403)
+        self.assertNotEqual(self.project.name, "Erinaceus europaeus")
 
     def test_list_projects_restricted_ones_hidden(self):
         self.organization_membership.level = OrganizationMembership.Level.MEMBER
@@ -118,7 +157,7 @@ class TestProjectEnterpriseAPI(team_enterprise_api_test_factory()):
         projects_response = self.client.get(f"/api/environments/")
 
         # 9 (above):
-        with self.assertNumQueries(FuzzyInt(16, 17)):
+        with self.assertNumQueries(FuzzyInt(14, 17)):
             current_org_response = self.client.get(f"/api/organizations/{self.organization.id}/")
 
         self.assertEqual(projects_response.status_code, 200)
@@ -129,6 +168,7 @@ class TestProjectEnterpriseAPI(team_enterprise_api_test_factory()):
                     "id": self.team.id,
                     "uuid": str(self.team.uuid),
                     "organization": str(self.organization.id),
+                    "project_id": self.team.project.id,
                     "api_token": self.team.api_token,
                     "name": self.team.name,
                     "completed_snippet_onboarding": False,
@@ -137,6 +177,7 @@ class TestProjectEnterpriseAPI(team_enterprise_api_test_factory()):
                     "is_demo": False,
                     "timezone": "UTC",
                     "access_control": False,
+                    "tags": [],
                 }
             ],
         )
@@ -163,6 +204,16 @@ class TestProjectEnterpriseAPI(team_enterprise_api_test_factory()):
 
     def test_cannot_create_project_in_org_without_access(self):
         self.organization_membership.delete()
+
+        # Ensure project-creation limits don't block this test (we want to assert on access control)
+        self.organization.available_product_features = [
+            {
+                "key": AvailableFeature.ORGANIZATIONS_PROJECTS,
+                "name": AvailableFeature.ORGANIZATIONS_PROJECTS,
+                "limit": 10,
+            }
+        ]
+        self.organization.save()
 
         response = self.client.post(f"/api/organizations/{self.organization.id}/projects/", {"name": "Test"})
 

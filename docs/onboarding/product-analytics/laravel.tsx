@@ -1,8 +1,8 @@
-import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/OnboardingDocsContentWrapper'
+import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/shared/OnboardingDocsContentWrapper'
 
 import { StepDefinition } from '../steps'
 
-export const getLaravelSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
+export const getLaravelInstallSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
     const { CodeBlock, Markdown, dedent } = ctx
 
     return [
@@ -52,7 +52,7 @@ export const getLaravelSteps = (ctx: OnboardingComponentsContext): StepDefinitio
                                     public function boot(): void
                                     {
                                         PostHog::init(
-                                            '<ph_project_api_key>',
+                                            '<ph_project_token>',
                                             [
                                                 'host' => '<ph_client_api_host>'
                                             ]
@@ -66,30 +66,40 @@ export const getLaravelSteps = (ctx: OnboardingComponentsContext): StepDefinitio
                 </>
             ),
         },
-        {
-            title: 'Send events',
-            badge: 'optional',
-            content: (
-                <>
-                    <Markdown>Capture custom events using the PostHog client:</Markdown>
-                    <CodeBlock
-                        blocks={[
-                            {
-                                language: 'php',
-                                file: 'PHP',
-                                code: dedent`
+    ]
+}
+
+export const getLaravelEventStep = (ctx: OnboardingComponentsContext): StepDefinition => {
+    const { CodeBlock, Markdown, dedent } = ctx
+
+    return {
+        title: 'Send events',
+        badge: 'optional',
+        content: (
+            <>
+                <Markdown>Capture custom events using the PostHog client:</Markdown>
+                <CodeBlock
+                    blocks={[
+                        {
+                            language: 'php',
+                            file: 'PHP',
+                            code: dedent`
                                 PostHog::capture([
                                     'distinctId' => 'test-user',
                                     'event' => 'test-event',
                                 ]);
                             `,
-                            },
-                        ]}
-                    />
-                </>
-            ),
-        },
-    ]
+                        },
+                    ]}
+                />
+            </>
+        ),
+    }
 }
+
+export const getLaravelSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => [
+    ...getLaravelInstallSteps(ctx),
+    getLaravelEventStep(ctx),
+]
 
 export const LaravelInstallation = createInstallation(getLaravelSteps)

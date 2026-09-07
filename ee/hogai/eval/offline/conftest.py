@@ -1,3 +1,4 @@
+import os
 import json
 from collections.abc import Awaitable, Callable, Generator
 from contextlib import contextmanager
@@ -31,7 +32,7 @@ from ee.hogai.eval.schema import DatasetInput, EvalsDockerImageConfig
 
 
 @pytest.fixture(scope="session")
-def dagster_context() -> Generator[PipesContext, None, None]:
+def dagster_context() -> Generator[PipesContext]:
     with open_dagster_pipes() as context:
         yield context
 
@@ -103,7 +104,7 @@ class EvaluationContext(BaseModel):
             kwargs.setdefault("posthog_distinct_id", self.distinct_id)
             return await original_create(*args, **kwargs)
 
-        client.chat.completions.create = patched_create  # type: ignore
+        client.chat.completions.create = patched_create
 
         return TracedLLMClient(
             openai=client,
@@ -120,7 +121,7 @@ def eval_ctx(
     set_up_evals,  # noqa: F811
     dagster_context: PipesContext,
     django_db_blocker,
-) -> Generator[EvaluationContext, None, None]:
+) -> Generator[EvaluationContext]:
     """
     Script that restores dumped Django models and patches AI query runners.
     Creates teams with team_id=project_id for the same single user and organization,
@@ -224,7 +225,11 @@ def pytest_collection_modifyitems(items):
     One test file might contain multiple evaluation tests cases.
     This hook will automatically apply the local evaluation context to all of them.
     """
-    current_dir = Path(__file__).parent
+    # pytest calls this hook with every item in the session, not only the ones under this
+    # directory, so the test runs tens of thousands of times on a full-tree shard. A string
+    # prefix is the same test as is_relative_to for these absolute paths, and it avoids both
+    # re-parsing item.fspath into a Path and walking Path.parents once per item.
+    current_dir_prefix = f"{Path(__file__).parent}{os.sep}"
     for item in items:
-        if Path(item.fspath).is_relative_to(current_dir):
+        if str(item.path).startswith(current_dir_prefix):
             item.obj = with_eval_context(item.obj)

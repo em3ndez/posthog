@@ -14,8 +14,10 @@ import { hogFlowEditorLogic } from '../../hogFlowEditorLogic'
 import { NODE_HEIGHT, NODE_WIDTH } from '../../react_flow_utils/constants'
 import { HogFlowAction } from '../../types'
 import { useHogFlowStep } from '../HogFlowSteps'
-import { StepViewMetrics } from './StepViewMetrics'
+import { isScheduleTrigger } from '../types'
+import { buildSummary } from './rrule-helpers'
 import { StepViewLogicProps, stepViewLogic } from './stepViewLogic'
+import { StepViewMetrics } from './StepViewMetrics'
 
 export function StepView({ action }: { action: HogFlowAction }): JSX.Element {
     const {
@@ -25,10 +27,26 @@ export function StepView({ action }: { action: HogFlowAction }): JSX.Element {
         selectedNodeCanBeDeleted,
         selectedNodeCanBeCopiedOrMoved,
         animatingEdgePair,
+        workflow,
+        isZoomedOutFar,
     } = useValues(hogFlowEditorLogic)
     const { setSelectedNodeId, startCopyingNode, startMovingNode } = useActions(hogFlowEditorLogic)
-    const { actionValidationErrorsById, logicProps } = useValues(workflowLogic)
+    const { actionValidationErrorsById, logicProps, scheduleState, scheduleStartsAt, isScheduleRepeating } =
+        useValues(workflowLogic)
     const { deleteElements } = useReactFlow()
+
+    const scheduleDescription = useMemo(() => {
+        if (!isScheduleTrigger(action)) {
+            return null
+        }
+        if (!scheduleStartsAt) {
+            return 'No schedule configured'
+        }
+        if (!isScheduleRepeating) {
+            return 'One-time run'
+        }
+        return buildSummary(scheduleState, scheduleStartsAt)
+    }, [action, scheduleState, scheduleStartsAt, isScheduleRepeating])
 
     const isSelected = selectedNode?.id === action.id
     const node = nodesById[action.id]
@@ -48,7 +66,8 @@ export function StepView({ action }: { action: HogFlowAction }): JSX.Element {
         cancelEditingDescription,
     } = useActions(stepViewLogic(stepViewLogicProps))
 
-    const height = mode === 'metrics' ? NODE_HEIGHT + 10 : NODE_HEIGHT
+    const shouldShowMetricsSummary = mode === 'metrics' && workflow.trigger?.type !== 'batch'
+    const height = shouldShowMetricsSummary ? NODE_HEIGHT + 10 : NODE_HEIGHT
 
     const Step = useHogFlowStep(action)
     const { selectedColor, colorLight, color, icon } = useMemo(() => {
@@ -67,6 +86,7 @@ export function StepView({ action }: { action: HogFlowAction }): JSX.Element {
     }, [action, isSelected, Step])
 
     const hasValidationError = actionValidationErrorsById[action.id]?.valid === false
+    const hasValidationWarning = Object.keys(actionValidationErrorsById[action.id]?.warnings ?? {}).length > 0
     const isAnimationTarget = mode === 'test' && animatingEdgePair?.endsWith(`->${action.id}`)
 
     return (
@@ -165,18 +185,18 @@ export function StepView({ action }: { action: HogFlowAction }): JSX.Element {
                                 className="text-[0.3rem] text-muted !bg-transparent !border-0 !shadow-none !p-0 !px-1 !m-0 !min-h-0 !max-h-[0.9rem] !leading-[0.45rem] !resize-none !overflow-hidden !rounded-sm"
                             />
                         </div>
-                    ) : (
-                        <Tooltip title={action.description || ''}>
+                    ) : isZoomedOutFar ? null : (
+                        <Tooltip title={scheduleDescription ?? action.description ?? ''}>
                             <div
-                                className={`text-[0.3rem]/1.5 text-muted line-clamp-2 !rounded-sm px-0.5 -mx-0.5 transition-colors pl-1 min-w-0 min-h-[0.45rem] overflow-hidden ${isSelected ? 'cursor-text hover:bg-fill-button-tertiary-hover' : ''}`}
+                                className={`text-[0.3rem]/1.5 text-muted line-clamp-2 !rounded-sm px-0.5 -mx-0.5 transition-colors pl-1 min-w-0 min-h-[0.45rem] overflow-hidden ${isSelected && !isScheduleTrigger(action) ? 'cursor-text hover:bg-fill-button-tertiary-hover' : ''}`}
                                 onClick={(e) => {
-                                    if (isSelected) {
+                                    if (isSelected && !isScheduleTrigger(action)) {
                                         e.stopPropagation()
                                         startEditingDescription()
                                     }
                                 }}
                             >
-                                {action.description || ''}
+                                {scheduleDescription ?? action.description ?? ''}
                             </div>
                         </Tooltip>
                     )}
@@ -215,17 +235,22 @@ export function StepView({ action }: { action: HogFlowAction }): JSX.Element {
                                 },
                             ]}
                         >
-                            <LemonButton icon={<IconEllipsis />} size="xsmall" noPadding />
+                            <LemonButton
+                                icon={<IconEllipsis className="text-[0.65rem]" />}
+                                size="xsmall"
+                                tooltip="Step actions"
+                                noPadding
+                            />
                         </LemonMenu>
                     </div>
                 )}
             </div>
-            {hasValidationError ? (
+            {hasValidationError || hasValidationWarning ? (
                 <div className="absolute top-0 right-0 scale-75">
                     <LemonBadge status="warning" size="small" content="!" position="top-right" />
                 </div>
             ) : null}
-            {mode === 'metrics' && (
+            {shouldShowMetricsSummary && (
                 <div
                     style={{
                         borderTopColor: colorLight,

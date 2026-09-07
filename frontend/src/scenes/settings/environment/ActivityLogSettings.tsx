@@ -3,27 +3,33 @@ import { useActions, useValues } from 'kea'
 import { IconInfo } from '@posthog/icons'
 import { LemonButton, LemonSwitch, Tooltip } from '@posthog/lemon-ui'
 
-import { PayGateMini } from 'lib/components/PayGateMini/PayGateMini'
-import { useRestrictedArea } from 'lib/components/RestrictedArea'
-import { OrganizationMembershipLevel } from 'lib/constants'
+import { RestrictionScope, useRestrictedArea } from 'lib/components/RestrictedArea'
+import { OrganizationMembershipLevel, TeamMembershipLevel } from 'lib/constants'
 import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
 import { LinkedHogFunctions } from 'scenes/hog-functions/list/LinkedHogFunctions'
 import { teamLogic } from 'scenes/teamLogic'
 import { urls } from 'scenes/urls'
+import { userLogic } from 'scenes/userLogic'
 
-import { AvailableFeature } from '~/types'
+// These settings are gated as a whole. The AUDIT_LOGS pay gate is declared on the
+// `environment-activity-logs` section in SettingsMap, not on each component here.
 
 export function ActivityLogSettings(): JSX.Element {
+    const { user } = useValues(userLogic)
+    const restrictedReason = useRestrictedArea({
+        scope: RestrictionScope.Project,
+        minimumAccessLevel: TeamMembershipLevel.Admin,
+    })
+    const effectiveRestriction = user?.is_impersonated ? null : restrictedReason
+
     return (
-        <PayGateMini feature={AvailableFeature.AUDIT_LOGS}>
-            <div className="flex">
-                <p>
-                    <LemonButton to={urls.advancedActivityLogs()} type="primary">
-                        Browse all activity logs
-                    </LemonButton>
-                </p>
-            </div>
-        </PayGateMini>
+        <div className="flex">
+            <p>
+                <LemonButton to={urls.advancedActivityLogs()} type="primary" disabledReason={effectiveRestriction}>
+                    Browse all activity logs
+                </LemonButton>
+            </p>
+        </div>
     )
 }
 
@@ -40,62 +46,67 @@ export function ActivityLogOrgLevelSettings(): JSX.Element {
     }
 
     return (
-        <PayGateMini feature={AvailableFeature.AUDIT_LOGS}>
-            <div>
-                <p className="flex items-center gap-1">
-                    Include organization-level activity logs in this project.
-                    <Tooltip
-                        title={
-                            <>
-                                When enabled, activity logs from organization-level changes (such as organization
-                                settings, domains, and members) will be included in this project's activity logs page,
-                                exports, and notifications subscriptions.
-                            </>
-                        }
-                    >
-                        <IconInfo className="text-lg" />
-                    </Tooltip>
-                </p>
+        <div>
+            <p className="flex items-center gap-1">
+                Include organization-level activity logs in this project.
+                <Tooltip
+                    title={
+                        <>
+                            When enabled, activity logs from organization-level changes (such as organization settings,
+                            domains, and members) will be included in this project's activity logs page, exports, and
+                            notifications subscriptions.
+                        </>
+                    }
+                >
+                    <IconInfo className="text-lg" />
+                </Tooltip>
+            </p>
 
-                <LemonSwitch
-                    id="posthog-activity-log-org-level-switch"
-                    onChange={handleToggle}
-                    checked={!!currentTeam?.receive_org_level_activity_logs}
-                    disabledReason={restrictionReason || undefined}
-                    label="Include organization-level activity"
-                    bordered
-                />
-            </div>
-        </PayGateMini>
+            <LemonSwitch
+                id="posthog-activity-log-org-level-switch"
+                onChange={handleToggle}
+                checked={!!currentTeam?.receive_org_level_activity_logs}
+                disabledReason={restrictionReason || undefined}
+                label="Include organization-level activity"
+                bordered
+            />
+        </div>
     )
 }
 
-export function ActivityLogNotifications(): JSX.Element {
-    return (
-        <PayGateMini feature={AvailableFeature.AUDIT_LOGS}>
-            <div>
-                <p className="flex items-center gap-1">
-                    Create notifications to get notified of activity logs.
-                    <Tooltip
-                        title={
-                            <>
-                                You can filter by activity type, resource, and other properties to receive only the
-                                notifications you need.
-                            </>
-                        }
-                    >
-                        <IconInfo className="text-lg" />
-                    </Tooltip>
-                </p>
+export function ActivityLogNotifications(): JSX.Element | null {
+    const restrictedReason = useRestrictedArea({
+        scope: RestrictionScope.Project,
+        minimumAccessLevel: TeamMembershipLevel.Admin,
+    })
 
-                <LinkedHogFunctions
-                    type="internal_destination"
-                    subTemplateIds={['activity-log']}
-                    queryParams={{
-                        returnTo: urls.settings('environment-activity-logs', 'activity-log-notifications'),
-                    }}
-                />
-            </div>
-        </PayGateMini>
+    if (restrictedReason) {
+        return null
+    }
+
+    return (
+        <div>
+            <p className="flex items-center gap-1">
+                Create notifications to get notified of activity logs.
+                <Tooltip
+                    title={
+                        <>
+                            You can filter by activity type, resource, and other properties to receive only the
+                            notifications you need.
+                        </>
+                    }
+                >
+                    <IconInfo className="text-lg" />
+                </Tooltip>
+            </p>
+
+            <LinkedHogFunctions
+                type="internal_destination"
+                subTemplateIds={['activity-log']}
+                queryParams={{
+                    returnTo: urls.settings('environment-activity-logs', 'activity-log-notifications'),
+                }}
+            />
+        </div>
     )
 }

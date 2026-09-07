@@ -1,8 +1,8 @@
 # Django API endpoints
 
-Django serves the admin/management API for feature flags: CRUD operations, local SDK evaluation, analytics, and organization-level operations. Runtime flag evaluation (`/flags`, `/decide`) is routed directly to the [Rust service](rust-service-overview.md) by Contour/Envoy at the Kubernetes infrastructure level -- these requests never reach Django. Django does make internal service-to-service HTTP calls to the Rust service for actions like `my_flags` and `evaluation_reasons`.
+Django serves the admin/management API for feature flags: CRUD operations, analytics, and organization-level operations. Runtime flag evaluation (`/flags`, `/decide`) is routed directly to the [Rust service](rust-service-overview.md) by Contour/Envoy at the Kubernetes infrastructure level -- these requests never reach Django. Django does make internal service-to-service HTTP calls to the Rust service for actions like `my_flags` and `evaluation_reasons`.
 
-The `/api/feature_flag/local_evaluation` endpoint (used by server-side SDKs for local flag evaluation) runs on a **dedicated Django deployment** (`posthog-local-evaluation`), separate from the main Django web service.
+The `/api/feature_flag/local_evaluation` endpoint was historically served by a dedicated Django deployment (`posthog-local-evaluation`). All local evaluation traffic is now served by the Rust definitions fleet at `/flags/definitions` (see [Rust service overview](rust-service-overview.md)). The Django endpoint and deployment have been removed.
 
 ## Architecture overview
 
@@ -54,13 +54,16 @@ Standard REST on `/api/projects/{id}/feature_flags/`. Hard `DELETE` is blocked â
 | Method | URL                                                     | Description                                                                     |
 | ------ | ------------------------------------------------------- | ------------------------------------------------------------------------------- |
 | `GET`  | `.../feature_flags/my_flags/`                           | All flags with values for the current user (proxied to Rust service)            |
-| `GET`  | `.../feature_flags/local_evaluation/`                   | Flag definitions for local SDK evaluation (ETag support)                        |
 | `GET`  | `.../feature_flags/evaluation_reasons/`                 | Evaluate flags for a `distinct_id` with match reasons (proxied to Rust service) |
 | `POST` | `.../feature_flags/user_blast_radius/`                  | Estimate how many users a condition affects                                     |
 | `POST` | `.../feature_flags/{pk}/create_static_cohort_for_flag/` | Create a static cohort from matched users                                       |
 | `GET`  | `.../feature_flags/{pk}/status/`                        | Flag status (ACTIVE, STALE, DELETED, UNKNOWN)                                   |
 | `GET`  | `.../feature_flags/{pk}/dependent_flags/`               | Flags that depend on this flag                                                  |
 | `POST` | `.../feature_flags/{pk}/dashboard/`                     | Create a usage dashboard for the flag                                           |
+| `POST` | `.../feature_flags/{pk}/enable/`                        | Set `active: true` only                                                         |
+| `POST` | `.../feature_flags/{pk}/disable/`                       | Set `active: false` only                                                        |
+| `POST` | `.../feature_flags/{pk}/archive/`                       | Set `archived: true`, disabling the flag in the same write when needed          |
+| `POST` | `.../feature_flags/{pk}/unarchive/`                     | Set `archived: false` only, leaving the flag disabled                           |
 
 ### Organization endpoints
 
@@ -69,17 +72,34 @@ Standard REST on `/api/projects/{id}/feature_flags/`. Hard `DELETE` is blocked â
 | `GET`  | `/api/organizations/{id}/feature_flags/{key}/`      | Get a flag by key across all accessible teams   |
 | `POST` | `/api/organizations/{id}/feature_flags/copy_flags/` | Copy a flag from one project to target projects |
 
+`copy_flags` requires editor access to `feature_flag` in each target project, not just visibility.
+A caller who can see a project but can't edit flags there gets a `failed` entry for that target instead of a copy.
+`target_project_ids` is capped at `MAX_COPY_FLAGS_TARGET_PROJECTS` (50) per call, and the endpoint has its own burst/sustained throttles since each target project can create cohorts and a flag.
+
 ## Key actions in detail
-
-### `local_evaluation`
-
-Returns flag definitions for SDKs that evaluate flags locally (server-side SDKs). Response includes flags (via `MinimalFeatureFlagSerializer`), `group_type_mapping`, and optionally cohort definitions. Supports ETag-based caching. Uses HyperCache with Redis -> S3 -> PostgreSQL fallback.
-
-Requires `ProjectSecretAPIKeyAuthentication` or `TemporaryTokenAuthentication`. Rate limited at 600/minute (overridable per team via `LOCAL_EVAL_RATE_LIMITS`). Checks billing quotas via `list_limited_team_attributes`.
 
 ### `my_flags` and `evaluation_reasons`
 
 Both actions **proxy to the Rust flags service** via `get_flags_from_service()` in `posthog/api/services/flags_service.py`. The Rust service URL defaults to `http://localhost:3001` (configured via `FEATURE_FLAGS_SERVICE_URL` in `posthog/settings/data_stores.py`).
+
+### Lifecycle state actions
+
+`enable`, `disable`, `archive` and `unarchive` are the typed alternative to `PATCH` for the two state fields.
+They take no request body, so a caller cannot send back targeting it read a moment ago.
+That shrinks the lost-update window but does not close it: the serializer saves the instance `get_object()` loaded and Django writes every column, so an edit committed between that read and the save is still reverted.
+A version-sending `PATCH` has the same hole, because the conflict check only fires when the caller's own fields overlap.
+What these endpoints remove is the caller-held read, which spans as long as the caller takes rather than the inside of one request.
+Each one delegates to the matching function in `products/feature_flags/backend/facade/api.py`, which routes the write through `FeatureFlagSerializer` â€” the same path `PATCH` uses, so the approval gate, the dependency guards, cache invalidation and activity logging all still apply.
+The write bumps `version` under a row lock, but the stale-write conflict check does not run: it compares a caller-supplied `version`, and these endpoints take no body.
+All four declare `feature_flag:write`, so object-level access control requires editor.
+They are POST but they update, so each one hands the facade a `FlagLifecycleWriteRequest` that reports the write as a PATCH.
+Two things branch on the method: the serializer runs create-only validation on POST, and the approval gate returns no resource id for POST, which made pending change requests for different flags collide.
+
+A flag already in the requested state is returned unchanged with no write at all, which keeps the actions safe to retry: no version bump and no activity entry for a change that did not happen.
+
+`archive` matches the UI contract by disabling an enabled flag in the same write, because an archived flag must be disabled.
+`unarchive` leaves the flag disabled; enabling it is a separate call.
+It is the one action that cannot return a 409: every gated action declines a change that sets neither `active` nor `filters`, so an `archived`-only write never opens a change request.
 
 ### `create_static_cohort_for_flag`
 
@@ -99,7 +119,7 @@ Key things to know:
 - `evaluation_runtime` controls whether a flag is evaluated client-side, server-side, or both
 - The `@approval_gate` decorator on updates can require approval before changes take effect
 
-**Cache invalidation**: The `refresh_flag_cache_on_updates` signal handler fires on save/delete, calling `set_feature_flags_for_team_in_cache()` via `transaction.on_commit()`.
+**Cache invalidation**: The `feature_flag_changed_flags_cache` (`flags_cache.py`) and `feature_flag_changed` (`local_evaluation.py`) signal handlers fire on save/delete, scheduling cache rebuilds via `transaction.on_commit()`.
 
 ### Related models (same file)
 
@@ -121,13 +141,7 @@ Key things to know:
 
 ## Remote config endpoints
 
-Separate from the feature flag viewset, remote config is served by unauthenticated public views. The token in the URL is a public identifier, not a credential.
-
-| URL                        | View                         | Purpose                  |
-| -------------------------- | ---------------------------- | ------------------------ |
-| `/array/{token}/config`    | `RemoteConfigAPIView`        | JSON remote config       |
-| `/array/{token}/config.js` | `RemoteConfigJSAPIView`      | JavaScript remote config |
-| `/array/{token}/array.js`  | `RemoteConfigArrayJSAPIView` | Array.js bundle          |
+Remote config (`/array/{token}/config`, `/array/{token}/config.js`, `/array/{token}/array.js`) and the surveys config endpoint (`/api/surveys`) are no longer served by Django. They are served by the Rust hypercache service, which reads from the same `RemoteConfig` model populated by Django via post-save signals. See [HyperCache system](hypercache-system.md).
 
 ## See also
 

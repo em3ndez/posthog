@@ -1,11 +1,9 @@
-import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/OnboardingDocsContentWrapper'
+import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/shared/OnboardingDocsContentWrapper'
 
 import { StepDefinition } from '../steps'
 
-export const getPythonSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
-    const { CodeBlock, Markdown, CalloutBox, dedent, snippets } = ctx
-
-    const PythonEventCapture = snippets?.PythonEventCapture
+export const getPythonInstallSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
+    const { CodeBlock, Markdown, CalloutBox, dedent } = ctx
 
     return [
         {
@@ -34,7 +32,7 @@ export const getPythonSteps = (ctx: OnboardingComponentsContext): StepDefinition
             content: (
                 <>
                     <Markdown>
-                        Initialize the PostHog client with your project API key and host from your project settings:
+                        Initialize the PostHog client with your project token and host from your project settings:
                     </Markdown>
                     <CodeBlock
                         blocks={[
@@ -45,7 +43,7 @@ export const getPythonSteps = (ctx: OnboardingComponentsContext): StepDefinition
                                     from posthog import Posthog
 
                                     posthog = Posthog(
-                                        project_api_key='<ph_project_api_key>',
+                                        project_api_key='<ph_project_token>',
                                         host='<ph_client_api_host>'
                                     )
                                 `,
@@ -61,20 +59,32 @@ export const getPythonSteps = (ctx: OnboardingComponentsContext): StepDefinition
                 </>
             ),
         },
-        {
-            title: 'Send events',
-            badge: 'recommended',
-            content: (
-                <>
-                    <Markdown>
-                        Once installed, PostHog will automatically start capturing events. You can also manually send
-                        events to test your integration:
-                    </Markdown>
-                    {PythonEventCapture && <PythonEventCapture />}
-                </>
-            ),
-        },
     ]
 }
+
+export const getPythonEventStep = (ctx: OnboardingComponentsContext): StepDefinition => {
+    const { Markdown, snippets } = ctx
+
+    const PythonEventCapture = snippets?.PythonEventCapture
+
+    return {
+        title: 'Send events',
+        badge: 'recommended',
+        content: (
+            <>
+                <Markdown>
+                    Once installed, PostHog will automatically start capturing events. You can also manually send events
+                    to test your integration:
+                </Markdown>
+                {PythonEventCapture && <PythonEventCapture />}
+            </>
+        ),
+    }
+}
+
+export const getPythonSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => [
+    ...getPythonInstallSteps(ctx),
+    getPythonEventStep(ctx),
+]
 
 export const PythonInstallation = createInstallation(getPythonSteps)

@@ -5,16 +5,16 @@ use batch_ingestion::process_batch;
 use common_kafka::kafka_consumer::{RecvErr, SingleTopicConsumer};
 use config::Config;
 use metrics_consts::{
-    BATCH_ACQUIRE_TIME, CACHE_CONSUMED, CACHE_HITS, CACHE_LEN, CACHE_MISSES, COMPACTED_UPDATES,
-    DUPLICATES_IN_BATCH, EMPTY_EVENTS, EVENTS_RECEIVED, EVENT_PARSE_ERROR, FORCED_SMALL_BATCH,
+    BATCH_ACQUIRE_TIME, CACHE_FILL_RATIO, CACHE_LEN, COMPACTED_UPDATES, DUPLICATES_IN_BATCH,
+    EMPTY_EVENTS, EVENTS_RECEIVED, EVENT_PARSE_ERROR, FORCED_SMALL_BATCH, OFFSET_STORE_FAILURES,
     RECV_DEQUEUED, SKIPPED_DUE_TO_TEAM_FILTER, UPDATES_FILTERED_BY_CACHE, UPDATES_PER_EVENT,
-    UPDATES_SEEN, UPDATE_PRODUCER_OFFSET, WORKER_BLOCKED,
+    UPDATES_SEEN, WORKER_BLOCKED,
 };
 use types::{Event, Update};
 
 use ahash::AHashSet;
 use tokio::sync::mpsc::error::TrySendError;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 use update_cache::Cache;
 
 use crate::{
@@ -26,8 +26,11 @@ pub mod api;
 pub mod app_context;
 pub mod batch_ingestion;
 pub mod config;
+pub mod group_type_resolver;
 pub mod measuring_channel;
+pub mod metrics_buckets;
 pub mod metrics_consts;
+pub mod read_filter;
 pub mod types;
 pub mod update_cache;
 
@@ -36,9 +39,9 @@ pub async fn update_consumer_loop(
     cache: Arc<Cache>,
     context: Arc<AppContext>,
     mut channel: MeasuringReceiver<Update>,
+    handle: lifecycle::Handle,
 ) {
-    let mut prev_hits = [0u64; 3];
-    let mut prev_misses = [0u64; 3];
+    let _guard = handle.process_scope();
 
     loop {
         let mut batch = Vec::with_capacity(config.update_batch_size);
@@ -46,7 +49,7 @@ pub async fn update_consumer_loop(
         let batch_start = tokio::time::Instant::now();
         let batch_time = common_metrics::timing_guard(BATCH_ACQUIRE_TIME, &[]);
         while batch.len() < config.update_batch_size {
-            context.worker_liveness.report_healthy().await;
+            handle.report_healthy();
 
             metrics::gauge!(CHANNEL_MESSAGES_IN_FLIGHT)
                 .set(channel.get_inflight_messages_count() as f64);
@@ -57,10 +60,14 @@ pub async fn update_consumer_loop(
             let sleep = tokio::time::sleep(Duration::from_secs(1));
 
             tokio::select! {
+                _ = handle.shutdown_recv() => {
+                    info!("Consumer loop received shutdown signal");
+                    return;
+                }
                 got = recv => {
                     if got == 0 {
-                        // Indicates all workers have exited, so we should too
-                        panic!("Coordinator recv failed, dying");
+                        info!("Channel closed, all producers exited");
+                        return;
                     }
                     metrics::gauge!(RECV_DEQUEUED).set(got as f64);
                     continue;
@@ -76,6 +83,10 @@ pub async fn update_consumer_loop(
         }
         batch_time.fin();
 
+        if batch.is_empty() {
+            continue;
+        }
+
         // We de-duplicate the batch, in case racing inserts slipped through the shared-cache filter. This
         // is important because duplicate updates touch the same row, and we issue in parallel, so we'd end
         // up deadlocking ourselves. We can still encounter deadlocks due to other pods, but those should
@@ -86,42 +97,34 @@ pub async fn update_consumer_loop(
 
         metrics::counter!(DUPLICATES_IN_BATCH).increment((start_len - batch.len()) as u64);
 
-        // Per-cache metrics once per batch (before DB write path)
-        let caps = [
-            (config.eventdefs_cache_capacity, "eventdefs"),
-            (config.eventprops_cache_capacity, "eventprops"),
-            (config.propdefs_cache_capacity, "propdefs"),
+        // Per-subcache size gauges once per batch. Hit/miss/eviction counters
+        // are emitted from inside `Cache::contains_key` and the EvictingLifecycle
+        // impl in `update_cache.rs`, not here.
+        let per_cache = [
+            (
+                config.eventdefs_cache_capacity,
+                "eventdefs",
+                cache.eventdefs_len(),
+            ),
+            (
+                config.eventprops_cache_capacity,
+                "eventprops",
+                cache.eventprops_len(),
+            ),
+            (
+                config.propdefs_cache_capacity,
+                "propdefs",
+                cache.propdefs_len(),
+            ),
         ];
-        let lens = [
-            cache.eventdefs_len(),
-            cache.eventprops_len(),
-            cache.propdefs_len(),
-        ];
-        let hits = [
-            cache.eventdefs_hits(),
-            cache.eventprops_hits(),
-            cache.propdefs_hits(),
-        ];
-        let misses = [
-            cache.eventdefs_misses(),
-            cache.eventprops_misses(),
-            cache.propdefs_misses(),
-        ];
-        for (i, (cap, label)) in caps.iter().enumerate() {
-            let len = lens[i];
-            let cap_f = *cap as f64;
-            metrics::gauge!(CACHE_CONSUMED, &[("cache", *label)]).set(if cap_f > 0.0 {
+        for (cap, label, len) in per_cache {
+            let cap_f = cap as f64;
+            metrics::gauge!(CACHE_FILL_RATIO, &[("cache", label)]).set(if cap_f > 0.0 {
                 len as f64 / cap_f
             } else {
                 0.0
             });
-            metrics::gauge!(CACHE_LEN, &[("cache", *label)]).set(len as f64);
-            let delta_hits = hits[i].saturating_sub(prev_hits[i]);
-            let delta_misses = misses[i].saturating_sub(prev_misses[i]);
-            metrics::counter!(CACHE_HITS, &[("cache", *label)]).increment(delta_hits);
-            metrics::counter!(CACHE_MISSES, &[("cache", *label)]).increment(delta_misses);
-            prev_hits[i] = hits[i];
-            prev_misses[i] = misses[i];
+            metrics::gauge!(CACHE_LEN, &[("cache", label)]).set(len as f64);
         }
 
         // enrich batch group events with resolved group_type_indices
@@ -135,8 +138,17 @@ pub async fn update_consumer_loop(
                     e
                 )
             });
+        handle.report_healthy();
 
-        process_batch(&config, cache.clone(), &context.pool, batch).await;
+        process_batch(
+            &config,
+            cache.clone(),
+            &context.pool,
+            context.read_pool.clone(),
+            batch,
+            &handle,
+        )
+        .await;
     }
 }
 
@@ -145,64 +157,97 @@ pub async fn update_producer_loop(
     consumer: SingleTopicConsumer,
     shared_cache: Arc<Cache>,
     channel: MeasuringSender<Update>,
+    handle: lifecycle::Handle,
 ) {
+    let _guard = handle.process_scope();
     let mut batch = AHashSet::with_capacity(config.compaction_batch_size);
     let mut last_send = tokio::time::Instant::now();
+    let drain_interval = Duration::from_secs(config.producer_drain_interval_secs);
+
+    // These fire per event or per update, so resolve the handles once instead of
+    // paying a registry lookup (hash + CAS + handle drop) on every increment.
+    // Safe only because main installs the metrics recorder before spawning us.
+    let events_received = metrics::counter!(EVENTS_RECEIVED);
+    let updates_seen = metrics::counter!(UPDATES_SEEN);
+    let updates_per_event = metrics::histogram!(UPDATES_PER_EVENT);
+    let compacted_updates = metrics::counter!(COMPACTED_UPDATES);
+    let updates_filtered_by_cache = metrics::counter!(UPDATES_FILTERED_BY_CACHE);
+    let skipped_due_to_team_filter = metrics::counter!(SKIPPED_DUE_TO_TEAM_FILTER);
     loop {
-        let (event, offset): (Event, _) = match consumer.json_recv().await {
-            Ok(r) => r,
-            Err(RecvErr::Empty) => {
-                warn!("Received empty event");
-                metrics::counter!(EMPTY_EVENTS).increment(1);
-                continue;
+        // The timer arm is what lets the flush check at the bottom of the loop run while no
+        // events are arriving. Without it the loop parks in json_recv(), so a partial compaction
+        // batch left behind when a partition goes quiet stays unwritten until traffic resumes.
+        // The tick period is deliberately independent of drain_interval; it only bounds how
+        // often the elapsed check is re-evaluated, not how long a batch may sit.
+        let recv_result = tokio::select! {
+            _ = handle.shutdown_recv() => {
+                info!("Producer loop shutting down");
+                return;
             }
-            Err(RecvErr::Serde(e)) => {
-                metrics::counter!(EVENT_PARSE_ERROR).increment(1);
-                warn!("Failed to parse event: {:?}", e);
-                continue;
-            }
-            Err(RecvErr::Kafka(e)) => {
-                panic!("Kafka error: {e:?}"); // We just panic if we fail to recv from kafka, if it's down, we're down
-            }
+            r = consumer.json_recv() => Some(r),
+            _ = tokio::time::sleep(Duration::from_secs(1)) => None,
         };
 
-        // NOTE: we extended the autocommit interval in production envs to 20 seconds
-        // as a temporary remediation for events already buffered in a pod's internal
-        // queue being skipped when the consumer group rebalances or the service is
-        // redeployed. Long-term fix: start tracking max partition offsets in the
-        // Update batches and commit them only when each batch succeeds. This will
-        // not be perfect, as batch writes are async and can complete out of order,
-        // but is better than what we're doing right now
-        let curr_offset = offset.get_value();
-        match offset.store() {
-            Ok(_) => (),
-            Err(e) => {
-                metrics::counter!(UPDATE_PRODUCER_OFFSET, &[("op", "store_fail")]).increment(1);
-                // TODO: consumer json_recv() should expose the source partition ID too
-                error!("update_producer_loop: failed to store offset {curr_offset}, got: {e}");
+        if let Some(recv_result) = recv_result {
+            let (event, offset): (Event, _) = match recv_result {
+                Ok(r) => r,
+                Err(RecvErr::Empty) => {
+                    warn!("Received empty event");
+                    metrics::counter!(EMPTY_EVENTS).increment(1);
+                    continue;
+                }
+                Err(RecvErr::Serde(e)) => {
+                    metrics::counter!(EVENT_PARSE_ERROR).increment(1);
+                    warn!("Failed to parse event: {:?}", e);
+                    continue;
+                }
+                Err(RecvErr::Kafka(e)) => {
+                    handle.signal_failure(format!("Kafka error: {e:?}"));
+                    return;
+                }
+            };
+
+            // NOTE: we extended the autocommit interval in production envs to 20 seconds
+            // as a temporary remediation for events already buffered in a pod's internal
+            // queue being skipped when the consumer group rebalances or the service is
+            // redeployed. Long-term fix: start tracking max partition offsets in the
+            // Update batches and commit them only when each batch succeeds. This will
+            // not be perfect, as batch writes are async and can complete out of order,
+            // but is better than what we're doing right now
+            let curr_offset = offset.get_value();
+            match offset.store() {
+                Ok(_) => (),
+                Err(e) => {
+                    metrics::counter!(OFFSET_STORE_FAILURES).increment(1);
+                    // TODO: consumer json_recv() should expose the source partition ID too
+                    error!("update_producer_loop: failed to store offset {curr_offset}, got: {e}");
+                }
             }
-        }
 
-        if !config
-            .filter_mode
-            .should_process(&config.filtered_teams.teams, event.team_id)
-        {
-            metrics::counter!(SKIPPED_DUE_TO_TEAM_FILTER).increment(1);
-            continue;
-        }
-
-        let updates = event.into_updates(config.update_count_skip_threshold);
-
-        metrics::counter!(EVENTS_RECEIVED).increment(1);
-        metrics::counter!(UPDATES_SEEN).increment(updates.len() as u64);
-        metrics::histogram!(UPDATES_PER_EVENT).record(updates.len() as f64);
-
-        for update in updates {
-            if batch.contains(&update) {
-                metrics::counter!(COMPACTED_UPDATES).increment(1);
+            if !config
+                .filter_mode
+                .should_process(&config.filtered_teams.teams, event.team_id)
+            {
+                skipped_due_to_team_filter.increment(1);
                 continue;
             }
-            batch.insert(update);
+
+            let updates = event.into_updates_with(
+                config.update_count_skip_threshold,
+                config.eventdef_last_seen_floor_secs,
+            );
+
+            events_received.increment(1);
+            updates_seen.increment(updates.len() as u64);
+            updates_per_event.record(updates.len() as f64);
+
+            for update in updates {
+                // insert returns false on duplicates, so one hash covers the
+                // membership check and the insert.
+                if !batch.insert(update) {
+                    compacted_updates.increment(1);
+                }
+            }
         }
 
         // We do the full batch insert before checking the time/batch size, because if we did this
@@ -211,22 +256,18 @@ pub async fn update_producer_loop(
         // wait on the next event, which might come an arbitrary amount of time later. This bit me
         // in testing, and while it's not a correctness problem and under normal load we'd never
         // see it, we may as well just do the full batch insert first.
-        if batch.len() >= config.compaction_batch_size
-            || last_send.elapsed() > Duration::from_secs(10)
-        {
+        if batch.len() >= config.compaction_batch_size || last_send.elapsed() > drain_interval {
             last_send = tokio::time::Instant::now();
             for update in batch.drain() {
                 if shared_cache.contains_key(&update) {
-                    // the above can replace this metric when we have new hit/miss stats both flowing
-                    metrics::counter!(UPDATES_FILTERED_BY_CACHE).increment(1);
+                    // kept for back-compat; equivalent to sum(prop_defs_cache_hits)
+                    updates_filtered_by_cache.increment(1);
                     continue;
                 }
 
-                // TEMPORARY: both old (v1) and new (v2) write paths will utilize the old
-                // not-great caching strategy for now: optimistically add entries before
-                // they are safely persisted to Postgres, and painfully extract them
-                // when batch writes fail. This may be a fine trade for now, since
-                // v2 batch writes fail much less often than v1
+                // Optimistic caching: entries go in before they are persisted, and are evicted
+                // again if the batch write fails. That trade is acceptable because batch writes
+                // rarely fail, and the alternative costs a second pass over every batch.
                 shared_cache.insert(update.clone());
 
                 match channel.try_send(update) {
@@ -234,9 +275,9 @@ pub async fn update_producer_loop(
                     Err(TrySendError::Full(update)) => {
                         warn!("Worker blocked");
                         metrics::counter!(WORKER_BLOCKED).increment(1);
-                        // Workers should just die if the channel is dropped, since that indicates
-                        // the main loop is dead.
-                        channel.send(update).await.unwrap();
+                        if channel.send(update).await.is_err() {
+                            return;
+                        }
                     }
                     Err(e) => {
                         warn!("Coordinator send failed: {:?}", e);

@@ -1,6 +1,5 @@
 import posthog from 'posthog-js'
 
-import { RevenueAnalyticsMRRQueryResultItem } from '~/queries/schema/schema-general'
 import { LifecycleToggle } from '~/types'
 
 import { LemonTagType } from './lemon-ui/LemonTag'
@@ -49,6 +48,32 @@ export type DataColorTheme = Partial<Record<DataColorToken, string>> & {
     [key: `preset-${number}`]: string
 }
 
+const FALLBACK_DATA_COLOR_THEME_COLORS = [
+    '#1d4aff',
+    '#621da6',
+    '#42827e',
+    '#ce0e74',
+    '#f14f58',
+    '#7c440e',
+    '#529a0a',
+    '#0476fb',
+    '#fe729e',
+    '#35416b',
+    '#41cbc4',
+    '#b64b02',
+    '#e4a604',
+    '#a56eff',
+    '#30d5c8',
+] as const
+
+export const FALLBACK_DATA_COLOR_THEME: DataColorTheme = FALLBACK_DATA_COLOR_THEME_COLORS.reduce(
+    (theme, color, index) => {
+        theme[`preset-${index + 1}`] = color
+        return theme
+    },
+    {} as DataColorTheme
+)
+
 export function getColorVar(variable: string): string {
     const colorValue = getComputedStyle(document.body).getPropertyValue('--' + variable)
     if (!colorValue) {
@@ -95,21 +120,13 @@ export function getTrendLikeSeriesColor(index: number, isPrevious: boolean): str
  *
  * Hexadecimal is necessary as Chart.js doesn't work with CSS vars.
  */
-export function getBarColorFromStatus(
-    status: LifecycleToggle | `revenue-analytics-${keyof RevenueAnalyticsMRRQueryResultItem}`,
-    hover?: boolean
-): string {
+export function getBarColorFromStatus(status: LifecycleToggle, hover?: boolean): string {
     switch (status) {
         case 'new':
         case 'returning':
         case 'resurrecting':
         case 'dormant':
             return getColorVar(`color-lifecycle-${status}${hover ? '-hover' : ''}`)
-        case 'revenue-analytics-new':
-        case 'revenue-analytics-expansion':
-        case 'revenue-analytics-contraction':
-        case 'revenue-analytics-churn':
-            return getColorVar(`color-${status}${hover ? '-hover' : ''}`)
         default:
             throw new Error(`Unknown lifecycle status: ${status}`)
     }
@@ -122,10 +139,11 @@ export function getGraphColors(): Record<string, string | null> {
         axis: getColorVar('color-graph-axis'),
         crosshair: getColorVar('color-graph-crosshair'),
 
-        // TODO: these are not used anywhere, but setting them to the correct values
-        tooltipBackground: getColorVar('color-bg-surface-tooltip'),
+        // Surface-following popover, not the inverse --color-bg-surface-tooltip — stays dark in
+        // dark mode. Text pairs with the surface, so it's the plain primary, not the inverse.
+        tooltipBackground: getColorVar('color-bg-surface-popover'),
         tooltipTitle: getColorVar('color-text-primary'),
-        tooltipBody: getColorVar('color-bg-surface-tooltip'),
+        tooltipBody: getColorVar('color-text-primary'),
     }
 }
 

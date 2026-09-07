@@ -12,11 +12,11 @@ from posthog.api.file_system.deletion import (
     register_pre_delete_hook,
     register_pre_restore_hook,
 )
+from posthog.helpers.impersonation import is_impersonated
 from posthog.models.activity_logging.activity_log import Change, Detail, log_activity
-from posthog.models.activity_logging.model_activity import is_impersonated_session
-from posthog.models.hog_functions.utils import humanize_hog_function_type
 from posthog.models.user import User
-from posthog.session_recordings.session_recording_playlist_api import log_playlist_activity
+
+from products.cdp.backend.models.hog_functions.utils import humanize_hog_function_type
 
 
 def _first_non_blank(*values: str | None) -> str | None:
@@ -49,7 +49,7 @@ def _log_deletion_activity(
         organization_id=organization.id,
         team_id=team_id,
         user=context.user,
-        was_impersonated=is_impersonated_session(context.request) if context.request else False,
+        was_impersonated=is_impersonated(context.request),
         item_id=str(item_id),
         scope=scope,
         activity="deleted",
@@ -79,7 +79,7 @@ def _log_restore_activity(
         organization_id=organization.id,
         team_id=team_id,
         user=context.user,
-        was_impersonated=is_impersonated_session(context.request) if context.request else False,
+        was_impersonated=is_impersonated(context.request),
         item_id=str(item_id),
         scope=scope,
         activity="restored",
@@ -163,6 +163,11 @@ def _link_post_delete(context: DeletionContext, link: Any) -> None:
 
 
 def _playlist_post_restore(context: RestoreContext, playlist: Any) -> None:
+    # Deferred: session_recording_playlist_api pulls session_recording_api -> the session_summary
+    # temporal workflow (-> google-genai). This module is imported from AppConfig.ready(), so a
+    # module-level import would drag all of that onto every process's startup path.
+    from posthog.session_recordings.session_recording_playlist_api import log_playlist_activity  # noqa: PLC0415
+
     organization = context.organization
     if not organization:
         return
@@ -184,7 +189,7 @@ def _playlist_post_restore(context: RestoreContext, playlist: Any) -> None:
         organization_id=organization.id,
         team_id=team_id,
         user=user,
-        was_impersonated=is_impersonated_session(context.request) if context.request else False,
+        was_impersonated=is_impersonated(context.request),
         changes=[
             Change(
                 type="SessionRecordingPlaylist",
@@ -198,6 +203,8 @@ def _playlist_post_restore(context: RestoreContext, playlist: Any) -> None:
 
 
 def _playlist_post_delete(context: DeletionContext, playlist: Any) -> None:
+    from posthog.session_recordings.session_recording_playlist_api import log_playlist_activity  # noqa: PLC0415
+
     organization = context.organization
     if not organization:
         return
@@ -223,7 +230,7 @@ def _playlist_post_delete(context: DeletionContext, playlist: Any) -> None:
         organization_id=organization.id,
         team_id=team_id,
         user=user,
-        was_impersonated=is_impersonated_session(context.request) if context.request else False,
+        was_impersonated=is_impersonated(context.request),
         changes=[
             Change(
                 type="SessionRecordingPlaylist",
@@ -339,7 +346,7 @@ def _feature_flag_pre_restore(context: RestoreContext, feature_flag: Any) -> Non
 def register_core_file_system_types() -> None:
     register_file_system_type(
         "action",
-        "posthog",
+        "actions",
         "Action",
         undo_message="Send PATCH /api/projects/@current/actions/{id} with deleted=false.",
     )
@@ -348,7 +355,7 @@ def register_core_file_system_types() -> None:
 
     register_file_system_type(
         "dashboard",
-        "posthog",
+        "dashboards",
         "Dashboard",
         undo_message="Send PATCH /api/projects/@current/dashboards/{id} with deleted=false.",
     )
@@ -357,7 +364,7 @@ def register_core_file_system_types() -> None:
 
     register_file_system_type(
         "feature_flag",
-        "posthog",
+        "feature_flags",
         "FeatureFlag",
         undo_message="Send PATCH /api/projects/@current/feature_flags/{id} with deleted=false.",
     )
@@ -368,7 +375,7 @@ def register_core_file_system_types() -> None:
 
     register_file_system_type(
         "experiment",
-        "posthog",
+        "experiments",
         "Experiment",
         undo_message="Send PATCH /api/projects/@current/experiments/{id} with deleted=false.",
     )
@@ -377,7 +384,7 @@ def register_core_file_system_types() -> None:
 
     register_file_system_type(
         "insight",
-        "posthog",
+        "product_analytics",
         "Insight",
         lookup_field="short_id",
         undo_message="Send PATCH /api/projects/@current/insights/{id} with deleted=false.",
@@ -387,7 +394,7 @@ def register_core_file_system_types() -> None:
 
     register_file_system_type(
         "link",
-        "posthog",
+        "links",
         "Link",
         allow_restore=False,
         undo_message="Create a new link with the same details.",
@@ -406,7 +413,7 @@ def register_core_file_system_types() -> None:
 
     register_file_system_type(
         "cohort",
-        "posthog",
+        "cohorts",
         "Cohort",
         undo_message="Send PATCH /api/projects/@current/cohorts/{id} with deleted=false.",
     )
@@ -417,7 +424,7 @@ def register_core_file_system_types() -> None:
         type_string = f"hog_function/{hog_type}"
         register_file_system_type(
             type_string,
-            "posthog",
+            "cdp",
             "HogFunction",
             undo_message="Send PATCH /api/projects/@current/hog_functions/{id} with deleted=false.",
         )

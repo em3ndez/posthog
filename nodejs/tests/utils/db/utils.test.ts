@@ -1,4 +1,4 @@
-import { personInitialAndUTMProperties } from '../../../src/utils/db/utils'
+import { personInitialAndUTMProperties } from '~/common/utils/db/utils'
 
 describe('personInitialAndUTMProperties()', () => {
     it('adds initial and utm properties', () => {
@@ -101,21 +101,87 @@ describe('personInitialAndUTMProperties()', () => {
             $set: { $current_url: 'https://test.com' },
         })
     })
-    it('treats $os_name as fallback for $os', () => {
-        const propertiesOsNameOnly = { $os_name: 'Android' }
-        expect(personInitialAndUTMProperties(propertiesOsNameOnly)).toEqual({
-            $os: 'Android',
-            $os_name: 'Android',
-            $set_once: { $initial_os: 'Android' },
-            $set: { $os: 'Android' },
-        })
-        // Test that $os takes precedence, with $os_name preserved (although this should not happen in the wild)
-        const propertiesBothOsKeys = { $os: 'Windows', $os_name: 'Android' }
-        expect(personInitialAndUTMProperties(propertiesBothOsKeys)).toEqual({
+    it('keeps $os over $os_name and drops the alias from person properties', () => {
+        // normalizeOsAlias fills the event's own $os upstream, so this function always sees $os
+        // alongside $os_name; the divergent values here never occur in the wild.
+        const properties = { $os: 'Windows', $os_name: 'Android' }
+        expect(personInitialAndUTMProperties(properties)).toEqual({
             $os: 'Windows',
             $os_name: 'Android',
             $set_once: { $initial_os: 'Windows' },
             $set: { $os: 'Windows' },
         })
+    })
+    it('falls back to $os_name for $initial_os when the event carries a null $os', () => {
+        // The never-write-null rule skips $initial_os for a null $os, leaving $os_name as the only
+        // first-touch value available.
+        const properties = { $os: null, $os_name: 'Android' }
+        expect(personInitialAndUTMProperties(properties)).toEqual({
+            $os: null,
+            $os_name: 'Android',
+            $set_once: { $initial_os: 'Android' },
+            $set: { $os: null },
+        })
+    })
+    it('does not lift device context from an $is_server event, but keeps campaign params', () => {
+        // A server SDK (is_server: true) stamps its host $os; it must not reach $set/$set_once or
+        // it permanently poisons $initial_os. utm is real attribution and still flows through.
+        const properties = {
+            $is_server: true,
+            $os: 'Linux',
+            $os_version: '5.15.0',
+            utm_source: 'newsletter',
+        }
+        expect(personInitialAndUTMProperties(properties)).toEqual({
+            $is_server: true,
+            $os: 'Linux',
+            $os_version: '5.15.0',
+            utm_source: 'newsletter',
+            $set: { utm_source: 'newsletter' },
+            $set_once: { $initial_utm_source: 'newsletter' },
+        })
+    })
+    it('does not let a server $os_name alias into $initial_os', () => {
+        const result = personInitialAndUTMProperties({ $is_server: true, $os_name: 'Linux' })
+        expect((result.$set_once as Record<string, any> | undefined)?.$initial_os).toBeUndefined()
+    })
+    // Browser SDKs send every absent campaign param as an explicit null whenever at least one is
+    // present. $set_once only applies while the person property is missing, so a null there would
+    // permanently block the real first-touch value. $set intentionally keeps the nulls (last-touch).
+    it.each([
+        [
+            'null campaign params stay in $set but never claim $set_once',
+            { utm_source: 'google', gclid: null },
+            { utm_source: 'google', gclid: null },
+            { $initial_utm_source: 'google' },
+        ],
+        [
+            'all-null campaign params leave $set_once empty',
+            { gclid: null, msclkid: null },
+            { gclid: null, msclkid: null },
+            {},
+        ],
+        ['a null $os_name does not claim $initial_os', { $os: null, $os_name: null }, { $os: null }, {}],
+    ])('never writes null first-touch values: %s', (_desc, input, expectedSet, expectedSetOnce) => {
+        const result = personInitialAndUTMProperties({ ...input })
+        expect(result.$set).toEqual(expectedSet)
+        expect(result.$set_once).toEqual(expectedSetOnce)
+    })
+
+    it.each([
+        ['client event maps $os', { $lib: 'web', $os: 'Linux' }, 'Linux'],
+        ['no $is_server is treated as client', { $os: 'Linux' }, 'Linux'],
+        ['$is_server false is treated as client', { $os: 'Linux', $is_server: false }, 'Linux'],
+        ['$is_server true skips $os', { $os: 'Linux', $is_server: true }, undefined],
+        ['$is_server true skips regardless of lib', { $lib: 'web', $os: 'Linux', $is_server: true }, undefined],
+    ])('maps $os to $initial_os unless $is_server is true: %s', (_desc, properties, expected) => {
+        const result = personInitialAndUTMProperties({ ...properties })
+        const setOnce = result.$set_once as Record<string, any> | undefined
+        const set = result.$set as Record<string, any> | undefined
+        expect(setOnce?.$initial_os).toBe(expected)
+        if (expected === undefined) {
+            // host $os must not reach current $set either, not just $set_once
+            expect(set?.$os).toBeUndefined()
+        }
     })
 })

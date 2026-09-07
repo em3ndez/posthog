@@ -15,7 +15,7 @@ from posthog.schema import (
 from posthog.hogql import ast
 from posthog.hogql.constants import LimitContext
 
-from posthog.hogql_queries.insights.paginators import HogQLHasMorePaginator
+from posthog.hogql_queries.paginators import HogQLHasMorePaginator
 from posthog.hogql_queries.query_runner import AnalyticsQueryRunner
 from posthog.utils import relative_date_parse
 
@@ -60,6 +60,7 @@ class DocumentEmbeddingsQueryRunner(AnalyticsQueryRunner[DocumentSimilarityQuery
             query_result = self.paginator.execute_hogql_query(
                 query=self.to_query(),
                 team=self.team,
+                user=self.user,
                 query_type="DocumentSimilarityQuery",
                 timings=self.timings,
                 modifiers=self.modifiers,

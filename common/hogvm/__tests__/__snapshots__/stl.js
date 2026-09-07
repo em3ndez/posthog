@@ -13,6 +13,7 @@ function __x_typeof (value) {
     return 'unknown'
 }
 function tuple (...args) { const tuple = args.slice(); tuple.__isHogTuple = true; return tuple; }
+function tryDecodeURLComponent (str) { try { return decodeURIComponent(str) } catch { return null } }
 function today() {
     const now = new Date();
     return __toHogDate(now.getUTCFullYear(), now.getUTCMonth()+1, now.getUTCDate());
@@ -307,7 +308,7 @@ function __escapeString(value) {
     return `'${value.split('').map((c) => singlequoteEscapeCharsMap[c] || c).join('')}'`;
 }
 function __escapeIdentifier(identifier) {
-    const backquoteEscapeCharsMap = { '\b': '\\b', '\f': '\\f', '\r': '\\r', '\n': '\\n', '\t': '\\t', '\0': '\\0', '\v': '\\v', '\\': '\\\\', '`': '\\`' }
+    const backquoteEscapeCharsMap = { '\b': '\\b', '\f': '\\f', '\r': '\\r', '\n': '\\n', '\t': '\\t', '\0': '\\0', '\v': '\\v', '\\': '\\\\', '`': '``' }
     if (typeof identifier === 'number') return identifier.toString();
     if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(identifier)) return identifier;
     return `\`${identifier.split('').map((c) => backquoteEscapeCharsMap[c] || c).join('')}\``;
@@ -452,6 +453,12 @@ print(encodeURLComponent("http://www.google.com"));
 print(encodeURLComponent("tom & jerry"));
 print(decodeURLComponent(encodeURLComponent("http://www.google.com")));
 print(decodeURLComponent(encodeURLComponent("tom & jerry")));
+print("");
+print("-- tryDecodeURLComponent --");
+print(tryDecodeURLComponent("hello%20world"));
+print(tryDecodeURLComponent("100%free"));
+print(tryDecodeURLComponent("valid%20and%20100%free"));
+print(tryDecodeURLComponent(""));
 print("");
 print("-- base64Encode, base64Decode --");
 print(base64Encode("http://www.google.com"));

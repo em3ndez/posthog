@@ -9,16 +9,16 @@ import { DashboardMode } from '~/types'
 import { dashboardLogic } from './dashboardLogic'
 
 export const DashboardOverridesBanner = (): JSX.Element | null => {
-    const { dashboardMode, urlFilters, cancellingPreview } = useValues(dashboardLogic)
+    const { dashboardMode, hasUrlFilters, cancellingPreview } = useValues(dashboardLogic)
     const { setDashboardMode } = useActions(dashboardLogic)
 
-    if (dashboardMode === DashboardMode.Edit || Object.keys(urlFilters).length === 0) {
+    if (dashboardMode === DashboardMode.Edit || !hasUrlFilters) {
         return null
     }
 
     return (
         <LemonBanner type="info" className="mt-4 mb-2">
-            <div className="flex flex-row items-center justify-between gap-2">
+            <div className="flex flex-row items-center justify-between gap-2 flex-wrap">
                 <span>You are viewing this dashboard with filter overrides.</span>
 
                 <div className="flex gap-2">

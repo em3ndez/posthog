@@ -1,6 +1,5 @@
 import { Meta, StoryObj } from '@storybook/react'
 
-import { makeDelay } from 'lib/utils'
 import { App } from 'scenes/App'
 import { urls } from 'scenes/urls'
 
@@ -18,6 +17,12 @@ const meta: Meta = {
         viewMode: 'story',
         mockDate: '2025-01-27',
         pageUrl: urls.experiment(EXPERIMENT_WITH_FUNNEL_METRIC.id),
+        testOptions: {
+            // The funnel chart only renders once the metric result AND the exposure query have
+            // both resolved. The loader wait covers the metric table alone, so wait for the chart
+            // itself to avoid snapshotting before it appears.
+            waitForSelector: '[data-attr="experiment-funnel-chart"]',
+        },
     },
     decorators: [
         mswDecorator({
@@ -28,16 +33,17 @@ const meta: Meta = {
                 [`/api/projects/:team_id/experiment_saved_metrics/`]: [],
                 [`/api/projects/:team_id/feature_flags/${EXPERIMENT_WITH_FUNNEL_METRIC.feature_flag.id}/`]: {},
                 [`/api/projects/:team_id/feature_flags/${EXPERIMENT_WITH_FUNNEL_METRIC.feature_flag.id}/status/`]: {},
+                [`/api/environments/:team_id/default_release_conditions/`]: [],
             },
             post: {
-                '/api/environments/:team_id/query': (req, res, ctx) => {
-                    const body = req.body as Record<string, any>
+                '/api/environments/:team_id/query/:kind': async ({ request }) => {
+                    const body = (await request.json()) as Record<string, any>
 
                     if (body.query.kind === NodeKind.ExperimentExposureQuery) {
-                        return res(ctx.json(EXPOSURE_QUERY_RESULT))
+                        return [200, EXPOSURE_QUERY_RESULT]
                     }
 
-                    return res(ctx.json(FUNNELS_METRIC_RESULT))
+                    return [200, FUNNELS_METRIC_RESULT]
                 },
             },
         }),
@@ -45,7 +51,6 @@ const meta: Meta = {
 }
 export default meta
 
-type Story = StoryObj<typeof meta>
+type Story = StoryObj<{}>
 
-// Small delay to ensure charts render completely
-export const ExperimentWithFunnelMetric: Story = { play: makeDelay(500) }
+export const ExperimentWithFunnelMetric: Story = {}

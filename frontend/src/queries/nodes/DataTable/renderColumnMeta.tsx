@@ -23,6 +23,9 @@ export interface ColumnMeta {
     title?: JSX.Element | string
     width?: string | number
     align?: 'left' | 'right' | 'center'
+    resizable?: boolean
+    onResize?: (width: number) => void
+    onResizeEnd?: () => void
 }
 
 export function renderColumnMeta<T extends DataVisualizationNode | DataTableNode>(
@@ -57,11 +60,13 @@ export function renderColumnMeta<T extends DataVisualizationNode | DataTableNode
     } else if (propertyName && isGroupsQuery(query.source)) {
         const splitPropertyName = propertyName.split('--')
         title = splitPropertyName.length > 1 ? splitPropertyName[1].trim() : propertyName
+    } else if (queryFeatures.has(QueryFeature.selectAndOrderByColumns) && key.includes('--')) {
+        title = extractExpressionComment(key)
     } else if (key === 'timestamp') {
         title = 'Time'
     } else if (key === 'created_at') {
         title = 'First seen'
-    } else if (key === 'last_seen') {
+    } else if (key === 'last_seen_at' || key === 'last_seen') {
         title = 'Last seen'
     } else if (key === 'event') {
         title = 'Event'
@@ -149,6 +154,13 @@ export function renderColumnMeta<T extends DataVisualizationNode | DataTableNode
     return {
         title,
         ...(typeof width !== 'undefined' ? { width } : {}),
+        ...(queryContextColumn?.resizable && queryContextColumn.onResize
+            ? {
+                  resizable: true,
+                  onResize: queryContextColumn.onResize,
+                  onResizeEnd: queryContextColumn.onResizeEnd,
+              }
+            : {}),
         ...(align ? { align } : {}),
     }
 }

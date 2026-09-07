@@ -5,6 +5,7 @@ import { useActions, useValues } from 'kea'
 import { memo } from 'react'
 
 import { IconBug, IconCursorClick, IconHourglass, IconKeyboard, IconLive } from '@posthog/icons'
+import { LemonTag } from '@posthog/lemon-ui'
 
 import { PropertyIcon } from 'lib/components/PropertyIcon/PropertyIcon'
 import { TZLabel } from 'lib/components/TZLabel'
@@ -13,7 +14,7 @@ import { LemonCheckbox } from 'lib/lemon-ui/LemonCheckbox'
 import { LemonSkeleton } from 'lib/lemon-ui/LemonSkeleton'
 import { Tooltip } from 'lib/lemon-ui/Tooltip'
 import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
-import { colonDelimitedDuration } from 'lib/utils'
+import { colonDelimitedDuration } from 'lib/utils/durations'
 import { DraggableToNotebook } from 'scenes/notebooks/AddToNotebook/DraggableToNotebook'
 import { asDisplay } from 'scenes/persons/person-utils'
 import { SimpleTimeLabel } from 'scenes/session-recordings/components/SimpleTimeLabel'
@@ -39,6 +40,11 @@ export interface SessionRecordingPreviewProps {
      * @default false
      */
     selectable?: boolean
+    /**
+     * Sort column for duration/error/TTL display. When set, playlist logic is not required
+     * (e.g. dashboard widgets that pass order from widget config).
+     */
+    order?: RecordingsQuery['order']
 }
 
 function RecordingDuration({ recordingDuration }: { recordingDuration: number | undefined }): JSX.Element {
@@ -252,17 +258,16 @@ function ItemCheckbox({ recording }: { recording: SessionRecordingType }): JSX.E
     )
 }
 
-export const SessionRecordingPreview = memo(
-    function SessionRecordingPreview({
+const SessionRecordingPreviewBase = memo(
+    function SessionRecordingPreviewBase({
         recording,
         isActive,
         selectable = false,
-    }: SessionRecordingPreviewProps): JSX.Element {
+        order,
+    }: SessionRecordingPreviewProps & { order: RecordingsQuery['order'] }): JSX.Element {
         const { playlistTimestampFormat } = useValues(playerSettingsLogic)
 
-        const { filters } = useValues(sessionRecordingsPlaylistLogic)
         const { recordingPropertiesById, recordingPropertiesLoading } = useValues(sessionRecordingsListPropertiesLogic)
-
         const recordingProperties = recordingPropertiesById[recording.id]
         const loading = !recordingProperties && recordingPropertiesLoading
         const iconProperties = gatherIconProperties(recordingProperties, recording)
@@ -281,8 +286,15 @@ export const SessionRecordingPreview = memo(
                     {selectable && <ItemCheckbox recording={recording} />}
                     <div className="grow overflow-hidden flex flex-col gap-y-2 ml-1">
                         <div className="flex items-center justify-between gap-x-0.5">
-                            <div className="flex overflow-hidden font-medium ph-no-capture">
+                            <div className="flex overflow-hidden items-center gap-x-1 font-medium ph-no-capture">
                                 <span className="truncate">{asDisplay(recording.person)}</span>
+                                {recording.matches_filters === false && (
+                                    <Tooltip title="This recording is listed only because it's open. It doesn't match the current filters.">
+                                        <LemonTag type="warning" size="small" className="shrink-0">
+                                            Doesn't match filters
+                                        </LemonTag>
+                                    </Tooltip>
+                                )}
                             </div>
 
                             {playlistTimestampFormat === TimestampFormat.Relative ? (
@@ -329,12 +341,12 @@ export const SessionRecordingPreview = memo(
                                 </div>
                             </div>
 
-                            {filters.order === 'console_error_count' ? (
+                            {order === 'console_error_count' ? (
                                 <ErrorCount
                                     iconClassNames={iconClassNames}
                                     errorCount={recording.console_error_count}
                                 />
-                            ) : filters.order === 'recording_ttl' ? (
+                            ) : order === 'recording_ttl' ? (
                                 <RecordingExpiry
                                     iconClassNames={iconClassNames}
                                     recordingTtl={recording.recording_ttl}
@@ -343,19 +355,20 @@ export const SessionRecordingPreview = memo(
                                 <RecordingDuration
                                     recordingDuration={durationToShow(
                                         recording,
-                                        filters.order || DEFAULT_RECORDING_FILTERS_ORDER_BY
+                                        order || DEFAULT_RECORDING_FILTERS_ORDER_BY
                                     )}
                                 />
                             )}
                         </div>
 
-                        <FirstURL startUrl={recording.start_url} />
+                        <div className="flex items-center justify-between">
+                            <FirstURL startUrl={recording.start_url} />
+                        </div>
                     </div>
 
                     <div
                         className={clsx(
                             'min-w-6 flex flex-col gap-x-0.5 items-center',
-                            // need different margin if the first item is an icon
                             recording.ongoing ? 'mt-1' : 'mt-2'
                         )}
                     >
@@ -370,8 +383,35 @@ export const SessionRecordingPreview = memo(
     },
     (prevProps, nextProps) =>
         prevProps.recording.id === nextProps.recording.id &&
+        // The row renders matches_filters, and the same recording flips in and out of matching
+        // as filters change around an open player, so comparing only the id would keep it stale.
+        prevProps.recording.matches_filters === nextProps.recording.matches_filters &&
         prevProps.isActive === nextProps.isActive &&
-        prevProps.selectable === nextProps.selectable
+        prevProps.selectable === nextProps.selectable &&
+        prevProps.order === nextProps.order
+)
+
+function SessionRecordingPreviewFromPlaylist(props: Omit<SessionRecordingPreviewProps, 'order'>): JSX.Element {
+    const { filters } = useValues(sessionRecordingsPlaylistLogic)
+    const order = filters.order || DEFAULT_RECORDING_FILTERS_ORDER_BY
+    return <SessionRecordingPreviewBase {...props} order={order} />
+}
+
+export const SessionRecordingPreview = memo(
+    function SessionRecordingPreview({ order, ...props }: SessionRecordingPreviewProps): JSX.Element {
+        if (order !== undefined) {
+            return <SessionRecordingPreviewBase {...props} order={order} />
+        }
+        return <SessionRecordingPreviewFromPlaylist {...props} />
+    },
+    (prevProps, nextProps) =>
+        prevProps.recording.id === nextProps.recording.id &&
+        // The row renders matches_filters, and the same recording flips in and out of matching
+        // as filters change around an open player, so comparing only the id would keep it stale.
+        prevProps.recording.matches_filters === nextProps.recording.matches_filters &&
+        prevProps.isActive === nextProps.isActive &&
+        prevProps.selectable === nextProps.selectable &&
+        prevProps.order === nextProps.order
 )
 
 export function SessionRecordingPreviewSkeleton(): JSX.Element {

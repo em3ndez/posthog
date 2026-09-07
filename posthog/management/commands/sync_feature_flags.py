@@ -5,7 +5,10 @@ from typing import cast
 
 from django.core.management.base import BaseCommand
 
-from posthog.models import FeatureFlag, Team, User
+from posthog.management.desktop_feature_flag_sync import load_desktop_feature_flags
+from posthog.models import Team, User
+
+from products.feature_flags.backend.models.feature_flag import FeatureFlag
 
 # These flags won't be enabled when syncing feature flags
 # Turn these on for flags that heavily change the behavior and that you wouldn't like
@@ -25,8 +28,6 @@ INACTIVE_FLAGS = [
     "webhooks-denylist",
     "insight-horizontal-controls",
     "flagged-feature-indicator",
-    "ai-only-mode",
-    "ai-first",
 ]
 
 
@@ -59,16 +60,24 @@ class Command(BaseCommand):
                 elif "export const FEATURE_FLAGS" in line:
                     parsing_flags = True
 
+        flags.update(load_desktop_feature_flags())
+
         first_user = cast(User, User.objects.first())
         for team in Team.objects.all():
-            existing_flags = FeatureFlag.objects.filter(team=team).values_list("key", flat=True)
-            deleted_flags = FeatureFlag.objects.filter(team=team, deleted=True).values_list("key", flat=True)
+            existing_flags = set(
+                FeatureFlag.objects_including_soft_deleted.filter(team=team).values_list("key", flat=True)
+            )
+            deleted_flags = set(
+                FeatureFlag.objects_including_soft_deleted.filter(team=team, deleted=True).values_list("key", flat=True)
+            )
             for flag in flags.keys():
                 flag_type = flags[flag]
                 is_enabled = flag not in INACTIVE_FLAGS
 
                 if flag in deleted_flags:
-                    ff = FeatureFlag.objects.filter(team=team, key=flag)[0]
+                    ff = FeatureFlag.objects_including_soft_deleted.filter(team=team, key=flag).first()
+                    if not ff:
+                        continue
                     ff.deleted = False
                     ff.active = is_enabled
                     ff.save()
@@ -79,7 +88,6 @@ class Command(BaseCommand):
                     if isinstance(flag_type, list):
                         FeatureFlag.objects.create(
                             team=team,
-                            rollout_percentage=100,
                             name=flag,
                             key=flag,
                             created_by=first_user,
@@ -101,7 +109,6 @@ class Command(BaseCommand):
                     else:
                         FeatureFlag.objects.create(
                             team=team,
-                            rollout_percentage=100,
                             name=flag,
                             key=flag,
                             created_by=first_user,
@@ -112,3 +119,5 @@ class Command(BaseCommand):
                     print(
                         f"Created feature flag '{flag} for team {team.id} {' - ' + team.name if team.name else ''}{f' (multivariate: {", ".join(flag_type)})' if isinstance(flag_type, list) else ''}"
                     )
+
+        print("Feature flag sync complete.")

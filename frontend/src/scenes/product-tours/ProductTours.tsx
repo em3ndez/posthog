@@ -6,13 +6,15 @@ import { LemonButton } from '@posthog/lemon-ui'
 import { FEATURE_FLAGS } from 'lib/constants'
 import { LemonTabs } from 'lib/lemon-ui/LemonTabs'
 import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
-import { Scene, SceneExport } from 'scenes/sceneTypes'
 import { sceneConfigurations } from 'scenes/scenes'
+import { Scene, SceneExport } from 'scenes/sceneTypes'
 
 import { Error404 } from '~/layout/Error404'
 import { SceneContent } from '~/layout/scenes/components/SceneContent'
 import { SceneTitleSection } from '~/layout/scenes/components/SceneTitleSection'
 import { ProductKey } from '~/queries/schema/schema-general'
+
+import { productToursEmptyState } from 'products/product_tours/frontend/emptyState/productToursEmptyState'
 
 import { NewProductTourModal } from './components/NewProductTourModal'
 import { ProductToursTable } from './components/ProductToursTable'
@@ -22,6 +24,7 @@ export const scene: SceneExport = {
     component: ProductTours,
     logic: productToursLogic,
     productKey: ProductKey.PRODUCT_TOURS,
+    emptyState: productToursEmptyState,
 }
 
 function NewTourButton(): JSX.Element {

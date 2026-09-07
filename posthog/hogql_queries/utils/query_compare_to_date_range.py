@@ -3,7 +3,7 @@ from typing import Optional
 
 from posthog.schema import DateRange, IntervalType
 
-from posthog.hogql_queries.utils.query_date_range import QueryDateRange
+from posthog.hogql_queries.utils.query_date_range import DateRangeBounds, QueryDateRange
 from posthog.models.team import Team
 from posthog.utils import relative_date_parse
 
@@ -29,26 +29,24 @@ class QueryCompareToDateRange(QueryDateRange):
         super().__init__(date_range, team, interval, now, **kwargs)
         self.compare_to = compare_to
 
-    def dates(self) -> tuple[datetime, datetime]:
+    def dates(self) -> DateRangeBounds:
         current_period_date_from = super().date_from()
         current_period_date_to = super().date_to()
 
         start_date = relative_date_parse(
             self.compare_to,
-            self._team.timezone_info,
+            self._timezone_info,
             now=current_period_date_from,
             human_friendly_comparison_periods=bool(self._team.human_friendly_comparison_periods),
         )
 
-        return (
-            start_date,
-            start_date + (current_period_date_to - current_period_date_from),
+        return DateRangeBounds(
+            date_from=start_date,
+            date_to=start_date + (self.nominal_comparison_date_to(current_period_date_to) - current_period_date_from),
         )
 
     def date_to(self) -> datetime:
-        previous_period_date_to = self.dates()[1]
-        return previous_period_date_to
+        return self.dates().date_to
 
     def date_from(self) -> datetime:
-        previous_period_date_from = self.dates()[0]
-        return previous_period_date_from
+        return self.dates().date_from

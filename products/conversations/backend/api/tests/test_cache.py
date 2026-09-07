@@ -1,6 +1,7 @@
 from unittest.mock import patch
 
-from django.test import TestCase
+from django.core.cache import cache
+from django.test import SimpleTestCase, TestCase
 
 from products.conversations.backend.cache import (
     MESSAGES_CACHE_TTL,
@@ -9,15 +10,34 @@ from products.conversations.backend.cache import (
     get_cached_messages,
     get_cached_tickets,
     get_cached_unread_count,
+    get_identity_tickets_cache_namespace,
     get_messages_cache_key,
     get_tickets_cache_key,
     get_unread_count_cache_key,
+    invalidate_identity_tickets_cache,
+    invalidate_messages_cache,
     invalidate_tickets_cache,
     invalidate_unread_count_cache,
     set_cached_messages,
     set_cached_tickets,
     set_cached_unread_count,
 )
+
+
+class TestIdentityTicketsCacheNamespace(SimpleTestCase):
+    def setUp(self):
+        cache.clear()
+
+    def test_invalidation_rotates_namespace(self):
+        initial_namespace = get_identity_tickets_cache_namespace(team_id=1)
+
+        invalidate_identity_tickets_cache(team_id=1)
+
+        assert get_identity_tickets_cache_namespace(team_id=1) != initial_namespace
+
+    @patch("products.conversations.backend.cache.cache.get", side_effect=Exception("Redis error"))
+    def test_lookup_failure_disables_cache(self, _mock_get):
+        assert get_identity_tickets_cache_namespace(team_id=1) is None
 
 
 class TestCacheKeyGeneration(TestCase):
@@ -86,19 +106,35 @@ class TestMessagesCacheOperations(TestCase):
         # Should not raise
         set_cached_messages(team_id=1, ticket_id="abc", response_data={})
 
+    @patch("products.conversations.backend.cache.cache")
+    def test_invalidate_messages_cache_deletes_key(self, mock_cache):
+        invalidate_messages_cache(team_id=1, ticket_id="abc-123")
+
+        mock_cache.delete.assert_called_once()
+        call_key = mock_cache.delete.call_args[0][0]
+        assert "messages" in call_key
+        assert "abc-123" in call_key
+
+    @patch("products.conversations.backend.cache.cache")
+    def test_invalidate_messages_cache_swallows_exception(self, mock_cache):
+        mock_cache.delete.side_effect = Exception("Redis error")
+
+        # Should not raise
+        invalidate_messages_cache(team_id=1, ticket_id="abc")
+
 
 class TestTicketsCacheOperations(TestCase):
     @patch("products.conversations.backend.cache.cache")
     def test_get_cached_tickets_returns_cached_data(self, mock_cache):
-        mock_cache.get.return_value = {"count": 5, "results": []}
+        mock_cache.get.return_value = {"results": [], "has_more": False}
 
         result = get_cached_tickets(team_id=1, widget_session_id="session")
 
-        assert result == {"count": 5, "results": []}
+        assert result == {"results": [], "has_more": False}
 
     @patch("products.conversations.backend.cache.cache")
     def test_get_cached_tickets_with_status_filter(self, mock_cache):
-        mock_cache.get.return_value = {"count": 2}
+        mock_cache.get.return_value = {"results": []}
 
         get_cached_tickets(team_id=1, widget_session_id="session", status="open")
 
@@ -115,7 +151,7 @@ class TestTicketsCacheOperations(TestCase):
 
     @patch("products.conversations.backend.cache.cache")
     def test_set_cached_tickets_sets_with_ttl(self, mock_cache):
-        data = {"count": 1, "results": []}
+        data = {"results": [], "has_more": False}
 
         set_cached_tickets(team_id=1, widget_session_id="session", response_data=data)
 
@@ -131,17 +167,21 @@ class TestTicketsCacheOperations(TestCase):
         set_cached_tickets(team_id=1, widget_session_id="session", response_data={})
 
     @patch("products.conversations.backend.cache.cache")
-    def test_invalidate_tickets_cache_deletes_key(self, mock_cache):
+    def test_invalidate_tickets_cache_deletes_all_status_variants(self, mock_cache):
         invalidate_tickets_cache(team_id=1, widget_session_id="session-123")
 
-        mock_cache.delete.assert_called_once()
-        call_key = mock_cache.delete.call_args[0][0]
-        assert "tickets" in call_key
-        assert "session-123" in call_key
+        mock_cache.delete_many.assert_called_once()
+        deleted_keys = mock_cache.delete_many.call_args[0][0]
+        # Should include unfiltered ("all") + every Status enum value
+        assert any("all" in k for k in deleted_keys)
+        assert any("open" in k for k in deleted_keys)
+        assert any("resolved" in k for k in deleted_keys)
+        assert any("new" in k for k in deleted_keys)
+        assert len(deleted_keys) == 6  # None + 5 statuses
 
     @patch("products.conversations.backend.cache.cache")
     def test_invalidate_tickets_cache_swallows_exception(self, mock_cache):
-        mock_cache.delete.side_effect = Exception("Redis error")
+        mock_cache.delete_many.side_effect = Exception("Redis error")
 
         # Should not raise
         invalidate_tickets_cache(team_id=1, widget_session_id="session")

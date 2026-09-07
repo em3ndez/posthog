@@ -1,29 +1,21 @@
 import { useActions, useValues } from 'kea'
 import { useState } from 'react'
 
+import { IconArrowRight } from '@posthog/icons'
 import { LemonInput, Link } from '@posthog/lemon-ui'
 
-import { AccessControlAction } from 'lib/components/AccessControlAction'
 import { PathCleanFilterAddItemButton } from 'lib/components/PathCleanFilters/PathCleanFilterAddItemButton'
 import { parseAliasToReadable } from 'lib/components/PathCleanFilters/PathCleanFilterItem'
 import { PathCleanFiltersTable } from 'lib/components/PathCleanFilters/PathCleanFiltersTable'
 import { PathCleaningRulesDebugger } from 'lib/components/PathCleanFilters/PathCleaningRulesDebugger'
-import { isValidRegexp } from 'lib/utils/regexp'
+import { applyPathCleaning } from 'lib/components/PathCleanFilters/pathCleaningUtils'
+import { RestrictionScope, useRestrictedArea } from 'lib/components/RestrictedArea'
+import { TeamMembershipLevel } from 'lib/constants'
+import { PathCleaningSuggestionsBanner } from 'scenes/settings/environment/PathCleaningSuggestionsBanner'
 import { teamLogic } from 'scenes/teamLogic'
 import { userLogic } from 'scenes/userLogic'
 
-import { AccessControlLevel, AccessControlResourceType, AvailableFeature, PathCleaningFilter } from '~/types'
-
-const cleanPathWithRegexes = (path: string, filters: PathCleaningFilter[]): string => {
-    return filters.reduce((text, filter) => {
-        // If for some reason we don't have a valid RegExp, don't attempt to clean the path
-        if (!isValidRegexp(filter.regex ?? '')) {
-            return text
-        }
-
-        return text.replace(new RegExp(filter.regex ?? '', 'gi'), filter.alias ?? '')
-    }, path)
-}
+import { AvailableFeature, PathCleaningFilter } from '~/types'
 
 export function PathCleaningFiltersConfig(): JSX.Element | null {
     const [testValue, setTestValue] = useState('')
@@ -32,6 +24,10 @@ export function PathCleaningFiltersConfig(): JSX.Element | null {
     const { currentTeam } = useValues(teamLogic)
     const { hasAvailableFeature } = useValues(userLogic)
     const hasAdvancedPaths = hasAvailableFeature(AvailableFeature.PATHS_ADVANCED)
+    const restrictedReason = useRestrictedArea({
+        scope: RestrictionScope.Project,
+        minimumAccessLevel: TeamMembershipLevel.Admin,
+    })
 
     if (!currentTeam) {
         return null
@@ -49,7 +45,7 @@ export function PathCleaningFiltersConfig(): JSX.Element | null {
         )
     }
 
-    const cleanedTestPath = cleanPathWithRegexes(testValue, currentTeam.path_cleaning_filters ?? [])
+    const cleanedTestPath = applyPathCleaning(testValue, currentTeam.path_cleaning_filters ?? [])
     const readableTestPath = parseAliasToReadable(cleanedTestPath)
 
     const updateFilters = (filters: PathCleaningFilter[]): void => {
@@ -66,20 +62,13 @@ export function PathCleaningFiltersConfig(): JSX.Element | null {
 
     return (
         <>
-            <AccessControlAction
-                resourceType={AccessControlResourceType.WebAnalytics}
-                minAccessLevel={AccessControlLevel.Editor}
-            >
-                <div className="flex flex-col gap-4">
-                    <PathCleanFiltersTable
-                        filters={currentTeam.path_cleaning_filters || []}
-                        setFilters={updateFilters}
-                    />
-                    <div>
-                        <PathCleanFilterAddItemButton onAdd={onAddFilter} />
-                    </div>
+            <PathCleaningSuggestionsBanner />
+            <div className="flex flex-col gap-4">
+                <PathCleanFiltersTable filters={currentTeam.path_cleaning_filters || []} setFilters={updateFilters} />
+                <div>
+                    <PathCleanFilterAddItemButton onAdd={onAddFilter} />
                 </div>
-            </AccessControlAction>
+            </div>
 
             <p className="mt-4">Wanna test what your cleaned path will look like? Try them out here.</p>
             <div className="flex flex-col sm:flex-row gap-2 items-center justify-center">
@@ -89,8 +78,9 @@ export function PathCleaningFiltersConfig(): JSX.Element | null {
                     placeholder="Enter a path to test"
                     size="medium"
                     className="flex-1"
+                    disabledReason={restrictedReason}
                 />
-                --&gt;
+                <IconArrowRight />
                 <span className="inline-flex items-center justify-start p-2 font-mono text-xs flex-1 border rounded min-h-10">
                     {readableTestPath}
                 </span>

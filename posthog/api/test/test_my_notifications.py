@@ -2,12 +2,13 @@ from datetime import timedelta
 from typing import Any, Optional
 
 from freezegun import freeze_time
-from freezegun.api import FrozenDateTimeFactory, StepTickTimeFactory
+from freezegun.api import FrozenDateTimeFactory, StepTickTimeFactory, TickingDateTimeFactory
 from posthog.test.base import APIBaseTest, FuzzyInt, QueryMatchingTest
 
 from rest_framework import status
 
 from posthog.models import NotificationViewed, User
+from posthog.test.insight_queries import default_pageview_query
 
 
 def _feature_flag_json_payload(key: str) -> dict:
@@ -60,8 +61,8 @@ class TestMyNotifications(APIBaseTest, QueryMatchingTest):
         if team_id is None:
             team_id = self.team.id
 
-        if "filters" not in data:
-            data["filters"] = {"events": [{"id": "$pageview"}]}
+        if "query" not in data:
+            data["query"] = default_pageview_query()
 
         response = self.client.post(f"/api/projects/{team_id}/insights", data=data)
         self.assertEqual(response.status_code, expected_status)
@@ -129,7 +130,7 @@ class TestMyNotifications(APIBaseTest, QueryMatchingTest):
         notebook_short_id: str,
         notebook_version: int,
         the_user: User,
-        frozen_time: FrozenDateTimeFactory | StepTickTimeFactory,
+        frozen_time: FrozenDateTimeFactory | StepTickTimeFactory | TickingDateTimeFactory,
     ) -> int:
         self.client.force_login(the_user)
         for created_insight_id in created_insights[:7]:
@@ -300,7 +301,7 @@ class TestMyNotifications(APIBaseTest, QueryMatchingTest):
                 user=user, defaults={"last_viewed_activity_date": f"2023-0{i}-17T04:36:50Z"}
             )
 
-            with self.assertNumQueries(FuzzyInt(43, 43)):
+            with self.assertNumQueries(FuzzyInt(33, 33)):
                 self.client.get(f"/api/projects/{self.team.id}/my_notifications")
 
     def test_microsecond_precision_mismatch(self):

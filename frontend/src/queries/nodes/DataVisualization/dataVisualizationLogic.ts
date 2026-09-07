@@ -1,4 +1,5 @@
 import {
+    MakeLogicType,
     actions,
     afterMount,
     connect,
@@ -12,11 +13,15 @@ import {
     selectors,
     sharedListeners,
 } from 'kea'
+import type { BreakPointFunction } from 'kea'
 import { subscriptions } from 'kea-subscriptions'
 import mergeObject from 'lodash.merge'
 
 import { dayjs } from 'lib/dayjs'
-import { RGBToHex, lightenDarkenColor, objectsEqual, uuid } from 'lib/utils'
+import { RGBToHex, lightenDarkenColor } from 'lib/utils/colors'
+import { uuid } from 'lib/utils/dom'
+import { compactNumber } from 'lib/utils/numbers'
+import { objectsEqual } from 'lib/utils/objects'
 import { sceneLogic } from 'scenes/sceneLogic'
 import { Scene } from 'scenes/sceneTypes'
 import { teamLogic } from 'scenes/teamLogic'
@@ -36,9 +41,25 @@ import {
 import { QueryContext } from '~/queries/types'
 import { ChartDisplayType, DashboardType } from '~/types'
 
+import type {
+    DataNode,
+    ErrorTrackingQueryResponse,
+    HogQLAutocompleteResponse,
+    HogQLMetadataResponse,
+    HogQLQueryResponse,
+    HogQueryResponse,
+    LogAttributesQueryResponse,
+    LogValuesQueryResponse,
+    MetricsQueryResponse,
+    RefreshType,
+    SessionsQueryResponse,
+    TraceSpansAggregationQueryResponse,
+    TraceSpansAttributeBreakdownQueryResponse,
+    TraceSpansQueryResponse,
+} from '../../schema/schema-general'
 import { dataNodeLogic } from '../DataNode/dataNodeLogic'
 import { QueryFeature, getQueryFeatures } from '../DataTable/queryFeatures'
-import type { dataVisualizationLogicType } from './dataVisualizationLogicType'
+import { getAutoBoxPlotSettings } from './Components/Charts/sqlBoxPlotAdapter'
 import { ColumnScalar, FORMATTING_TEMPLATES } from './types'
 
 export enum SideBarTab {
@@ -63,6 +84,8 @@ export interface TableDataCell<T extends string | number | boolean | Date | null
     value: T
     formattedValue: string | object | null
     type: ColumnScalar
+    sourceColumnName?: string
+    isTransposedHeader?: boolean
 }
 
 export interface AxisSeriesSettings {
@@ -117,6 +140,16 @@ const DefaultAxisSettings = (): AxisSeriesSettings => ({
     },
 })
 
+/** Deep clone settings to prevent shared references between Y-axis entries */
+const cloneSettings = (settings: AxisSeriesSettings): AxisSeriesSettings =>
+    mergeObject({}, settings) as AxisSeriesSettings
+
+const cloneOrDefaultSettings = (settings?: AxisSeriesSettings): AxisSeriesSettings =>
+    settings ? cloneSettings(settings) : DefaultAxisSettings()
+
+const TRANSPOSED_FIELD_COLUMN_NAME = '__transpose_field__'
+const TRANSPOSED_ROW_COLUMN_PREFIX = '__transpose_row__'
+
 export const formatDataWithSettings = (
     data: number | string | null | object,
     settings?: AxisSeriesSettings
@@ -138,6 +171,10 @@ export const formatDataWithSettings = (
 
         if (settings?.formatting?.style === 'number') {
             dataAsString = data.toLocaleString(undefined, { maximumFractionDigits: decimalPlaces })
+        }
+
+        if (settings?.formatting?.style === 'short') {
+            dataAsString = compactNumber(data)
         }
 
         if (settings?.formatting?.style === 'percent') {
@@ -239,6 +276,87 @@ const isNumericalType = (type: ColumnScalar): boolean => {
     return false
 }
 
+const columnsFromResponseFields = (columns: string[] = [], types: string[][] = []): Column[] => {
+    return columns.map((column, index) => {
+        const type = types[index]?.[1]
+        const friendlyClickhouseTypeName = toFriendlyClickhouseTypeName(type)
+
+        return {
+            name: column,
+            type: {
+                name: friendlyClickhouseTypeName,
+                isNumerical: isNumericalType(friendlyClickhouseTypeName),
+            },
+            label: `${column} - ${type}`,
+            dataIndex: index,
+        }
+    })
+}
+
+export const columnsFromResponse = (response: AnyResponseType | null): Column[] => {
+    if (!response) {
+        return []
+    }
+
+    return columnsFromResponseFields(
+        'columns' in response && Array.isArray(response.columns) ? response.columns : [],
+        'types' in response && Array.isArray(response.types) ? response.types : []
+    )
+}
+
+const deriveDefaultAxes = (columns: Column[]): { xAxis: string | null; yAxis: string[] } => {
+    const dateColumn = columns.find((column) => column.type.name.indexOf('DATE') !== -1)
+    const numericalColumns = columns.filter((column) => column.type.isNumerical)
+    const yAxis = numericalColumns.map((column) => column.name)
+
+    if (dateColumn) {
+        return { xAxis: dateColumn.name, yAxis }
+    }
+
+    const claimed = new Set(yAxis)
+    return { xAxis: columns.find((column) => !claimed.has(column.name))?.name ?? null, yAxis }
+}
+
+const resolveNonTimeSeriesVisualizationType = (columns: Column[]): ChartDisplayType => {
+    const stringColumns = columns.filter((column) => column.type.name === 'STRING')
+    const numericalColumns = columns.filter((column) => column.type.isNumerical)
+
+    if (stringColumns.length >= 2 && numericalColumns.length >= 1) {
+        return ChartDisplayType.TwoDimensionalHeatmap
+    }
+
+    if (numericalColumns.length === 1 && columns.length === 1) {
+        return ChartDisplayType.BoldNumber
+    }
+
+    if (numericalColumns.length > 0) {
+        return ChartDisplayType.ActionsBar
+    }
+
+    return ChartDisplayType.ActionsTable
+}
+
+export const rowCountFromResponse = (response: AnyResponseType | null): number => {
+    const rawResults =
+        response && 'results' in response ? response.results : response && 'result' in response ? response.result : []
+    return Array.isArray(rawResults) ? rawResults.length : 0
+}
+
+const hasTimeSeriesData = (columns: Column[], rowCount: number): boolean => {
+    const hasDateColumn = columns.some((column) => ['DATE', 'DATETIME'].includes(column.type.name))
+    const hasNumericColumn = columns.some((column) => column.type.isNumerical)
+
+    return hasDateColumn && hasNumericColumn && rowCount > 1
+}
+
+export const getAutoVisualizationType = (columns: Column[], rowCount: number): ChartDisplayType => {
+    if (hasTimeSeriesData(columns, rowCount)) {
+        return ChartDisplayType.ActionsLineGraph
+    }
+
+    return resolveNonTimeSeriesVisualizationType(columns)
+}
+
 const getHeatmapAutoSettings = (columns: Column[], heatmapSettings: HeatmapSettings): Partial<HeatmapSettings> => {
     const stringColumns = columns.filter((column) => column.type.name === 'STRING')
     const numericalColumns = columns.filter((column) => column.type.isNumerical)
@@ -260,6 +378,581 @@ const getHeatmapAutoSettings = (columns: Column[], heatmapSettings: HeatmapSetti
     return nextSettings
 }
 
+const applyAutoHeatmapSettings = (
+    actions: { updateChartSettings: (settings: ChartSettings) => void },
+    columns: Column[],
+    heatmapSettings: HeatmapSettings
+): void => {
+    const autoSettings = getHeatmapAutoSettings(columns, heatmapSettings)
+
+    if (Object.keys(autoSettings).length === 0) {
+        return
+    }
+
+    actions.updateChartSettings({
+        heatmap: {
+            ...heatmapSettings,
+            ...autoSettings,
+        },
+    })
+}
+
+const mergeChartSettings = (state: ChartSettings, settings: ChartSettings): ChartSettings => {
+    return {
+        ...state,
+        ...settings,
+        heatmap:
+            state.heatmap || settings.heatmap
+                ? {
+                      ...state.heatmap,
+                      ...settings.heatmap,
+                  }
+                : undefined,
+        pie:
+            state.pie || settings.pie
+                ? {
+                      ...state.pie,
+                      ...settings.pie,
+                  }
+                : undefined,
+        scatter:
+            state.scatter || settings.scatter
+                ? {
+                      ...state.scatter,
+                      ...settings.scatter,
+                  }
+                : undefined,
+        boxPlot:
+            state.boxPlot || settings.boxPlot
+                ? {
+                      ...state.boxPlot,
+                      ...settings.boxPlot,
+                  }
+                : undefined,
+        leftYAxisSettings:
+            state.leftYAxisSettings || settings.leftYAxisSettings
+                ? {
+                      ...state.leftYAxisSettings,
+                      ...settings.leftYAxisSettings,
+                  }
+                : undefined,
+        rightYAxisSettings:
+            state.rightYAxisSettings || settings.rightYAxisSettings
+                ? {
+                      ...state.rightYAxisSettings,
+                      ...settings.rightYAxisSettings,
+                  }
+                : undefined,
+        chartStyle:
+            state.chartStyle || settings.chartStyle
+                ? {
+                      ...state.chartStyle,
+                      ...settings.chartStyle,
+                  }
+                : undefined,
+    }
+}
+
+const shouldUseFirstNumericColumnAsContinuousChartXAxis = (
+    columns: Column[],
+    numericalColumns: Column[],
+    selectedXAxis: string | null,
+    selectedYAxis: (Pick<SelectedYAxis, 'name'> | null)[] | null
+): boolean => {
+    if (selectedXAxis !== null || columns.length < 2 || numericalColumns.length < 2) {
+        return false
+    }
+
+    if (!columns.every((column) => column.type.isNumerical)) {
+        return false
+    }
+
+    if (!selectedYAxis || selectedYAxis.length !== numericalColumns.length) {
+        return false
+    }
+
+    const selectedYAxisNames = new Set(selectedYAxis.map((series) => series?.name))
+
+    return numericalColumns.every((column) => selectedYAxisNames.has(column.name))
+}
+
+const resolveScatterXAxisColumn = (
+    columns: Column[],
+    numericalColumns: Column[],
+    selectedXAxis: string | null,
+    selectedYAxis: (Pick<SelectedYAxis, 'name'> | null)[] | null
+): Column | null => {
+    if (numericalColumns.length < 2) {
+        return null
+    }
+
+    const currentXAxis = columns.find((column) => column.name === selectedXAxis)
+    if (currentXAxis?.type.isNumerical) {
+        return currentXAxis
+    }
+
+    const selectedYAxisNames = new Set((selectedYAxis ?? []).map((series) => series?.name))
+    return numericalColumns.find((column) => !selectedYAxisNames.has(column.name)) ?? numericalColumns[0]
+}
+
+export function applyVisualizationType(
+    query: DataVisualizationNode,
+    visualizationType: ChartDisplayType,
+    columns: Column[],
+    rowCount: number
+): DataVisualizationNode {
+    const numericalColumns = columns.filter((column) => column.type.isNumerical)
+    const chartSettings: ChartSettings = { ...query.chartSettings }
+
+    const columnNames = new Set(columns.map((column) => column.name))
+    const invalidX = chartSettings.xAxis !== undefined && !columnNames.has(chartSettings.xAxis.column)
+    const invalidY =
+        chartSettings.yAxis?.some(
+            (series) => !columns.find((column) => column.name === series.column)?.type.isNumerical
+        ) ?? false
+
+    if (columns.length > 0 && (invalidX || invalidY)) {
+        chartSettings.xAxis = undefined
+        chartSettings.yAxis = undefined
+    }
+
+    // An empty yAxis records that the user deleted every series, so only absent axes are seeded.
+    if (chartSettings.xAxis === undefined && chartSettings.yAxis === undefined) {
+        const seeded = deriveDefaultAxes(columns)
+        if (seeded.yAxis.length > 0) {
+            chartSettings.yAxis = seeded.yAxis.map((column) => ({ column, settings: DefaultAxisSettings() }))
+        }
+        if (seeded.xAxis) {
+            chartSettings.xAxis = { column: seeded.xAxis }
+        }
+    }
+
+    const selectedXAxis = chartSettings.xAxis?.column ?? null
+    let yAxis = chartSettings.yAxis ? [...chartSettings.yAxis] : []
+    const selectedYAxis = yAxis.map((series) => ({ name: series.column }))
+
+    if (visualizationType === ChartDisplayType.ActionsPie && chartSettings.pie?.sliceContent === undefined) {
+        chartSettings.pie = { ...chartSettings.pie, sliceContent: 'labels' }
+    }
+
+    if (
+        [ChartDisplayType.ActionsLineGraph, ChartDisplayType.ActionsAreaGraph].includes(visualizationType) &&
+        shouldUseFirstNumericColumnAsContinuousChartXAxis(columns, numericalColumns, selectedXAxis, selectedYAxis)
+    ) {
+        const [xAxisColumn] = numericalColumns
+        chartSettings.xAxis = { column: xAxisColumn.name }
+        yAxis = yAxis.filter((series) => series.column !== xAxisColumn.name)
+    }
+
+    if (visualizationType === ChartDisplayType.ScatterPlot) {
+        const xAxisColumn = resolveScatterXAxisColumn(columns, numericalColumns, selectedXAxis, selectedYAxis)
+        if (xAxisColumn) {
+            chartSettings.xAxis = { column: xAxisColumn.name }
+            yAxis = yAxis.filter((series) => series.column !== xAxisColumn.name)
+        }
+    }
+
+    if (visualizationType === ChartDisplayType.BoxPlot) {
+        chartSettings.boxPlot = getAutoBoxPlotSettings(columns, chartSettings.boxPlot)
+    }
+
+    const isAutoHeatmap =
+        visualizationType === ChartDisplayType.Auto &&
+        getAutoVisualizationType(columns, rowCount) === ChartDisplayType.TwoDimensionalHeatmap
+
+    if (visualizationType === ChartDisplayType.TwoDimensionalHeatmap || isAutoHeatmap) {
+        const heatmap = chartSettings.heatmap ?? {}
+        const autoSettings = getHeatmapAutoSettings(columns, heatmap)
+        if (Object.keys(autoSettings).length > 0) {
+            chartSettings.heatmap = { ...heatmap, ...autoSettings }
+        }
+    }
+
+    if (chartSettings.yAxis !== undefined) {
+        chartSettings.yAxis = yAxis
+    }
+
+    return { ...query, display: visualizationType, chartSettings }
+}
+
+/**
+ * Establishes the scatter x-axis invariant: a numeric column on the x axis that isn't also a
+ * y-series. Runs from every entry path a scatter can arrive through, including column changes and
+ * persisted or assistant-created insights, so the chart never
+ * renders blank or plots a column against itself. A no-op when there's nothing to fix.
+ */
+const applyScatterXAxis = (
+    actions: {
+        updateXSeries: (columnName: string) => void
+        deleteYSeries: (seriesIndex: number) => void
+    },
+    columns: Column[],
+    selectedXAxis: string | null,
+    selectedYAxis: (SelectedYAxis | null)[] | null
+): void => {
+    const numericalColumns = columns.filter((column) => column.type.isNumerical)
+    const xAxisColumn = resolveScatterXAxisColumn(columns, numericalColumns, selectedXAxis, selectedYAxis)
+    if (!xAxisColumn) {
+        return
+    }
+
+    if (xAxisColumn.name !== selectedXAxis) {
+        actions.updateXSeries(xAxisColumn.name)
+    }
+
+    // updateXSeries doesn't touch the y-series array, so this index stays valid.
+    const xAxisSeriesIndex = selectedYAxis?.findIndex((series) => series?.name === xAxisColumn.name) ?? -1
+    if (xAxisSeriesIndex > -1) {
+        actions.deleteYSeries(xAxisSeriesIndex)
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface dataVisualizationLogicValues {
+    hasMoreData: boolean // dataNodeLogic
+    queryCancelled: boolean // dataNodeLogic
+    response:
+        | ErrorTrackingQueryResponse
+        | HogQLAutocompleteResponse
+        | HogQLMetadataResponse
+        | HogQLQueryResponse<any[]>
+        | HogQueryResponse
+        | LogAttributesQueryResponse
+        | LogValuesQueryResponse
+        | MetricsQueryResponse
+        | Record<string, any>
+        | SessionsQueryResponse
+        | TraceSpansAggregationQueryResponse
+        | TraceSpansAttributeBreakdownQueryResponse
+        | TraceSpansQueryResponse
+        | null // dataNodeLogic
+    responseError: string | null // dataNodeLogic
+    responseLoading: boolean // dataNodeLogic
+    activeSceneId: string | null // sceneLogic
+    currentTeamId: number | null // teamLogic
+    isDarkModeOn: boolean // themeLogic
+    activeSideBarTab: SideBarTab
+    autoVisualizationType: ChartDisplayType
+    chartSettings: ChartSettings
+    columns: Column[]
+    conditionalFormattingRules: ConditionalFormattingRule[]
+    conditionalFormattingRulesPanelActiveKeys: string[]
+    dashboardId: any
+    dataVisualizationProps: DataVisualizationLogicProps
+    effectiveVisualizationType: ChartDisplayType
+    hasDateTimeColumns: boolean
+    hasSortedTable: boolean
+    isChartSettingsPanelOpen: boolean
+    isColumnPinned: (columnName: string) => boolean
+    isPinningEnabled: boolean
+    isShowingCachedResults: boolean
+    isTableVisualization: boolean
+    isTransposed: boolean
+    numericalColumns: Column[]
+    pinnedColumns: string[]
+    presetChartHeight: boolean
+    query: DataVisualizationNode
+    selectedXAxis: string | null
+    selectedYAxis: (SelectedYAxis | null)[] | null
+    showEditingUI: boolean
+    showResultControls: boolean
+    showTableSettings: boolean
+    sourceFeatures: Set<QueryFeature>
+    sourceTabularColumns: AxisSeries<any>[]
+    sourceTabularData: TableDataCell<any>[][]
+    tabularColumnSettings: (SelectedYAxis | null)[] | null
+    tabularColumns: AxisSeries<any>[]
+    tabularData: TableDataCell<any>[][]
+    visualizationType: ChartDisplayType
+    xData: AxisSeries<string> | null
+    yData: AxisSeries<number | null>[]
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface dataVisualizationLogicActions {
+    loadData: (
+        refresh?: RefreshType | undefined,
+        alreadyRunningQueryId?: string | undefined,
+        overrideQuery?: DataNode<Record<string, any>> | undefined
+    ) => {
+        overrideQuery: DataNode<Record<string, any>> | undefined
+        pollOnly: boolean
+        queryId: string
+        refresh: RefreshType | undefined
+    } // dataNodeLogic
+    _setQuery: (node: DataVisualizationNode) => {
+        node: DataVisualizationNode
+    }
+    addConditionalFormattingRule: (rule?: ConditionalFormattingRule) => {
+        isDarkModeOn: boolean
+        rule:
+            | ConditionalFormattingRule
+            | {
+                  id: string
+              }
+    }
+    addSeries: (
+        columnName?: string,
+        settings?: AxisSeriesSettings
+    ) => {
+        allColumns: Column[]
+        columnName: string | undefined
+        settings: AxisSeriesSettings | undefined
+    }
+    addYSeries: (
+        columnName?: string,
+        settings?: AxisSeriesSettings
+    ) => {
+        allNumericalColumns: Column[]
+        columnName: string | undefined
+        settings: AxisSeriesSettings | undefined
+    }
+    clearAxis: () => {
+        value: true
+    }
+    deleteYSeries: (seriesIndex: number) => {
+        seriesIndex: number
+    }
+    setConditionalFormattingRulesPanelActiveKeys: (keys: string[]) => {
+        keys: string[]
+    }
+    setQuery: (setter: (node: DataVisualizationNode) => DataVisualizationNode) => {
+        setter: (node: DataVisualizationNode) => DataVisualizationNode
+    }
+    setSideBarTab: (tab: SideBarTab) => {
+        tab: SideBarTab
+    }
+    setTableSorted: () => {
+        value: true
+    }
+    setTransposeResults: (transpose: boolean) => {
+        transpose: boolean
+    }
+    setVisualizationType: (visualizationType: ChartDisplayType) => {
+        node: DataVisualizationNode
+        visualizationType: ChartDisplayType
+    }
+    toggleChartSettingsPanel: (open?: boolean) => {
+        open: boolean | undefined
+    }
+    toggleColumnPin: (columnName: string) => {
+        columnName: string
+    }
+    updateChartSettings: (settings: ChartSettings) => {
+        settings: ChartSettings
+    }
+    updateConditionalFormattingRule: (
+        rule: ConditionalFormattingRule,
+        deleteRule?: boolean
+    ) => {
+        colorMode: string
+        deleteRule: boolean | undefined
+        rule: ConditionalFormattingRule
+    }
+    updateSeries: (
+        columnName: string,
+        settings?: AxisSeriesSettings
+    ) => {
+        columnName: string
+        settings: AxisSeriesSettings | undefined
+    }
+    updateSeriesIndex: (
+        seriesIndex: number,
+        columnName: string,
+        settings?: AxisSeriesSettings
+    ) => {
+        columnName: string
+        seriesIndex: number
+        settings: AxisSeriesSettings | undefined
+    }
+    updateXSeries: (columnName: string) => {
+        columnName: string
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface dataVisualizationLogicMeta {
+    key: string
+    sharedListeners: {
+        axesChanged: (
+            payload: any,
+            breakpoint: BreakPointFunction,
+            action: {
+                type: string
+                payload: any
+            },
+            previousState: any
+        ) => void | Promise<void>
+        conditionalFormattingRules: (
+            payload: any,
+            breakpoint: BreakPointFunction,
+            action: {
+                type: string
+                payload: any
+            },
+            previousState: any
+        ) => void | Promise<void>
+        pinnedColumnsChanged: (
+            payload: any,
+            breakpoint: BreakPointFunction,
+            action: {
+                type: string
+                payload: any
+            },
+            previousState: any
+        ) => void | Promise<void>
+    }
+    __keaTypeGenInternalSelectorTypes: {
+        columns: (
+            response:
+                | ErrorTrackingQueryResponse
+                | HogQLAutocompleteResponse
+                | HogQLMetadataResponse
+                | HogQLQueryResponse<any[]>
+                | HogQueryResponse
+                | LogAttributesQueryResponse
+                | LogValuesQueryResponse
+                | MetricsQueryResponse
+                | Record<string, any>
+                | SessionsQueryResponse
+                | TraceSpansAggregationQueryResponse
+                | TraceSpansAttributeBreakdownQueryResponse
+                | TraceSpansQueryResponse
+                | null
+        ) => Column[]
+        numericalColumns: (columns: Column[]) => Column[]
+        hasDateTimeColumns: (columns: Column[]) => boolean
+        dashboardId: (arg: any) => any
+        showEditingUI: (arg: boolean | undefined, dashboardId: any) => boolean
+        showResultControls: (arg: boolean | undefined, dashboardId: any) => boolean
+        presetChartHeight: (key: string, dashboardId: any, activeSceneId: string | null) => boolean
+        sourceFeatures: (query: DataVisualizationNode) => Set<QueryFeature>
+        isShowingCachedResults: (arg: any) => boolean
+        isTransposed: (query: DataVisualizationNode) => boolean
+        yData: (
+            selectedYAxis: (SelectedYAxis | null)[] | null,
+            response:
+                | ErrorTrackingQueryResponse
+                | HogQLAutocompleteResponse
+                | HogQLMetadataResponse
+                | HogQLQueryResponse<any[]>
+                | HogQueryResponse
+                | LogAttributesQueryResponse
+                | LogValuesQueryResponse
+                | MetricsQueryResponse
+                | Record<string, any>
+                | SessionsQueryResponse
+                | TraceSpansAggregationQueryResponse
+                | TraceSpansAttributeBreakdownQueryResponse
+                | TraceSpansQueryResponse
+                | null,
+            columns: Column[],
+            chartSettings: ChartSettings
+        ) => AxisSeries<number | null>[]
+        xData: (
+            selectedXAxis: string | null,
+            response:
+                | ErrorTrackingQueryResponse
+                | HogQLAutocompleteResponse
+                | HogQLMetadataResponse
+                | HogQLQueryResponse<any[]>
+                | HogQueryResponse
+                | LogAttributesQueryResponse
+                | LogValuesQueryResponse
+                | MetricsQueryResponse
+                | Record<string, any>
+                | SessionsQueryResponse
+                | TraceSpansAggregationQueryResponse
+                | TraceSpansAttributeBreakdownQueryResponse
+                | TraceSpansQueryResponse
+                | null,
+            columns: Column[]
+        ) => AxisSeries<string> | null
+        sourceTabularColumns: (
+            tabularColumnSettings: (SelectedYAxis | null)[] | null,
+            response:
+                | ErrorTrackingQueryResponse
+                | HogQLAutocompleteResponse
+                | HogQLMetadataResponse
+                | HogQLQueryResponse<any[]>
+                | HogQueryResponse
+                | LogAttributesQueryResponse
+                | LogValuesQueryResponse
+                | MetricsQueryResponse
+                | Record<string, any>
+                | SessionsQueryResponse
+                | TraceSpansAggregationQueryResponse
+                | TraceSpansAttributeBreakdownQueryResponse
+                | TraceSpansQueryResponse
+                | null,
+            columns: Column[]
+        ) => AxisSeries<any>[]
+        sourceTabularData: (
+            sourceTabularColumns: AxisSeries<any>[],
+            response:
+                | ErrorTrackingQueryResponse
+                | HogQLAutocompleteResponse
+                | HogQLMetadataResponse
+                | HogQLQueryResponse<any[]>
+                | HogQueryResponse
+                | LogAttributesQueryResponse
+                | LogValuesQueryResponse
+                | MetricsQueryResponse
+                | Record<string, any>
+                | SessionsQueryResponse
+                | TraceSpansAggregationQueryResponse
+                | TraceSpansAttributeBreakdownQueryResponse
+                | TraceSpansQueryResponse
+                | null,
+            chartSettings: ChartSettings
+        ) => TableDataCell<any>[][]
+        tabularColumns: (
+            sourceTabularColumns: AxisSeries<any>[],
+            sourceTabularData: TableDataCell<any>[][],
+            isTransposed: boolean
+        ) => AxisSeries<any>[]
+        tabularData: (
+            sourceTabularColumns: AxisSeries<any>[],
+            sourceTabularData: TableDataCell<any>[][],
+            isTransposed: boolean
+        ) => TableDataCell<any>[][]
+        dataVisualizationProps: (arg: any) => DataVisualizationLogicProps
+        effectiveVisualizationType: (
+            visualizationType: ChartDisplayType,
+            autoVisualizationType: ChartDisplayType
+        ) => ChartDisplayType
+        autoVisualizationType: (
+            columns: Column[],
+            response:
+                | ErrorTrackingQueryResponse
+                | HogQLAutocompleteResponse
+                | HogQLMetadataResponse
+                | HogQLQueryResponse<any[]>
+                | HogQueryResponse
+                | LogAttributesQueryResponse
+                | LogValuesQueryResponse
+                | MetricsQueryResponse
+                | Record<string, any>
+                | SessionsQueryResponse
+                | TraceSpansAggregationQueryResponse
+                | TraceSpansAttributeBreakdownQueryResponse
+                | TraceSpansQueryResponse
+                | null
+        ) => ChartDisplayType
+        isTableVisualization: (effectiveVisualizationType: ChartDisplayType) => boolean
+        showTableSettings: (effectiveVisualizationType: ChartDisplayType) => boolean
+        isColumnPinned: (pinnedColumns: string[]) => (columnName: string) => boolean
+        isPinningEnabled: (activeSceneId: string | null, isTransposed: boolean) => boolean
+    }
+}
+
+export type dataVisualizationLogicType = MakeLogicType<
+    dataVisualizationLogicValues,
+    dataVisualizationLogicActions,
+    DataVisualizationLogicProps,
+    dataVisualizationLogicMeta
+>
+
 export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
     key((props) => props.key),
     path(['queries', 'nodes', 'DataVisualization', 'dataVisualizationLogic']),
@@ -276,7 +969,7 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
                 variablesOverride: props.variablesOverride,
                 limitContext: props.limitContext,
             }),
-            ['response', 'responseLoading', 'responseError', 'queryCancelled'],
+            ['response', 'responseLoading', 'responseError', 'queryCancelled', 'hasMoreData'],
             themeLogic,
             ['isDarkModeOn'],
             sceneLogic,
@@ -308,7 +1001,15 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
     }),
     props({ query: { source: {} } } as DataVisualizationLogicProps),
     actions(({ values }) => ({
-        setVisualizationType: (visualizationType: ChartDisplayType) => ({ visualizationType }),
+        setVisualizationType: (visualizationType: ChartDisplayType) => ({
+            visualizationType,
+            node: applyVisualizationType(
+                values.query,
+                visualizationType,
+                values.columns,
+                rowCountFromResponse(values.response)
+            ),
+        }),
         updateXSeries: (columnName: string) => ({
             columnName,
         }),
@@ -345,6 +1046,8 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
         }),
         setConditionalFormattingRulesPanelActiveKeys: (keys: string[]) => ({ keys }),
         toggleColumnPin: (columnName: string) => ({ columnName }),
+        setTableSorted: true,
+        setTransposeResults: (transpose: boolean) => ({ transpose }),
         _setQuery: (node: DataVisualizationNode) => ({ node }),
     })),
     reducers(({ props }) => ({
@@ -352,6 +1055,7 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
             props.query,
             {
                 setQuery: (state, { setter }) => setter(state),
+                setVisualizationType: (_, { node }) => node,
                 _setQuery: (_, { node }) => node,
             },
         ],
@@ -369,7 +1073,7 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
                     if (node.tableSettings?.columns) {
                         return node.tableSettings.columns.map((column) => ({
                             name: column.column,
-                            settings: column.settings ?? DefaultAxisSettings(),
+                            settings: cloneOrDefaultSettings(column.settings),
                         }))
                     }
                     return state
@@ -415,7 +1119,7 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
 
                     ySeries[index] = {
                         name: columnName,
-                        settings: mergeObject(ySeries[index]?.settings ?? {}, settings),
+                        settings: mergeObject({}, ySeries[index]?.settings ?? {}, settings),
                     }
                     return ySeries
                 },
@@ -428,7 +1132,7 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
 
                     ySeries[seriesIndex] = {
                         name: columnName,
-                        settings: mergeObject(ySeries[seriesIndex]?.settings ?? {}, settings),
+                        settings: mergeObject({}, ySeries[seriesIndex]?.settings ?? {}, settings),
                     }
                     return ySeries
                 },
@@ -437,6 +1141,7 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
         selectedXAxis: [
             props.query.chartSettings?.xAxis?.column ?? null,
             {
+                setVisualizationType: (_, { node }) => node.chartSettings?.xAxis?.column ?? null,
                 _setQuery: (_, { node }) => node.chartSettings?.xAxis?.column ?? null,
                 clearAxis: () => null,
                 updateXSeries: (_, { columnName }) => columnName,
@@ -445,14 +1150,23 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
         selectedYAxis: [
             (props.query.chartSettings?.yAxis?.map((axis) => ({
                 name: axis.column,
-                settings: axis.settings ?? DefaultAxisSettings(),
+                settings: cloneOrDefaultSettings(axis.settings),
             })) ?? null) as (SelectedYAxis | null)[] | null,
             {
+                setVisualizationType: (state, { node }) => {
+                    if (node.chartSettings?.yAxis) {
+                        return node.chartSettings.yAxis.map((axis) => ({
+                            name: axis.column,
+                            settings: cloneOrDefaultSettings(axis.settings),
+                        }))
+                    }
+                    return state
+                },
                 _setQuery: (state, { node }) => {
                     if (node.chartSettings?.yAxis) {
                         return node.chartSettings.yAxis.map((axis) => ({
                             name: axis.column,
-                            settings: axis.settings ?? DefaultAxisSettings(),
+                            settings: cloneOrDefaultSettings(axis.settings),
                         }))
                     }
                     return state
@@ -495,7 +1209,7 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
 
                     ySeries[seriesIndex] = {
                         name: columnName,
-                        settings: mergeObject(ySeries[seriesIndex]?.settings ?? {}, settings),
+                        settings: mergeObject({}, ySeries[seriesIndex]?.settings ?? {}, settings),
                     }
                     return ySeries
                 },
@@ -513,7 +1227,7 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
 
                     ySeries[index] = {
                         name: columnName,
-                        settings: mergeObject(ySeries[index]?.settings ?? {}, settings),
+                        settings: mergeObject({}, ySeries[index]?.settings ?? {}, settings),
                     }
                     return ySeries
                 },
@@ -543,9 +1257,10 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
         chartSettings: [
             props.query.chartSettings ?? ({} as ChartSettings),
             {
+                setVisualizationType: (state, { node }) => node.chartSettings ?? state,
                 _setQuery: (state, { node }) => node.chartSettings ?? state,
                 updateChartSettings: (state, { settings }) => {
-                    return { ...state, ...settings }
+                    return mergeChartSettings(state, settings)
                 },
             },
         ],
@@ -646,45 +1361,49 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
                 },
             },
         ],
+        hasSortedTable: [
+            false,
+            {
+                setTableSorted: () => true,
+            },
+        ],
     })),
     selectors({
         columns: [
             (s) => [s.response],
-            (response): Column[] => {
-                if (!response) {
-                    return []
-                }
-
-                const columns: string[] = response['columns'] ?? []
-                const types: string[][] = response['types'] ?? []
-
-                return columns.map((column, index) => {
-                    const type = types[index]?.[1]
-                    const friendlyClickhouseTypeName = toFriendlyClickhouseTypeName(type)
-
-                    return {
-                        name: column,
-                        type: {
-                            name: friendlyClickhouseTypeName,
-                            isNumerical: isNumericalType(friendlyClickhouseTypeName),
-                        },
-                        label: `${column} - ${type}`,
-                        dataIndex: index,
-                    }
-                })
-            },
+            (
+                response:
+                    | Record<string, any>
+                    | null
+                    | import('~/queries/schema/schema-general').ErrorTrackingQueryResponse
+                    | import('~/queries/schema/schema-general').HogQLAutocompleteResponse
+                    | import('~/queries/schema/schema-general').HogQLMetadataResponse
+                    | import('~/queries/schema/schema-general').HogQLQueryResponse<any[]>
+                    | import('~/queries/schema/schema-general').HogQueryResponse
+                    | import('~/queries/schema/schema-general').LogAttributesQueryResponse
+                    | import('~/queries/schema/schema-general').LogValuesQueryResponse
+                    | import('~/queries/schema/schema-general').MetricsQueryResponse
+                    | import('~/queries/schema/schema-general').SessionsQueryResponse
+                    | import('~/queries/schema/schema-general').TraceSpansAggregationQueryResponse
+                    | import('~/queries/schema/schema-general').TraceSpansAttributeBreakdownQueryResponse
+                    | import('~/queries/schema/schema-general').TraceSpansQueryResponse
+            ): Column[] => columnsFromResponse(response),
             { resultEqualityCheck: objectsEqual },
         ],
         numericalColumns: [
             (s) => [s.columns],
-            (columns): Column[] => {
+            (columns: Column[]): Column[] => {
                 return columns.filter((n) => n.type.isNumerical)
             },
+        ],
+        hasDateTimeColumns: [
+            (s) => [s.columns],
+            (columns: Column[]): boolean => columns.some((column) => ['DATE', 'DATETIME'].includes(column.type.name)),
         ],
         dashboardId: [() => [(_, props) => props.dashboardId], (dashboardId) => dashboardId ?? null],
         showEditingUI: [
             (s) => [(_, props: DataVisualizationLogicProps) => props.editMode, s.dashboardId],
-            (editMode, dashboardId) => {
+            (editMode: boolean | undefined, dashboardId) => {
                 if (dashboardId) {
                     return false
                 }
@@ -693,7 +1412,7 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
         ],
         showResultControls: [
             (s) => [(_, props: DataVisualizationLogicProps) => props.editMode, s.dashboardId],
-            (editMode, dashboardId) => {
+            (editMode: boolean | undefined, dashboardId) => {
                 if (editMode) {
                     return true
                 }
@@ -703,33 +1422,69 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
         ],
         presetChartHeight: [
             (s, props) => [props.key, s.dashboardId, s.activeSceneId],
-            (key, dashboardId, activeSceneId) => {
-                // Key for SQL editor based visiaulizations
-                const sqlEditorScene = activeSceneId === Scene.SQLEditor
+            (key: string, dashboardId, activeSceneId: string | null) => {
+                // Keys for SQL editor visualizations can render outside the SQLEditor scene,
+                // e.g. in embedded mode, so key matching keeps sizing consistent.
+                const sqlEditorVisualization =
+                    activeSceneId === Scene.SQLEditor ||
+                    key.includes('SQLEditor') ||
+                    key.startsWith('data-warehouse-editor-data-node-')
 
                 if (activeSceneId === Scene.Insight) {
                     return true
                 }
 
-                return !key.includes('new-SQL') && !dashboardId && !sqlEditorScene
+                return !key.includes('new-SQL') && !dashboardId && !sqlEditorVisualization
             },
         ],
-        sourceFeatures: [(_, props) => [props.query], (query): Set<QueryFeature> => getQueryFeatures(query.source)],
+        sourceFeatures: [
+            (_, props) => [props.query],
+            (query: DataVisualizationNode): Set<QueryFeature> => getQueryFeatures(query.source),
+        ],
         isShowingCachedResults: [
             () => [(_, props) => props.cachedResults ?? null],
             (cachedResults: AnyResponseType | null): boolean => !!cachedResults,
         ],
+        isTransposed: [
+            (s) => [s.query],
+            (query: DataVisualizationNode): boolean => query.tableSettings?.transpose ?? false,
+        ],
         yData: [
-            (s) => [s.selectedYAxis, s.response, s.columns],
-            (ySeries, response, columns): AxisSeries<number>[] => {
+            (s) => [s.selectedYAxis, s.response, s.columns, s.chartSettings],
+            (
+                ySeries: (SelectedYAxis | null)[] | null,
+                response:
+                    | Record<string, any>
+                    | null
+                    | import('~/queries/schema/schema-general').ErrorTrackingQueryResponse
+                    | import('~/queries/schema/schema-general').HogQLAutocompleteResponse
+                    | import('~/queries/schema/schema-general').HogQLMetadataResponse
+                    | import('~/queries/schema/schema-general').HogQLQueryResponse<any[]>
+                    | import('~/queries/schema/schema-general').HogQueryResponse
+                    | import('~/queries/schema/schema-general').LogAttributesQueryResponse
+                    | import('~/queries/schema/schema-general').LogValuesQueryResponse
+                    | import('~/queries/schema/schema-general').MetricsQueryResponse
+                    | import('~/queries/schema/schema-general').SessionsQueryResponse
+                    | import('~/queries/schema/schema-general').TraceSpansAggregationQueryResponse
+                    | import('~/queries/schema/schema-general').TraceSpansAttributeBreakdownQueryResponse
+                    | import('~/queries/schema/schema-general').TraceSpansQueryResponse,
+                columns: Column[],
+                chartSettings: ChartSettings
+            ): AxisSeries<number | null>[] => {
                 if (!response || ySeries === null || ySeries.length === 0) {
                     return [EmptyYAxisSeries]
                 }
 
-                const data: any[] = response?.['results'] ?? response?.['result'] ?? []
+                const showNullsAsZero = chartSettings.showNullsAsZero ?? false
+                const data =
+                    'results' in response && Array.isArray(response.results)
+                        ? response.results
+                        : 'result' in response && Array.isArray(response.result)
+                          ? response.result
+                          : []
 
                 return ySeries
-                    .map((series): AxisSeries<number> | null => {
+                    .map((series): AxisSeries<number | null> | null => {
                         if (!series) {
                             return EmptyYAxisSeries
                         }
@@ -758,7 +1513,7 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
                                         n[column.dataIndex] === undefined ||
                                         n[column.dataIndex] === null
                                     if (isNotANumber) {
-                                        return 0
+                                        return showNullsAsZero ? 0 : null
                                     }
 
                                     const isInt = Number.isInteger(n[column.dataIndex])
@@ -766,19 +1521,37 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
                                         ? parseInt(n[column.dataIndex], 10) * multiplier
                                         : parseFloat(n[column.dataIndex]) * multiplier
                                 } catch {
-                                    return 0
+                                    return showNullsAsZero ? 0 : null
                                 }
                             }),
                             settings: series.settings,
                         }
                     })
-                    .filter((series): series is AxisSeries<number> => Boolean(series))
+                    .filter((series): series is AxisSeries<number | null> => Boolean(series))
             },
         ],
         xData: [
             (s) => [s.selectedXAxis, s.response, s.columns],
-            (xSeries, response, columns): AxisSeries<string> | null => {
-                if (!response || xSeries === null) {
+            (
+                xSeries: string | null,
+                response:
+                    | Record<string, any>
+                    | null
+                    | import('~/queries/schema/schema-general').ErrorTrackingQueryResponse
+                    | import('~/queries/schema/schema-general').HogQLAutocompleteResponse
+                    | import('~/queries/schema/schema-general').HogQLMetadataResponse
+                    | import('~/queries/schema/schema-general').HogQLQueryResponse<any[]>
+                    | import('~/queries/schema/schema-general').HogQueryResponse
+                    | import('~/queries/schema/schema-general').LogAttributesQueryResponse
+                    | import('~/queries/schema/schema-general').LogValuesQueryResponse
+                    | import('~/queries/schema/schema-general').MetricsQueryResponse
+                    | import('~/queries/schema/schema-general').SessionsQueryResponse
+                    | import('~/queries/schema/schema-general').TraceSpansAggregationQueryResponse
+                    | import('~/queries/schema/schema-general').TraceSpansAttributeBreakdownQueryResponse
+                    | import('~/queries/schema/schema-general').TraceSpansQueryResponse,
+                columns: Column[]
+            ): AxisSeries<string> | null => {
+                if (!response) {
                     return {
                         column: {
                             name: 'None',
@@ -793,7 +1566,23 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
                     }
                 }
 
-                const data: any[] = response?.['results'] ?? response?.['result'] ?? []
+                const data =
+                    ('results' in response ? response.results : 'result' in response ? response.result : null) ?? []
+
+                if (xSeries === null) {
+                    return {
+                        column: {
+                            name: 'None',
+                            type: {
+                                name: 'STRING',
+                                isNumerical: false,
+                            },
+                            label: 'None',
+                            dataIndex: -1,
+                        },
+                        data: data.map(() => ''),
+                    }
+                }
 
                 const column = columns.find((n) => n.name === xSeries)
                 if (!column) {
@@ -802,21 +1591,81 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
 
                 return {
                     column,
-                    data: data.map((n) => n[column.dataIndex]),
+                    data: data.map((n: any) => n[column.dataIndex]),
                 }
             },
         ],
-        tabularData: [
-            (s) => [s.tabularColumns, s.response],
-            (tabularColumns, response): TableDataCell<any>[][] => {
-                if (!response || tabularColumns === null) {
+        sourceTabularColumns: [
+            (s) => [s.tabularColumnSettings, s.response, s.columns],
+            (
+                tabularColumnSettings: (SelectedYAxis | null)[] | null,
+                response:
+                    | Record<string, any>
+                    | null
+                    | import('~/queries/schema/schema-general').ErrorTrackingQueryResponse
+                    | import('~/queries/schema/schema-general').HogQLAutocompleteResponse
+                    | import('~/queries/schema/schema-general').HogQLMetadataResponse
+                    | import('~/queries/schema/schema-general').HogQLQueryResponse<any[]>
+                    | import('~/queries/schema/schema-general').HogQueryResponse
+                    | import('~/queries/schema/schema-general').LogAttributesQueryResponse
+                    | import('~/queries/schema/schema-general').LogValuesQueryResponse
+                    | import('~/queries/schema/schema-general').MetricsQueryResponse
+                    | import('~/queries/schema/schema-general').SessionsQueryResponse
+                    | import('~/queries/schema/schema-general').TraceSpansAggregationQueryResponse
+                    | import('~/queries/schema/schema-general').TraceSpansAttributeBreakdownQueryResponse
+                    | import('~/queries/schema/schema-general').TraceSpansQueryResponse,
+                columns: Column[]
+            ): AxisSeries<any>[] => {
+                if (!response) {
                     return []
                 }
 
-                const data: (string | number | null)[][] = response?.['results'] ?? response?.['result'] ?? []
+                return columns.map((col) => {
+                    const series = (tabularColumnSettings || []).find((n) => n?.name === col.name)
+
+                    return {
+                        column: col,
+                        data: [],
+                        settings: series?.settings ?? DefaultAxisSettings(),
+                    }
+                })
+            },
+        ],
+        sourceTabularData: [
+            (s) => [s.sourceTabularColumns, s.response, s.chartSettings],
+            (
+                sourceTabularColumns: AxisSeries<any>[],
+                response:
+                    | Record<string, any>
+                    | null
+                    | import('~/queries/schema/schema-general').ErrorTrackingQueryResponse
+                    | import('~/queries/schema/schema-general').HogQLAutocompleteResponse
+                    | import('~/queries/schema/schema-general').HogQLMetadataResponse
+                    | import('~/queries/schema/schema-general').HogQLQueryResponse<any[]>
+                    | import('~/queries/schema/schema-general').HogQueryResponse
+                    | import('~/queries/schema/schema-general').LogAttributesQueryResponse
+                    | import('~/queries/schema/schema-general').LogValuesQueryResponse
+                    | import('~/queries/schema/schema-general').MetricsQueryResponse
+                    | import('~/queries/schema/schema-general').SessionsQueryResponse
+                    | import('~/queries/schema/schema-general').TraceSpansAggregationQueryResponse
+                    | import('~/queries/schema/schema-general').TraceSpansAttributeBreakdownQueryResponse
+                    | import('~/queries/schema/schema-general').TraceSpansQueryResponse,
+                chartSettings: ChartSettings
+            ): TableDataCell<any>[][] => {
+                if (!response) {
+                    return []
+                }
+
+                const showNullsAsZero = chartSettings.showNullsAsZero ?? false
+                const data =
+                    'results' in response && Array.isArray(response.results)
+                        ? response.results
+                        : 'result' in response && Array.isArray(response.result)
+                          ? response.result
+                          : []
 
                 return data.map((row): TableDataCell<any>[] => {
-                    return tabularColumns.map((column): TableDataCell<any> => {
+                    return sourceTabularColumns.map((column): TableDataCell<any> => {
                         if (!column) {
                             return {
                                 value: null,
@@ -830,9 +1679,11 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
                         if (column.column.type.isNumerical) {
                             try {
                                 if (value === null) {
+                                    const nullReplacement = showNullsAsZero ? 0 : null
+
                                     return {
-                                        value: null,
-                                        formattedValue: null,
+                                        value: nullReplacement,
+                                        formattedValue: formatDataWithSettings(nullReplacement, column.settings),
                                         type: column.column.type.name,
                                     }
                                 }
@@ -884,49 +1735,149 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
             },
         ],
         tabularColumns: [
-            (s) => [s.tabularColumnSettings, s.response, s.columns],
-            (tabularColumnSettings, response, columns): AxisSeries<any>[] => {
-                if (!response) {
+            (s) => [s.sourceTabularColumns, s.sourceTabularData, s.isTransposed],
+            (
+                sourceTabularColumns: AxisSeries<any>[],
+                sourceTabularData: TableDataCell<any>[][],
+                isTransposed: boolean
+            ): AxisSeries<any>[] => {
+                if (!isTransposed) {
+                    return sourceTabularColumns
+                }
+
+                if (sourceTabularColumns.length === 0) {
                     return []
                 }
 
-                return columns.map((col) => {
-                    const series = (tabularColumnSettings || []).find((n) => n?.name === col.name)
-
-                    return {
-                        column: col,
+                return [
+                    {
+                        column: {
+                            name: TRANSPOSED_FIELD_COLUMN_NAME,
+                            type: {
+                                name: 'STRING',
+                                isNumerical: false,
+                            },
+                            label: 'Field',
+                            dataIndex: -1,
+                        },
                         data: [],
-                        settings: series?.settings ?? DefaultAxisSettings(),
-                    }
-                })
+                        settings: {
+                            ...DefaultAxisSettings(),
+                            display: {
+                                label: 'Field',
+                            },
+                        },
+                    },
+                    ...sourceTabularData.map(
+                        (_, index): AxisSeries<any> => ({
+                            column: {
+                                name: `${TRANSPOSED_ROW_COLUMN_PREFIX}${index}`,
+                                type: {
+                                    name: 'STRING',
+                                    isNumerical: false,
+                                },
+                                label: `Row ${index + 1}`,
+                                dataIndex: -1,
+                            },
+                            data: [],
+                            settings: {
+                                ...DefaultAxisSettings(),
+                                display: {
+                                    label: `Row ${index + 1}`,
+                                },
+                            },
+                        })
+                    ),
+                ]
+            },
+        ],
+        tabularData: [
+            (s) => [s.sourceTabularColumns, s.sourceTabularData, s.isTransposed],
+            (
+                sourceTabularColumns: AxisSeries<any>[],
+                sourceTabularData: TableDataCell<any>[][],
+                isTransposed: boolean
+            ): TableDataCell<any>[][] => {
+                if (!isTransposed) {
+                    return sourceTabularData
+                }
+
+                if (sourceTabularData.length === 0) {
+                    return []
+                }
+
+                return sourceTabularColumns.map((column, columnIndex) => [
+                    {
+                        value: column.column.name,
+                        formattedValue: null,
+                        type: 'STRING',
+                        sourceColumnName: column.column.name,
+                        isTransposedHeader: true,
+                    },
+                    ...sourceTabularData.map((row) => ({
+                        ...row[columnIndex],
+                        sourceColumnName: column.column.name,
+                    })),
+                ])
             },
         ],
         dataVisualizationProps: [() => [(_, props) => props], (props): DataVisualizationLogicProps => props],
+        effectiveVisualizationType: [
+            (s) => [s.visualizationType, s.autoVisualizationType],
+            (visualizationType: ChartDisplayType, autoVisualizationType: ChartDisplayType): ChartDisplayType => {
+                if (visualizationType === ChartDisplayType.Auto) {
+                    return autoVisualizationType
+                }
+
+                return visualizationType
+            },
+        ],
+        autoVisualizationType: [
+            (s) => [s.columns, s.response],
+            (
+                columns: Column[],
+                response:
+                    | Record<string, any>
+                    | null
+                    | import('~/queries/schema/schema-general').ErrorTrackingQueryResponse
+                    | import('~/queries/schema/schema-general').HogQLAutocompleteResponse
+                    | import('~/queries/schema/schema-general').HogQLMetadataResponse
+                    | import('~/queries/schema/schema-general').HogQLQueryResponse<any[]>
+                    | import('~/queries/schema/schema-general').HogQueryResponse
+                    | import('~/queries/schema/schema-general').LogAttributesQueryResponse
+                    | import('~/queries/schema/schema-general').LogValuesQueryResponse
+                    | import('~/queries/schema/schema-general').MetricsQueryResponse
+                    | import('~/queries/schema/schema-general').SessionsQueryResponse
+                    | import('~/queries/schema/schema-general').TraceSpansAggregationQueryResponse
+                    | import('~/queries/schema/schema-general').TraceSpansAttributeBreakdownQueryResponse
+                    | import('~/queries/schema/schema-general').TraceSpansQueryResponse
+            ): ChartDisplayType => getAutoVisualizationType(columns, rowCountFromResponse(response)),
+        ],
         isTableVisualization: [
-            (s) => [s.visualizationType],
-            (visualizationType): boolean =>
+            (s) => [s.effectiveVisualizationType],
+            (visualizationType: ChartDisplayType): boolean =>
                 // BoldNumber relies on yAxis formatting so it's considered a table visualization
                 visualizationType === ChartDisplayType.ActionsTable ||
                 visualizationType === ChartDisplayType.BoldNumber,
         ],
         showTableSettings: [
-            (s) => [s.visualizationType],
-            (visualizationType): boolean =>
+            (s) => [s.effectiveVisualizationType],
+            (visualizationType: ChartDisplayType): boolean =>
                 visualizationType === ChartDisplayType.ActionsTable ||
                 visualizationType === ChartDisplayType.BoldNumber,
         ],
         isColumnPinned: [
             (s) => [s.pinnedColumns],
-            (pinnedColumns) =>
+            (pinnedColumns: string[]) =>
                 (columnName: string): boolean => {
                     return pinnedColumns.includes(columnName)
                 },
         ],
         isPinningEnabled: [
-            (s) => [s.activeSceneId],
-            (activeSceneId: Scene | null): boolean => {
-                // disable column pinning in sql editor
-                return activeSceneId !== Scene.SQLEditor
+            (s) => [s.activeSceneId, s.isTransposed],
+            (activeSceneId: Scene | null, isTransposed: boolean): boolean => {
+                // disable column pinning in sql editor or when transposed
+                return activeSceneId !== Scene.SQLEditor && !isTransposed
             },
         ],
     }),
@@ -943,12 +1894,12 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
                 ...query,
                 chartSettings: {
                     ...query.chartSettings,
-                    yAxis: yColumns.map((n) => ({ column: n.name, settings: n.settings })),
+                    yAxis: yColumns.map((n) => ({ column: n.name, settings: cloneSettings(n.settings) })),
                     xAxis: xColumn,
                 },
                 tableSettings: {
                     ...query.tableSettings,
-                    columns: columns.map((n) => ({ column: n.name, settings: n.settings })),
+                    columns: columns.map((n) => ({ column: n.name, settings: cloneSettings(n.settings) })),
                 },
             }))
         },
@@ -978,7 +1929,7 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
         updateChartSettings: ({ settings }) => {
             actions.setQuery((query) => ({
                 ...query,
-                chartSettings: { ...query.chartSettings, ...settings },
+                chartSettings: mergeChartSettings(query.chartSettings ?? ({} as ChartSettings), settings),
             }))
         },
         setQuery: ({ setter }) => {
@@ -986,10 +1937,16 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
                 props.setQuery(setter)
             }
         },
-        setVisualizationType: ({ visualizationType }) => {
+        setVisualizationType: ({ node }) => {
+            props.setQuery?.(() => node)
+        },
+        setTransposeResults: ({ transpose }) => {
             actions.setQuery((query) => ({
                 ...query,
-                display: visualizationType,
+                tableSettings: {
+                    ...query.tableSettings,
+                    transpose,
+                },
             }))
         },
         toggleChartSettingsPanel: ({ open }) => {
@@ -1002,19 +1959,7 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
                 return
             }
 
-            const heatmapSettings = values.chartSettings.heatmap ?? {}
-            const autoSettings = getHeatmapAutoSettings(values.columns, heatmapSettings)
-
-            if (Object.keys(autoSettings).length === 0) {
-                return
-            }
-
-            actions.updateChartSettings({
-                heatmap: {
-                    ...heatmapSettings,
-                    ...autoSettings,
-                },
-            })
+            applyAutoHeatmapSettings(actions, values.columns, values.chartSettings.heatmap ?? {})
         },
         clearAxis: [sharedListeners.axesChanged],
         updateXSeries: [sharedListeners.axesChanged],
@@ -1039,7 +1984,22 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
                 JSON.stringify(values.tabularColumnSettings)
             )
 
-            if (oldValue && oldValue.length) {
+            const currentColumnNames = new Set(value.map((column) => column.name))
+            const hasInvalidSelectedXAxis =
+                values.selectedXAxis !== null && !currentColumnNames.has(values.selectedXAxis)
+            const hasInvalidSelectedYAxis =
+                values.selectedYAxis?.some((series) => {
+                    if (series === null) {
+                        return false
+                    }
+
+                    const column = value.find((nextColumn) => nextColumn.name === series.name)
+                    return !column || !column.type.isNumerical
+                }) ?? false
+
+            if (hasInvalidSelectedXAxis || hasInvalidSelectedYAxis) {
+                actions.clearAxis()
+            } else if (oldValue && oldValue.length) {
                 if (JSON.stringify(value) !== JSON.stringify(oldValue)) {
                     actions.clearAxis()
                 }
@@ -1059,40 +2019,37 @@ export const dataVisualizationLogic = kea<dataVisualizationLogicType>([
 
             // Set up chart series
             if (values.response && values.selectedXAxis === null && values.selectedYAxis === null) {
-                const xAxisTypes = value.find((n) => n.type.name.indexOf('DATE') !== -1)
-                const yAxisTypes = value.filter((n) => n.type.isNumerical)
+                const { xAxis, yAxis } = deriveDefaultAxes(value)
 
-                if (yAxisTypes) {
-                    yAxisTypes.forEach((y) => {
-                        if (oldTabularColumnSettings) {
-                            const lastValue = oldTabularColumnSettings.find((n) => n?.name === y.name)
-                            return actions.addYSeries(y.name, lastValue?.settings)
-                        }
+                yAxis.forEach((columnName) => {
+                    if (oldTabularColumnSettings) {
+                        const lastValue = oldTabularColumnSettings.find((n) => n?.name === columnName)
+                        return actions.addYSeries(columnName, lastValue?.settings)
+                    }
 
-                        actions.addYSeries(y.name)
-                    })
-                }
+                    actions.addYSeries(columnName)
+                })
 
-                if (xAxisTypes) {
-                    actions.updateXSeries(xAxisTypes.name)
+                if (xAxis) {
+                    actions.updateXSeries(xAxis)
                 }
             }
 
-            if (
-                values.isChartSettingsPanelOpen &&
-                values.visualizationType === ChartDisplayType.TwoDimensionalHeatmap
-            ) {
-                const heatmapSettings = values.chartSettings.heatmap ?? {}
-                const autoSettings = getHeatmapAutoSettings(value, heatmapSettings)
+            if (values.effectiveVisualizationType === ChartDisplayType.TwoDimensionalHeatmap) {
+                applyAutoHeatmapSettings(actions, value, values.chartSettings.heatmap ?? {})
+            }
 
-                if (Object.keys(autoSettings).length > 0) {
-                    actions.updateChartSettings({
-                        heatmap: {
-                            ...heatmapSettings,
-                            ...autoSettings,
-                        },
-                    })
-                }
+            if (values.effectiveVisualizationType === ChartDisplayType.BoxPlot) {
+                actions.updateChartSettings({
+                    boxPlot: getAutoBoxPlotSettings(value, values.chartSettings.boxPlot),
+                })
+            }
+
+            // The generic setup above only lands a numeric x for a scatter by luck (a DATE column or a
+            // non-numeric first column). Resolve it explicitly so an all-numeric query, a column change,
+            // or a persisted/assistant-created scatter still gets a plottable x axis.
+            if (values.effectiveVisualizationType === ChartDisplayType.ScatterPlot) {
+                applyScatterXAxis(actions, value, values.selectedXAxis, values.selectedYAxis)
             }
         },
     })),

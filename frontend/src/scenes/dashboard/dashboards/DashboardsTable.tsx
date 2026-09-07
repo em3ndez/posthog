@@ -1,24 +1,23 @@
 import { useActions, useValues } from 'kea'
 
-import { IconChevronDown, IconHome, IconLock, IconPin, IconPinFilled, IconShare } from '@posthog/icons'
-import { LemonInput, Popover } from '@posthog/lemon-ui'
+import { IconFolder, IconHome, IconLock, IconPin, IconPinFilled, IconShare } from '@posthog/icons'
 
 import { AccessControlAction } from 'lib/components/AccessControlAction'
-import { MemberSelect } from 'lib/components/MemberSelect'
+import { BulkUpdateTagsButton } from 'lib/components/BulkActions/BulkUpdateTagsButton'
 import { ObjectTags } from 'lib/components/ObjectTags/ObjectTags'
 import { LemonButton } from 'lib/lemon-ui/LemonButton'
 import { More } from 'lib/lemon-ui/LemonButton/More'
 import { LemonDivider } from 'lib/lemon-ui/LemonDivider'
 import { LemonRow } from 'lib/lemon-ui/LemonRow'
 import { LemonTable, LemonTableColumn, LemonTableColumns } from 'lib/lemon-ui/LemonTable'
-import { LemonTableLink } from 'lib/lemon-ui/LemonTable/LemonTableLink'
 import { atColumn, createdAtColumn, createdByColumn } from 'lib/lemon-ui/LemonTable/columnUtils'
+import { LemonTableLink } from 'lib/lemon-ui/LemonTable/LemonTableLink'
 import { Link } from 'lib/lemon-ui/Link'
 import { Tooltip } from 'lib/lemon-ui/Tooltip'
 import { accessLevelSatisfied } from 'lib/utils/accessControlUtils'
 import { DashboardEventSource } from 'lib/utils/eventUsageLogic'
 import { dashboardLogic } from 'scenes/dashboard/dashboardLogic'
-import { DashboardsFilters, DashboardsTab, dashboardsLogic } from 'scenes/dashboard/dashboards/dashboardsLogic'
+import { dashboardsLogic } from 'scenes/dashboard/dashboards/dashboardsLogic'
 import { deleteDashboardLogic } from 'scenes/dashboard/deleteDashboardLogic'
 import { duplicateDashboardLogic } from 'scenes/dashboard/duplicateDashboardLogic'
 import { teamLogic } from 'scenes/teamLogic'
@@ -33,18 +32,48 @@ import {
     DashboardType,
 } from '~/types'
 
+import { UNFILED_DASHBOARDS_FOLDER } from '../dashboardConstants'
 import { DASHBOARD_CANNOT_EDIT_MESSAGE } from '../DashboardHeader'
+import { DashboardsFiltersBar } from './DashboardsFiltersBar'
+
+function BulkMoveToFolderButton({
+    ctx,
+    filedIds,
+    onMove,
+}: {
+    ctx: { selectedKeys: ReadonlyArray<number>; setSelectedKeys: (keys: ReadonlyArray<number>) => void }
+    filedIds: Set<number>
+    onMove: (ids: number[], method: 'single' | 'bulk', onStillSelected?: (ids: number[]) => void) => void
+}): JSX.Element {
+    const movable = ctx.selectedKeys.filter((key) => filedIds.has(key))
+    const skipped = ctx.selectedKeys.length - movable.length
+    return (
+        <LemonButton
+            size="small"
+            type="secondary"
+            onClick={() => onMove([...ctx.selectedKeys], 'bulk', ctx.setSelectedKeys)}
+            disabledReason={movable.length === 0 ? 'None of the selected dashboards are filed anywhere yet' : undefined}
+            tooltip={
+                skipped > 0 && movable.length > 0
+                    ? `${skipped} of the ${ctx.selectedKeys.length} selected are not filed anywhere yet, so they stay put`
+                    : undefined
+            }
+            data-attr="dashboards-bulk-move-to-folder"
+        >
+            {skipped > 0 && movable.length > 0 ? `Move ${movable.length} to folder` : 'Move to folder'}
+        </LemonButton>
+    )
+}
 
 export function DashboardsTableContainer(): JSX.Element {
     const { dashboardsLoading } = useValues(dashboardsModel)
-    const { dashboards, filters } = useValues(dashboardsLogic)
+    const { dashboards } = useValues(dashboardsLogic)
 
-    return <DashboardsTable dashboards={dashboards} dashboardsLoading={dashboardsLoading} filters={filters} />
+    return <DashboardsTable dashboards={dashboards} dashboardsLoading={dashboardsLoading} />
 }
 
 interface DashboardsTableProps {
     dashboards: DashboardBasicType[]
-    filters: DashboardsFilters
     dashboardsLoading: boolean
     extraActions?: JSX.Element | JSX.Element[]
     hideActions?: boolean
@@ -53,30 +82,24 @@ interface DashboardsTableProps {
 export function DashboardsTable({
     dashboards,
     dashboardsLoading,
-    filters,
     extraActions,
     hideActions,
 }: DashboardsTableProps): JSX.Element {
     const { unpinDashboard, pinDashboard } = useActions(dashboardsModel)
-    const { setFilters, tableSortingChanged, setTagSearch, setShowTagPopover } = useActions(dashboardsLogic)
-    const { tableSorting, currentTab, filteredTags, tagSearch, showTagPopover } = useValues(dashboardsLogic)
+    const { tableSortingChanged, setFilters, moveDashboardsToFolder } = useActions(dashboardsLogic)
+    const { tableSorting, filters, filedDashboardIds } = useValues(dashboardsLogic)
+    // Server-side fuzzy search ranks results by relevance; re-sorting alphabetically by name
+    // would push the exact match below partial matches. Suppress the persisted column sort
+    // while the user has an active search term.
+    const effectiveTableSorting = filters.search ? null : tableSorting
     const { currentTeam } = useValues(teamLogic)
     const { showDuplicateDashboardModal } = useActions(duplicateDashboardLogic)
     const { showDeleteDashboardModal } = useActions(deleteDashboardLogic)
 
-    const handleTagToggle = (tag: string): void => {
-        const selected = new Set(filters.tags || [])
-        if (selected.has(tag)) {
-            selected.delete(tag)
-        } else {
-            selected.add(tag)
-        }
-        setFilters({ tags: Array.from(selected) })
-    }
-
     const columns: LemonTableColumns<DashboardType> = [
         {
-            width: 0,
+            // Fixed-layout table: icon-only columns need an explicit width, otherwise they'd be squeezed to a sliver.
+            width: 40,
             dataIndex: 'pinned',
             render: function Render(pinned, { id }) {
                 return (
@@ -105,32 +128,47 @@ export function DashboardsTable({
                     AccessControlLevel.Editor
                 )
                 return (
-                    <LemonTableLink
-                        to={urls.dashboard(id)}
-                        title={
-                            <>
-                                <span data-attr="dashboard-name">{name || 'Untitled'}</span>
-                                {is_shared && (
-                                    <Tooltip title="This dashboard is shared publicly.">
-                                        <IconShare className="ml-1 text-base text-link" />
-                                    </Tooltip>
-                                )}
-                                {!canEditDashboard && (
-                                    <Tooltip title={DASHBOARD_CANNOT_EDIT_MESSAGE}>
-                                        <IconLock className="ml-1 text-base text-secondary" />
-                                    </Tooltip>
-                                )}
-                                {isPrimary && (
-                                    <Tooltip title="The primary dashboard is shown on the project home page.">
-                                        <span>
-                                            <IconHome className="ml-1 text-base text-warning" />
+                    // Fixed-layout table sizes this cell from the container, so the name truncates within its column
+                    // (full name on hover) instead of growing the cell and scrolling the whole table.
+                    <div className="min-w-0">
+                        <LemonTableLink
+                            to={urls.dashboard(id)}
+                            truncateTitle
+                            title={
+                                <>
+                                    <Tooltip title={name || 'Untitled'}>
+                                        <span data-attr="dashboard-name" className="truncate min-w-0">
+                                            {name || 'Untitled'}
                                         </span>
                                     </Tooltip>
-                                )}
-                            </>
-                        }
-                        description={description}
-                    />
+                                    {is_shared && (
+                                        <Tooltip title="This dashboard is shared publicly.">
+                                            <IconShare className="ml-1 text-base text-link" />
+                                        </Tooltip>
+                                    )}
+                                    {!canEditDashboard && (
+                                        <Tooltip title={DASHBOARD_CANNOT_EDIT_MESSAGE}>
+                                            <IconLock className="ml-1 text-base text-secondary" />
+                                        </Tooltip>
+                                    )}
+                                    {isPrimary && (
+                                        <Tooltip title="The primary dashboard is shown on the project home page.">
+                                            <span>
+                                                <IconHome className="ml-1 text-base text-warning" />
+                                            </span>
+                                        </Tooltip>
+                                    )}
+                                </>
+                            }
+                            description={
+                                description ? (
+                                    <Tooltip title={description}>
+                                        <span className="block truncate max-w-[30rem]">{description}</span>
+                                    </Tooltip>
+                                ) : undefined
+                            }
+                        />
+                    </div>
                 )
             },
             sorter: nameCompareFunction,
@@ -139,7 +177,38 @@ export function DashboardsTable({
             title: 'Tags',
             dataIndex: 'tags' as keyof DashboardType,
             render: function Render(tags: DashboardType['tags']) {
-                return tags ? <ObjectTags tags={[...tags].sort()} staticOnly /> : null
+                return tags ? (
+                    <ObjectTags
+                        tags={[...tags].sort()}
+                        staticOnly
+                        maxVisibleTags={5}
+                        data-attr="dashboard-tags"
+                        onTagClick={(tag) => setFilters({ tags: [tag] })}
+                    />
+                ) : null
+            },
+        } as LemonTableColumn<DashboardType, keyof DashboardType | undefined>,
+        {
+            title: 'Folder',
+            dataIndex: 'folder' as keyof DashboardType,
+            render: function Render(folder: DashboardType['folder']) {
+                // Unfiled dashboards live in the default `Unfiled/Dashboards` folder — that's not a folder
+                // the user chose, so show nothing rather than a filter affordance.
+                if (folder === null || folder === undefined || folder === UNFILED_DASHBOARDS_FOLDER) {
+                    return <span className="text-secondary">—</span>
+                }
+                const label = folder || 'Project root'
+                return (
+                    <Tooltip title={`Filter to dashboards in ${label}`}>
+                        <Link
+                            className="flex items-center gap-1 text-secondary max-w-[10rem]"
+                            onClick={() => setFilters({ folder })}
+                        >
+                            <IconFolder className="shrink-0" />
+                            <span className="truncate">{label}</span>
+                        </Link>
+                    </Tooltip>
+                )
             },
         } as LemonTableColumn<DashboardType, keyof DashboardType | undefined>,
         createdByColumn<DashboardType>() as LemonTableColumn<DashboardType, keyof DashboardType | undefined>,
@@ -148,11 +217,17 @@ export function DashboardsTable({
             DashboardType,
             keyof DashboardType | undefined
         >,
+        atColumn<DashboardType>('last_viewed_at', 'You last viewed') as LemonTableColumn<
+            DashboardType,
+            keyof DashboardType | undefined
+        >,
         hideActions
             ? {}
             : {
-                  width: 0,
-                  render: function RenderActions(_, { id, name, user_access_level }: DashboardType) {
+                  // Fixed-layout table: give the actions menu a fixed width so it isn't squeezed to a sliver.
+                  width: 48,
+                  render: function RenderActions(_, dashboard: DashboardType) {
+                      const { id, name, user_access_level } = dashboard
                       return (
                           <More
                               overlay={
@@ -200,9 +275,32 @@ export function DashboardsTable({
                                           Duplicate
                                       </LemonButton>
 
+                                      <AccessControlAction
+                                          resourceType={AccessControlResourceType.Dashboard}
+                                          minAccessLevel={AccessControlLevel.Editor}
+                                          userAccessLevel={user_access_level}
+                                      >
+                                          <LemonButton
+                                              onClick={() => moveDashboardsToFolder([id], 'single')}
+                                              disabledReason={
+                                                  filedDashboardIds.has(id)
+                                                      ? undefined
+                                                      : 'This dashboard is not filed anywhere yet'
+                                              }
+                                              fullWidth
+                                              data-attr="dashboard-move-to-folder"
+                                          >
+                                              Move to another folder
+                                          </LemonButton>
+                                      </AccessControlAction>
+
                                       <LemonDivider />
 
-                                      <LemonRow icon={<IconHome className="text-warning" />} fullWidth status="warning">
+                                      <LemonRow
+                                          icon={<IconHome className="size-4 text-warning" />}
+                                          fullWidth
+                                          status="warning"
+                                      >
                                           <span className="text-secondary">
                                               Change the default dashboard
                                               <br />
@@ -235,141 +333,51 @@ export function DashboardsTable({
 
     return (
         <>
-            <div className="flex justify-between gap-2 flex-wrap mb-4">
-                <LemonInput
-                    type="search"
-                    placeholder="Search for dashboards"
-                    onChange={(x) => setFilters({ search: x })}
-                    value={filters.search}
-                />
-                <div className="flex items-center gap-2 flex-wrap">
-                    <div className="flex items-center gap-2">
-                        <span>Filter to:</span>
-                        {currentTab !== DashboardsTab.Pinned && (
-                            <div className="flex items-center gap-2">
-                                <LemonButton
-                                    active={filters.pinned}
-                                    type="secondary"
-                                    size="small"
-                                    onClick={() => setFilters({ pinned: !filters.pinned })}
-                                    icon={<IconPin />}
-                                >
-                                    Pinned
-                                </LemonButton>
-                            </div>
-                        )}
-                        <Popover
-                            visible={showTagPopover}
-                            onClickOutside={() => setShowTagPopover(false)}
-                            overlay={
-                                <div className="max-w-100 deprecated-space-y-2">
-                                    <LemonInput
-                                        type="search"
-                                        placeholder="Search tags"
-                                        autoFocus
-                                        value={tagSearch}
-                                        onChange={setTagSearch}
-                                        fullWidth
-                                        className="max-w-full"
-                                    />
-                                    <ul className="deprecated-space-y-px">
-                                        {filteredTags.map((tag: string) => (
-                                            <li key={tag}>
-                                                <LemonButton
-                                                    fullWidth
-                                                    role="menuitem"
-                                                    size="small"
-                                                    onClick={() => handleTagToggle(tag)}
-                                                >
-                                                    <span className="flex items-center justify-between gap-2 flex-1">
-                                                        <span className="flex items-center gap-2 max-w-full">
-                                                            <input
-                                                                type="checkbox"
-                                                                className="cursor-pointer"
-                                                                checked={filters.tags?.includes(tag) || false}
-                                                                readOnly
-                                                            />
-                                                            <span>{tag}</span>
-                                                        </span>
-                                                    </span>
-                                                </LemonButton>
-                                            </li>
-                                        ))}
-                                        {filteredTags.length === 0 ? (
-                                            <div className="p-2 text-secondary italic truncate border-t">
-                                                {tagSearch ? <span>No matching tags</span> : <span>No tags</span>}
-                                            </div>
-                                        ) : null}
-                                        {(filters.tags?.length || 0) > 0 && (
-                                            <>
-                                                <div className="my-1 border-t" />
-                                                <li>
-                                                    <LemonButton
-                                                        fullWidth
-                                                        role="menuitem"
-                                                        size="small"
-                                                        onClick={() => setFilters({ tags: [] })}
-                                                        type="tertiary"
-                                                    >
-                                                        Clear selection
-                                                    </LemonButton>
-                                                </li>
-                                            </>
-                                        )}
-                                    </ul>
-                                </div>
-                            }
-                        >
-                            <LemonButton
-                                type="secondary"
-                                size="small"
-                                icon={<IconChevronDown />}
-                                sideIcon={null}
-                                active={(filters.tags?.length || 0) > 0}
-                                onClick={() => setShowTagPopover(!showTagPopover)}
-                            >
-                                Tags
-                                {(filters.tags?.length || 0) > 0 && (
-                                    <span className="ml-1 text-xs">({filters.tags?.length})</span>
-                                )}
-                            </LemonButton>
-                        </Popover>
-                        <div className="flex items-center gap-2">
-                            <LemonButton
-                                active={filters.shared}
-                                type="secondary"
-                                size="small"
-                                onClick={() => setFilters({ shared: !filters.shared })}
-                                icon={<IconShare />}
-                            >
-                                Shared
-                            </LemonButton>
-                        </div>
-                    </div>
-                    {currentTab !== DashboardsTab.Yours && (
-                        <div className="flex items-center gap-2">
-                            <span>Created by:</span>
-                            <MemberSelect
-                                value={filters.createdBy === 'All users' ? null : filters.createdBy}
-                                onChange={(user) => setFilters({ createdBy: user?.uuid || 'All users' })}
-                            />
-                        </div>
-                    )}
-                    {extraActions}
-                </div>
-            </div>
+            <DashboardsFiltersBar extraActions={extraActions} />
             <LemonTable
                 data-attr="dashboards-table"
-                pagination={{ pageSize: 100 }}
+                pagination={{ pageSize: 50 }}
                 dataSource={dashboards as DashboardType[]}
                 rowKey="id"
                 rowClassName={(record) => (record._highlight ? 'highlighted' : null)}
+                tableLayout="fixed"
                 columns={columns}
                 loading={dashboardsLoading}
-                defaultSorting={tableSorting}
+                defaultSorting={effectiveTableSorting}
                 onSort={tableSortingChanged}
                 emptyState="No dashboards matching your filters!"
                 nouns={['dashboard', 'dashboards']}
+                bulkSelection={{
+                    barClassName: 'mb-2',
+                    getKey: (dashboard: DashboardType): number => dashboard.id,
+                    isRowSelectable: (dashboard: DashboardType) =>
+                        accessLevelSatisfied(
+                            AccessControlResourceType.Dashboard,
+                            dashboard.user_access_level,
+                            AccessControlLevel.Editor
+                        )
+                            ? true
+                            : { disabledReason: DASHBOARD_CANNOT_EDIT_MESSAGE },
+                    rowAriaLabel: (dashboard: DashboardType) => `Select dashboard ${dashboard.name}`,
+                    headerAriaLabel: 'Select all dashboards on this page',
+                    renderActions: (ctx) => (
+                        <>
+                            <BulkMoveToFolderButton
+                                ctx={ctx}
+                                filedIds={filedDashboardIds}
+                                onMove={moveDashboardsToFolder}
+                            />
+                            <BulkUpdateTagsButton
+                                resource="dashboards"
+                                selectedIds={ctx.selectedKeys}
+                                onSuccess={() => {
+                                    ctx.clearSelection()
+                                    dashboardsModel.actions.loadDashboards()
+                                }}
+                            />
+                        </>
+                    ),
+                }}
             />
         </>
     )

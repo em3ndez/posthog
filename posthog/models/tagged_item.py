@@ -12,6 +12,11 @@ RELATED_OBJECTS = (
     "action",
     "feature_flag",
     "experiment_saved_metric",
+    "ticket",
+    "account",
+    "endpoint",
+    "replay_scanner",
+    "project",
 )
 
 
@@ -35,53 +40,92 @@ class TaggedItem(ModelActivityMixin, UUIDTModel):
     # When adding a new taggeditem-model relationship, make sure to add the foreign key field and append field name to
     # the `RELATED_OBJECTS` tuple above.
     dashboard = models.ForeignKey(
-        "Dashboard",
+        "dashboards.Dashboard",
         on_delete=models.CASCADE,
         null=True,
         blank=True,
         related_name="tagged_items",
     )
     insight = models.ForeignKey(
-        "Insight",
+        "product_analytics.Insight",
         on_delete=models.CASCADE,
         null=True,
         blank=True,
         related_name="tagged_items",
     )
     event_definition = models.ForeignKey(
-        "EventDefinition",
+        "event_definitions.EventDefinition",
         on_delete=models.CASCADE,
         null=True,
         blank=True,
         related_name="tagged_items",
     )
     property_definition = models.ForeignKey(
-        "PropertyDefinition",
+        "event_definitions.PropertyDefinition",
         on_delete=models.CASCADE,
         null=True,
         blank=True,
         related_name="tagged_items",
     )
     action = models.ForeignKey(
-        "Action",
+        "actions.Action",
         on_delete=models.CASCADE,
         null=True,
         blank=True,
         related_name="tagged_items",
     )
     feature_flag = models.ForeignKey(
-        "FeatureFlag",
+        "feature_flags.FeatureFlag",
         on_delete=models.CASCADE,
         null=True,
         blank=True,
         related_name="tagged_items",
     )
     experiment_saved_metric = models.ForeignKey(
-        "ExperimentSavedMetric",
+        "experiments.ExperimentSavedMetric",
         on_delete=models.CASCADE,
         null=True,
         blank=True,
         related_name="tagged_items",
+    )
+    ticket = models.ForeignKey(
+        "conversations.Ticket",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="tagged_items",
+    )
+    account = models.ForeignKey(
+        "customer_analytics.Account",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="tagged_items",
+    )
+    endpoint = models.ForeignKey(
+        "endpoints.Endpoint",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="tagged_items",
+    )
+    replay_scanner = models.ForeignKey(
+        "replay_vision.ReplayScanner",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="tagged_items",
+    )
+    project = models.ForeignKey(
+        "posthog.Project",
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name="tagged_items",
+        # posthog_project is read on nearly every request, so creating this FK's database
+        # constraint inline would lock it. A later migration adds the constraint NOT VALID
+        # and validates it separately.
+        db_constraint=False,
     )
 
     class Meta:
@@ -95,7 +139,7 @@ class TaggedItem(ModelActivityMixin, UUIDTModel):
                 for related_field in RELATED_OBJECTS
             ],
             models.CheckConstraint(
-                check=build_unique_relationship_check(RELATED_OBJECTS), name="exactly_one_related_object"
+                condition=build_unique_relationship_check(RELATED_OBJECTS), name="exactly_one_related_object"
             ),
         ]
 

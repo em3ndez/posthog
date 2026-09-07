@@ -1,4 +1,5 @@
 import os
+import time
 import random
 
 import pytest
@@ -8,11 +9,18 @@ from temporalio.testing import ActivityEnvironment
 from posthog.models import Integration, OAuthApplication, Organization, OrganizationMembership, Team, User
 from posthog.temporal.common.logger import configure_logger
 
+from products.tasks.backend.logic.services.sandbox import Sandbox, SandboxConfig, SandboxTemplate
 from products.tasks.backend.models import SandboxSnapshot, Task, TaskRun
-from products.tasks.backend.services.sandbox import Sandbox, SandboxConfig, SandboxTemplate
 from products.tasks.backend.temporal.create_snapshot.activities.get_snapshot_context import SnapshotContext
 from products.tasks.backend.temporal.oauth import ARRAY_APP_CLIENT_ID_DEV
 from products.tasks.backend.temporal.process_task.activities.get_task_processing_context import TaskProcessingContext
+
+
+def _runs_on_internal_pr() -> bool:
+    value = os.getenv("RUNS_ON_INTERNAL_PR")
+    if value is None:
+        return True
+    return value.lower() in {"1", "true"}
 
 
 @pytest.fixture
@@ -21,9 +29,38 @@ def activity_environment():
     return ActivityEnvironment()
 
 
+@pytest.fixture
+def assert_sandbox_shutdown():
+    """Assert a sandbox reaches SHUTDOWN, polling because `Sandbox.destroy()` does not wait.
+
+    `destroy()` fires Modal's terminate RPC and returns immediately, by design: the sandbox
+    TTL is the backstop if termination never lands. So the shutdown a cleanup activity causes
+    is only observable some time after the activity returns.
+    """
+
+    def _assert_sandbox_shutdown(sandbox_id: str, timeout_seconds: float = 60.0) -> None:
+        deadline = time.monotonic() + timeout_seconds
+        while Sandbox.get_by_id(sandbox_id).is_running():
+            assert time.monotonic() < deadline, f"sandbox {sandbox_id} still running after {timeout_seconds}s"
+            time.sleep(1)
+
+    return _assert_sandbox_shutdown
+
+
 @pytest.fixture(autouse=True)
-def array_oauth_app():
-    """Create the Array OAuth application for tests."""
+def posthog_code_oauth_app(request):
+    """Create the Array OAuth application for DB-backed tests.
+
+    Skipped for tests without a `django_db` marker — those can't touch the
+    ORM, so seeding the OAuth row would just raise.
+    """
+    has_db = "django_db" in {m.name for m in request.node.iter_markers()}
+    if not has_db:
+        yield None
+        return
+
+    if not _runs_on_internal_pr():
+        pytest.skip("Skipping test that requires internal secrets on external PRs")
     app, _ = OAuthApplication.objects.get_or_create(
         client_id=ARRAY_APP_CLIENT_ID_DEV,
         defaults={
@@ -138,9 +175,12 @@ def task_context(test_task, test_task_run) -> TaskProcessingContext:
         task_id=str(test_task.id),
         run_id=str(test_task_run.id),
         team_id=test_task.team_id,
+        team_uuid=str(test_task.team.uuid),
+        organization_id=str(test_task.team.organization_id),
         github_integration_id=test_task.github_integration_id,
         repository=test_task.repository,
         distinct_id=test_task.created_by.distinct_id or "test-distinct-id",
+        task_created_by_id=test_task.created_by_id,
     )
 
 

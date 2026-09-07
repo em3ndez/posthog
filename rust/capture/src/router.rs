@@ -4,54 +4,132 @@ use std::time::Duration;
 
 use axum::extract::DefaultBodyLimit;
 use axum::http::Method;
+use axum::Extension;
 use axum::{
     routing::{get, post},
     Router,
 };
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-use health::{readiness_handler, HealthRegistry};
+use lifecycle::{LivenessHandler, ReadinessHandler};
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 use tower_http::trace::TraceLayer;
 
-use crate::ai_s3::BlobStorage;
 use crate::event_restrictions::EventRestrictionService;
 use crate::global_rate_limiter::GlobalRateLimiter;
+use crate::otel;
+use crate::outputs::OutputRegistry;
 use crate::test_endpoint;
 use crate::v0_request::DataType;
-use crate::{ai_endpoint, sinks, time::TimeSource, v0_endpoint};
+use crate::{ai_endpoint, time::TimeSource, v0_endpoint};
+use common_ingestion_warnings::WarningEmitter;
 use common_redis::Client;
+use limiters::overflow::OverflowLimiter;
+use limiters::redis::RedisLimiter;
 use limiters::token_dropper::TokenDropper;
 
 use crate::config::CaptureMode;
-use crate::metrics_middleware::{apply_request_timeout, track_metrics};
-use crate::prometheus::setup_metrics_recorder;
+use crate::metrics_middleware::track_metrics;
 use crate::quota_limiters::CaptureQuotaLimiter;
+use metrics_exporter_prometheus::PrometheusHandle;
 
-const EVENT_BODY_SIZE: usize = 2 * 1024 * 1024; // 2MB
-pub const BATCH_BODY_SIZE: usize = 20 * 1024 * 1024; // 20MB, up from the default 2MB used for normal event payloads
-const RECORDING_BODY_SIZE: usize = 25 * 1024 * 1024; // 25MB, up from the default 2MB used for normal event payloads
+/// Wire-body ceiling for every v0 analytics route. One handler serves `/e`,
+/// `/batch`, `/capture`, `/track` and `/engage`, and a batch is accepted on any
+/// of them, so the cap is a property of the pipeline rather than of the path.
+pub const BATCH_BODY_SIZE: usize = 20 * 1024 * 1024; // 20MB
+
+const RECORDING_BODY_SIZE: usize = 25 * 1024 * 1024; // 25MB
+
+/// A route group's wire-body ceiling, carried as a request extension.
+///
+/// `DefaultBodyLimit` only inserts an extension that `Bytes`-style extractors
+/// read. Handlers that stream take `Body`, which never reads it, so they would
+/// otherwise fall back to the much larger decompressed budget. Both layers are
+/// applied from the same constant so one number governs the route either way.
+#[derive(Debug, Clone, Copy)]
+pub struct WireBodyLimit(pub usize);
 
 #[derive(Clone)]
 pub struct State {
-    pub sink: Arc<dyn sinks::Event + Send + Sync>,
+    pub outputs: Arc<OutputRegistry>,
     pub timesource: Arc<dyn TimeSource + Send + Sync>,
     pub redis: Arc<dyn Client + Send + Sync>,
-    pub global_rate_limiter: Option<Arc<GlobalRateLimiter>>,
+    pub global_rate_limiter_token_distinctid: Option<Arc<GlobalRateLimiter>>,
     pub quota_limiter: Arc<CaptureQuotaLimiter>,
     pub token_dropper: Arc<TokenDropper>,
+    /// Restriction service scoped to all pipelines this capture deployment
+    /// produces to (e.g. `[Analytics, ErrorTracking]` for the events
+    /// deployment). Callers select the pipeline per event when looking up
+    /// restrictions — see `events::analytics::process_events`.
     pub event_restriction_service: Option<EventRestrictionService>,
     pub event_payload_size_limit: usize,
     pub historical_cfg: HistoricalConfig,
     pub is_mirror_deploy: bool,
     pub verbose_sample_percent: f32,
     pub ai_max_sum_of_parts_bytes: usize,
-    pub ai_blob_storage: Option<Arc<dyn BlobStorage>>,
+    /// Largest AI-lane event this deployment accepts (`AI_MAX_EVENT_BYTES`).
+    /// `0` disables the ceiling.
+    pub ai_max_event_bytes: u64,
     pub body_chunk_read_timeout: Option<Duration>,
     pub body_read_chunk_size_kb: usize,
+    pub capture_v1_max_compressed_body_bytes: usize,
+    pub capture_v1_max_decompressed_body_bytes: usize,
+    /// In-process overflow limiter (governor-backed) for `DataType::AnalyticsMain`
+    /// events. When present, every handler that emits analytics events runs
+    /// the shared `events::overflow_stamping::stamp_overflow_reason` helper,
+    /// which calls `is_limited` per event and stamps
+    /// `ProcessedEventMetadata::overflow_reason` with `ForceLimited` or
+    /// `RateLimited { .. }` so the kafka sink can route to the overflow topic.
+    /// Call sites that consult this limiter:
+    /// * `events::analytics::process_events` (analytics batch path)
+    /// * `ai_endpoint::ai_handler` (`/i/v0/ai`)
+    /// * `otel::otel_handler` (`/i/v0/ai/otel`)
+    ///
+    /// This lives in `State` (not in the sink) so routing policy sits in the
+    /// pipeline alongside every other routing decision, and so the sink stays
+    /// a pure mechanism layer with cheap Arc-based clones.
+    pub overflow_limiter: Option<Arc<OverflowLimiter>>,
+    /// Dedicated overflow limiter for the AI lane (`DataType::AiEvents` /
+    /// `Destination::AiEvents`). Same knobs as `overflow_limiter` but a
+    /// separate governor instance, so per-key budgets are isolated: analytics
+    /// volume never pushes a key's AI events into AI overflow and AI volume
+    /// never burns the analytics budget. Only built when both
+    /// `OVERFLOW_ENABLED` and the AI overflow valve are set; `None` leaves
+    /// the AI lane subject to restriction-driven `force_overflow` only.
+    pub ai_events_overflow_limiter: Option<Arc<OverflowLimiter>>,
+    /// AI-lane per-token byte budget; `None` when disabled. A second instance
+    /// of the same global rate limiter the `token:distinct_id` field holds,
+    /// charged an event's serialized size rather than `1`. Drops over-budget
+    /// events, unlike the overflow limiter's reroute.
+    pub ai_byte_rate_limiter: Option<Arc<GlobalRateLimiter>>,
+    /// Redis-backed replay overflow limiter for session recording sessions.
+    /// When present, the recordings pipeline calls `is_limited(session_id)`
+    /// and stamps `ProcessedEventMetadata::overflow_reason = ReplayLimited` so
+    /// the kafka sink can route to the replay overflow topic. Same rationale
+    /// as `overflow_limiter` above.
+    pub replay_overflow_limiter: Option<Arc<RedisLimiter>>,
+    /// V1 sink router for the new capture analytics pipeline.
+    /// When present, the v1 analytics handler publishes events through this.
+    pub v1_sink_router: Option<Arc<crate::v1::sinks::Router>>,
+    /// Whether the AI overflow valve is armed (`CAPTURE_ANALYTICS_AI_EVENTS_OVERFLOW_TOPIC` is
+    /// set). Gates overflow stamping for the AI lane in both pipelines: when
+    /// false, AI events never overflow (pre-overflow behavior).
+    pub ai_events_overflow_enabled: bool,
+    pub capture_v1_scatter_gather_min_batch: usize,
+    pub ai_gateway_signing_secret: Option<String>,
+    /// Best-effort v2 ingestion warnings emitter (fire-and-forget Kafka
+    /// producer behind a per-(token, type) throttle). `None` when disabled —
+    /// emit points skip on `is_none()`, same optionality pattern as
+    /// `overflow_limiter` / `event_restriction_service`. Never awaited and
+    /// never allowed to fail a request.
+    pub ingestion_warning_emitter: Option<Arc<dyn WarningEmitter>>,
+    /// Deployment capture mode. Threaded into the analytics processing paths
+    /// (legacy and v1) so mode-specific policy — Import skips the global rate
+    /// limiter and drops non-historical batches — lives with the pipeline.
+    pub capture_mode: CaptureMode,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct HistoricalConfig {
     pub enable_historical_rerouting: bool,
     pub historical_rerouting_threshold_days: i64,
@@ -88,22 +166,18 @@ async fn index() -> &'static str {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn router<
-    TZ: TimeSource + Send + Sync + 'static,
-    S: sinks::Event + Send + Sync + 'static,
-    R: Client + Send + Sync + 'static,
->(
+pub fn router<TZ: TimeSource + Send + Sync + 'static, R: Client + Send + Sync + 'static>(
     timesource: TZ,
-    liveness: HealthRegistry,
-    sink: S,
+    readiness: ReadinessHandler,
+    liveness: LivenessHandler,
+    outputs: Arc<OutputRegistry>,
     redis: Arc<R>,
-    global_rate_limiter: Option<Arc<GlobalRateLimiter>>,
+    global_rate_limiter_token_distinctid: Option<Arc<GlobalRateLimiter>>,
     quota_limiter: CaptureQuotaLimiter,
     token_dropper: TokenDropper,
     event_restriction_service: Option<EventRestrictionService>,
-    metrics: bool,
+    recorder_handle: Option<PrometheusHandle>,
     capture_mode: CaptureMode,
-    deploy_role: String,
     concurrency_limit: Option<usize>,
     event_payload_size_limit: usize,
     enable_historical_rerouting: bool,
@@ -111,16 +185,26 @@ pub fn router<
     is_mirror_deploy: bool,
     verbose_sample_percent: f32,
     ai_max_sum_of_parts_bytes: usize,
-    ai_blob_storage: Option<Arc<dyn BlobStorage>>,
-    request_timeout_seconds: Option<u64>,
+    ai_max_event_bytes: u64,
     body_chunk_read_timeout_ms: Option<u64>,
     body_read_chunk_size_kb: usize,
+    capture_v1_max_compressed_body_bytes: usize,
+    capture_v1_max_decompressed_body_bytes: usize,
+    overflow_limiter: Option<Arc<OverflowLimiter>>,
+    ai_events_overflow_limiter: Option<Arc<OverflowLimiter>>,
+    ai_byte_rate_limiter: Option<Arc<GlobalRateLimiter>>,
+    replay_overflow_limiter: Option<Arc<RedisLimiter>>,
+    v1_sink_router: Option<Arc<crate::v1::sinks::Router>>,
+    capture_v1_scatter_gather_min_batch: usize,
+    ai_gateway_signing_secret: Option<String>,
+    ai_events_overflow_enabled: bool,
+    ingestion_warning_emitter: Option<Arc<dyn WarningEmitter>>,
 ) -> Router {
     let state = State {
-        sink: Arc::new(sink),
+        outputs,
         timesource: Arc::new(timesource),
         redis,
-        global_rate_limiter,
+        global_rate_limiter_token_distinctid,
         quota_limiter: Arc::new(quota_limiter),
         event_payload_size_limit,
         token_dropper: Arc::new(token_dropper),
@@ -132,9 +216,21 @@ pub fn router<
         is_mirror_deploy,
         verbose_sample_percent,
         ai_max_sum_of_parts_bytes,
-        ai_blob_storage,
+        ai_max_event_bytes,
         body_chunk_read_timeout: body_chunk_read_timeout_ms.map(Duration::from_millis),
         body_read_chunk_size_kb,
+        capture_v1_max_compressed_body_bytes,
+        capture_v1_max_decompressed_body_bytes,
+        overflow_limiter,
+        ai_events_overflow_limiter,
+        ai_byte_rate_limiter,
+        replay_overflow_limiter,
+        v1_sink_router,
+        capture_v1_scatter_gather_min_batch,
+        ai_gateway_signing_secret,
+        ai_events_overflow_enabled,
+        ingestion_warning_emitter,
+        capture_mode,
     };
 
     // Very permissive CORS policy, as old SDK versions
@@ -158,7 +254,8 @@ pub fn router<
                 .get(test_endpoint::test_black_hole)
                 .options(v0_endpoint::options),
         )
-        .layer(DefaultBodyLimit::max(BATCH_BODY_SIZE));
+        .layer(DefaultBodyLimit::max(BATCH_BODY_SIZE))
+        .layer(Extension(WireBodyLimit(BATCH_BODY_SIZE)));
 
     let batch_router = Router::new()
         .route(
@@ -173,7 +270,30 @@ pub fn router<
                 .get(v0_endpoint::event)
                 .options(v0_endpoint::options),
         )
-        .layer(DefaultBodyLimit::max(BATCH_BODY_SIZE)); // Have to use this, rather than RequestBodyLimitLayer, because we use `Bytes` in the handler (this limit applies specifically to Bytes body types)
+        .layer(DefaultBodyLimit::max(BATCH_BODY_SIZE))
+        .layer(Extension(WireBodyLimit(BATCH_BODY_SIZE)));
+
+    // AI events: the same batch handler as `/batch`, on a dedicated path so the
+    // ingress can route them to the capture-ai deployment and keep AI and
+    // analytics workloads isolated. Its own router rather than a member of
+    // `batch_router` so capture-ai can serve this path without also serving the
+    // analytics batch and event routes, and rather than a member of `ai_router`
+    // so it keeps the batch body limit instead of the larger multipart one.
+    let ai_batch_router = Router::new()
+        .route(
+            "/i/v0/ai/batch",
+            post(v0_endpoint::event)
+                .get(v0_endpoint::event)
+                .options(v0_endpoint::options),
+        )
+        .route(
+            "/i/v0/ai/batch/",
+            post(v0_endpoint::event)
+                .get(v0_endpoint::event)
+                .options(v0_endpoint::options),
+        )
+        .layer(DefaultBodyLimit::max(BATCH_BODY_SIZE))
+        .layer(Extension(WireBodyLimit(BATCH_BODY_SIZE)));
 
     let event_router = Router::new()
         .route(
@@ -236,12 +356,25 @@ pub fn router<
                 .get(v0_endpoint::event)
                 .options(v0_endpoint::options),
         )
-        .layer(DefaultBodyLimit::max(EVENT_BODY_SIZE));
+        .layer(DefaultBodyLimit::max(BATCH_BODY_SIZE))
+        .layer(Extension(WireBodyLimit(BATCH_BODY_SIZE)));
 
     let status_router = Router::new()
         .route("/", get(index))
-        .route("/_readiness", get(readiness_handler))
-        .route("/_liveness", get(move || ready(liveness.get_status())));
+        .route(
+            "/_readiness",
+            get(move || {
+                let r = readiness.clone();
+                async move { r.check().await }
+            }),
+        )
+        .route(
+            "/_liveness",
+            get(move || {
+                let l = liveness.clone();
+                async move { l.check() }
+            }),
+        );
 
     let recordings_router = Router::new()
         .route(
@@ -256,7 +389,8 @@ pub fn router<
                 .get(v0_endpoint::recording)
                 .options(v0_endpoint::options),
         )
-        .layer(DefaultBodyLimit::max(RECORDING_BODY_SIZE));
+        .layer(DefaultBodyLimit::max(RECORDING_BODY_SIZE))
+        .layer(Extension(WireBodyLimit(RECORDING_BODY_SIZE)));
 
     // AI endpoint body limit is 110% of max sum of parts to account for multipart overhead
     let ai_body_limit = (state.ai_max_sum_of_parts_bytes as f64 * 1.1) as usize;
@@ -272,12 +406,47 @@ pub fn router<
         )
         .layer(DefaultBodyLimit::max(ai_body_limit));
 
+    let otel_router = Router::new()
+        .route(
+            "/i/v0/ai/otel",
+            post(otel::otel_handler).options(otel::options),
+        )
+        .route(
+            "/i/v0/ai/otel/",
+            post(otel::otel_handler).options(otel::options),
+        )
+        .layer(DefaultBodyLimit::max(otel::OTEL_BODY_SIZE));
+
+    // Each deployment registers its own ingress and nothing else. The AI paths
+    // (`/i/v0/ai*`) belong to capture-ai and the analytics paths to
+    // capture-analytics; the ingress has always routed them that way, so a
+    // deployment serving the other set is surface no traffic reaches and no
+    // restriction slice covers. `Pipeline::for_capture_mode` loads exactly the
+    // pipelines each set can produce to, so the two must stay in step.
+    //
+    // `$ai_*` events still reach capture-analytics — on `/batch`, from SDKs that
+    // send everything to one endpoint. Those divert to the AI lane by event
+    // name; that is unrelated to which paths are registered here.
     let mut router = match capture_mode {
-        CaptureMode::Events | CaptureMode::Ai => Router::new()
+        CaptureMode::Events => Router::new()
             .merge(batch_router)
             .merge(event_router)
-            .merge(test_router)
-            .merge(ai_router),
+            .merge(test_router),
+        CaptureMode::Ai => Router::new()
+            .merge(ai_batch_router)
+            .merge(ai_router)
+            .merge(otel_router),
+        // Import is an analytics deployment restricted to backfills, so it
+        // serves the analytics paths. It must never register ai_router or
+        // otel_router for a second reason on top of the split above: those
+        // handlers build their own ProcessingContext with
+        // `historical_migration: false`, so they sidestep both Import gates
+        // (historical-only drop and GRL bypass) and would return a false 200
+        // for events this deployment silently discards.
+        CaptureMode::Import => Router::new()
+            .merge(batch_router)
+            .merge(event_router)
+            .merge(test_router),
         CaptureMode::Recordings => Router::new().merge(recordings_router),
     };
 
@@ -285,23 +454,59 @@ pub fn router<
         router = router.layer(ConcurrencyLimitLayer::new(limit));
     }
 
-    // add this prior to timeout middleware to ensure healthchecks are sensitive to load
+    // keep healthchecks outside the concurrency limit so they stay responsive under load
     router = router.merge(status_router);
 
-    // apply request timeout middleware if request_timeout_seconds is set
-    router = apply_request_timeout(router, request_timeout_seconds);
+    // Legacy CORS is applied before the v1 router is merged so it stays
+    // scoped to v0/status routes; v1 ships its own policy.
+    router = router.layer(cors);
+
+    // The v1 endpoints are only routable when a v1 sink is configured.
+    // Without a sink the handler can't publish, so we keep the paths
+    // unregistered (404) rather than advertising endpoints that can only
+    // ever return 503. This also isolates the routes to deployments that
+    // opt in via CAPTURE_V1_SINKS.
+    //
+    // Merged after every legacy layer above: the v1 router owns its full
+    // middleware stack (CORS, limits) and applies the same per-route
+    // concurrency cap to its own routes.
+    //
+    // Matched exhaustively, like the legacy route gating above: a new capture
+    // mode must declare whether it serves each v1 endpoint instead of silently
+    // defaulting to "no v1 routes" and 404ing its traffic.
+    let serves_v1_analytics = match capture_mode {
+        CaptureMode::Events | CaptureMode::Import => true,
+        // `/i/v1/analytics/events` is an analytics endpoint: it accepts any
+        // event name and its traffic is governed by analytics restrictions,
+        // which capture-ai no longer loads.
+        CaptureMode::Ai | CaptureMode::Recordings => false,
+    };
+    let serves_v1_ai_events = match capture_mode {
+        // `/i/v1/ai/events` belongs to capture-ai the way the v0 AI paths do:
+        // that deployment produces straight to the AI topic and sizes its
+        // ceilings for AI events. See `v1::analytics::router::ai_routes` for
+        // why the shared handler needs no AI-specific branch.
+        CaptureMode::Ai => true,
+        CaptureMode::Events | CaptureMode::Import | CaptureMode::Recordings => false,
+    };
+    if (serves_v1_analytics || serves_v1_ai_events) && state.v1_sink_router.is_some() {
+        router = router.merge(crate::v1::router::router(crate::v1::router::RouterConfig {
+            concurrency_limit,
+            max_compressed_body_bytes: state.capture_v1_max_compressed_body_bytes,
+            serves_analytics: serves_v1_analytics,
+            serves_ai_events: serves_v1_ai_events,
+        }));
+    }
 
     let router = router
         .layer(TraceLayer::new_for_http())
-        .layer(cors)
         .layer(axum::middleware::from_fn(track_metrics))
         .with_state(state);
 
-    // Don't install metrics unless asked to
-    // Installing a global recorder when capture is used as a library (during tests etc)
-    // does not work well.
-    if metrics {
-        let recorder_handle = setup_metrics_recorder(deploy_role, capture_mode.as_tag());
+    // The caller installs the recorder, before anything can emit; here we only
+    // expose its output. `None` for tests and library use, which have no
+    // recorder of their own.
+    if let Some(recorder_handle) = recorder_handle {
         router.route("/metrics", get(move || ready(recorder_handle.render())))
     } else {
         router
@@ -310,164 +515,7 @@ pub fn router<
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::time::Duration as StdDuration;
-
-    use axum::http::StatusCode;
-    use axum_test_helper::TestClient;
-
-    async fn slow_handler() -> &'static str {
-        // Sleep for 2 seconds to ensure timeout with 1 second timeout
-        tokio::time::sleep(StdDuration::from_secs(2)).await;
-        "slow response"
-    }
-
-    async fn fast_handler() -> &'static str {
-        "fast response"
-    }
-
-    #[tokio::test]
-    async fn test_timeout_returns_408() {
-        // Use a 1 second timeout - the slow handler sleeps for 2 seconds, so it should timeout
-        // Create router with test route included before timeout middleware is applied
-        let router = Router::new().route("/slow", get(slow_handler));
-        let router = apply_request_timeout(router, Some(1));
-
-        let client = TestClient::new(router);
-        let response = client.get("/slow").send().await;
-
-        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
-        let body = response.text().await;
-        assert_eq!(body, "Request timeout");
-    }
-
-    #[tokio::test]
-    async fn test_normal_request_completes_within_timeout() {
-        // Use a longer timeout (1 second) so normal requests complete
-        let router = Router::new().route("/fast", get(fast_handler));
-        let router = apply_request_timeout(router, Some(1));
-
-        let client = TestClient::new(router);
-        let response = client.get("/fast").send().await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = response.text().await;
-        assert_eq!(body, "fast response");
-    }
-
-    #[tokio::test]
-    async fn test_timeout_configuration_works() {
-        // Test with 1 second timeout - should timeout on slow handler (which sleeps 2 seconds)
-        let router = Router::new().route("/slow", get(slow_handler));
-        let router = apply_request_timeout(router, Some(1));
-
-        let client = TestClient::new(router);
-        let start = std::time::Instant::now();
-        let response = client.get("/slow").send().await;
-        let elapsed = start.elapsed();
-
-        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
-        // Should timeout around 1 second (within 1.5 seconds, accounting for test overhead)
-        assert!(elapsed >= StdDuration::from_millis(900)); // At least 900ms
-        assert!(elapsed < StdDuration::from_millis(1500)); // But less than 1.5s
-    }
-
-    #[tokio::test]
-    async fn test_no_timeout_when_none_specified() {
-        // Test when None is specified - should complete without timeout
-        let router = Router::new().route("/slow", get(slow_handler));
-        let router = apply_request_timeout(router, None);
-
-        let client = TestClient::new(router);
-        let start = std::time::Instant::now();
-        let response = client.get("/slow").send().await;
-        let elapsed = start.elapsed();
-
-        assert_eq!(response.status(), StatusCode::OK);
-        // Should complete within 2 seconds since no timeout is specified
-        assert!(elapsed >= StdDuration::from_millis(2000)); // At least 2 seconds
-    }
-
-    #[tokio::test]
-    async fn test_timeout_on_incomplete_request() {
-        // Test with 1 second timeout - simulate slow body transfer (slowloris style)
-        // Send complete headers but incomplete/slow body so handler starts but times out during body reading
-        use std::net::SocketAddr;
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::{TcpListener, TcpStream};
-
-        async fn body_reading_handler(body: axum::body::Body) -> &'static str {
-            // This handler reads body as a stream, which will hang if body is incomplete
-            // The timeout middleware should trigger while waiting for body chunks
-            use futures::StreamExt;
-
-            let mut stream = body.into_data_stream();
-            // Try to read all chunks - this will hang if body is incomplete
-            while stream.next().await.is_some() {
-                // Process chunks
-            }
-            "should never reach here"
-        }
-
-        let router = Router::new().route("/test", post(body_reading_handler));
-        let router = apply_request_timeout(router, Some(1));
-
-        // Bind to a random port
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        // Spawn the server
-        let server_handle = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            .unwrap();
-        });
-
-        // Give server time to start
-        tokio::time::sleep(StdDuration::from_millis(100)).await;
-
-        // Connect and send complete headers but incomplete body
-        let mut stream = TcpStream::connect(addr).await.unwrap();
-
-        // Send complete request line and headers
-        stream.write_all(b"POST /test HTTP/1.1\r\n").await.unwrap();
-        stream.write_all(b"Host: localhost\r\n").await.unwrap();
-        stream
-            .write_all(b"Content-Length: 10000\r\n")
-            .await
-            .unwrap(); // Claim large body
-        stream
-            .write_all(b"Content-Type: application/json\r\n")
-            .await
-            .unwrap();
-        stream.write_all(b"\r\n").await.unwrap(); // Complete headers - this triggers request parsing
-
-        // Send just a tiny bit of body data, then wait
-        stream.write_all(b"{").await.unwrap();
-
-        // Keep connection alive but don't send more data
-        // The handler is waiting for the remaining 9999 bytes
-        tokio::time::sleep(StdDuration::from_millis(1200)).await;
-
-        // Try to read response - should get timeout response
-        let mut buf = [0u8; 1024];
-        let read_result = stream.read(&mut buf).await;
-
-        // Should receive timeout response (408 Request Timeout)
-        if let Ok(bytes_read) = read_result {
-            if bytes_read > 0 {
-                let response = String::from_utf8_lossy(&buf[..bytes_read]);
-                assert!(response.contains("408") || response.contains("Request timeout"));
-            }
-        }
-
-        // Clean up
-        server_handle.abort();
-    }
 
     #[tokio::test]
     async fn test_body_chunk_timeout_fires_on_stalled_upload() {

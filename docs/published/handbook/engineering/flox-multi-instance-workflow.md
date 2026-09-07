@@ -6,15 +6,28 @@ noindex: true
 
 This guide explains how to create isolated PostHog development environments using Flox and Git worktrees for seamless branch switching.
 
+> This guide builds on the [developing locally](./developing-locally) setup.
+> You should have Flox installed and be able to run `hogli start`
+> (PostHog's developer CLI, available inside the Flox environment) before proceeding.
+
 **Key Benefits:**
 
 - Work on multiple branches simultaneously with isolated environments
 - Each worktree has its own Flox environment and Python dependencies
 - Quick switching between features, bug fixes, and PR reviews
-- Standard `bin/start` command works in each worktree
+- Standard `hogli start` command works in each worktree
 
-> [!IMPORTANT]
-> **Important:** Only one PostHog instance (`bin/start`) can run at a time since they all use the same ports. The workflow focuses on quickly stopping one instance and starting another.
+> **Important:** Only one PostHog instance (`hogli start`) can run at a time since they all use the same ports. The workflow focuses on quickly stopping one instance and starting another.
+
+## Light worktrees
+
+You only need the full setup below when you want to run the app in a worktree. For edit and commit workflows, a plain `git worktree add <path> <branch>` is enough:
+
+- Pre-commit hooks (lint-staged, hogli, ruff, ty) work out of the box: they borrow the main clone's `node_modules` and Python venv automatically, as long as the worktree's `pnpm-lock.yaml` and `uv.lock` match the main clone's.
+- The borrow lasts for one hook process. The worktree gets no `node_modules` or venv of its own, so editors, typecheck and tests need `flox activate` first.
+- Borrowed tooling runs the main clone's copy of first-party code. `hogli` and `@posthog/*` resolve there rather than to your branch, because editable installs and workspace links point at whichever clone ran the install. Run `flox activate` in the worktree before changing `hogli` or a workspace package.
+- If a lockfile differs, the hooks tell you what to install locally instead.
+- Use `phw` (below) only when you need to run the app in that worktree.
 
 ## Prerequisites
 
@@ -40,6 +53,159 @@ For example:
 ```bash
 export POSTHOG_WORKTREE_BASE="$HOME/code/worktrees"
 # Worktrees will be created in ~/code/worktrees/<branch-name>
+```
+
+## Quick Start
+
+### 1. One-Time Setup
+
+In all these examples, replace `~/dev/posthog/posthog` with your local path to the PostHog repo.
+
+```bash
+# Install dependencies
+brew install direnv gh jq
+
+# Add direnv hook to your shell (~/.zshrc or ~/.bashrc)
+eval "$(direnv hook zsh)"  # or bash
+
+# Reload your shell
+source ~/.zshrc  # or ~/.bashrc
+
+# Verify setup in main repo
+cd ~/dev/posthog/posthog
+flox activate
+# You should see Flox environment activate and uv sync run
+```
+
+### 2. Daily Workflow with `phw`
+
+After setup, use the `phw` command for everything:
+
+#### Create a NEW branch
+
+```bash
+# creates branch haacked/new-feature and worktree haacked/new-feature off of master
+phw create haacked/new-feature
+# You're now IN the worktree with Flox activated!
+hogli start
+# Access at http://localhost:8010
+
+# Or specify a different base branch
+phw create haacked/new-feature master
+```
+
+#### Work on EXISTING branch
+
+```bash
+phw checkout haacked/new-feature
+# Creates worktree for existing branch, Flox activated!
+hogli start
+# Access at http://localhost:8010
+```
+
+#### Switch to EXISTING worktree
+
+```bash
+phw switch haacked/new-feature
+# Switches to already created worktree, Flox activated!
+hogli start
+# Access at http://localhost:8010
+```
+
+#### Review a Pull Request
+
+```bash
+phw pr 12345
+# Fetched PR, switched to worktree, ready to test!
+hogli start
+# Access at http://localhost:8010
+```
+
+## Real-World Example
+
+```bash
+# 9:00 AM - Start working on new dashboard
+phw create haacked/analytics-dashboard
+hogli migrations:run  # Run migrations
+hogli start           # Start development
+# Work on feature at http://localhost:8010
+
+# 10:30 AM - Urgent production bug!
+# Stop current PostHog instance first
+# Ctrl+C to stop hogli start
+phw checkout master
+# Already in main worktree with Flox activated
+git pull origin master
+hogli start  # Start development
+# Fix bug, test at http://localhost:8010
+
+# 11:00 AM - Review teammate's PR
+# Stop current instance first
+phw pr 5678
+# Automatically fetches PR and switches to it
+hogli start
+# Review at http://localhost:8010
+
+# 2:00 PM - Back to feature work
+# Stop current instance and switch back
+phw switch haacked/analytics-dashboard
+# You may see interactive prompt - press Enter to skip nesting, or run 'exit' first
+hogli start  # Continue where you left off
+
+# 5:00 PM - Cleanup
+phw list                                # See all worktrees
+phw remove pr-5678-teammate            # Done with PR review
+```
+
+## Common Workflows
+
+### Switching Between Worktrees
+
+Since you can only run one PostHog instance at a time, the workflow focuses on quickly switching between isolated environments:
+
+```bash
+# Create isolated worktrees for different tasks
+phw create haacked/feature-analytics
+phw checkout bugfix/login-issue
+phw pr 1234
+
+# Work on feature
+phw switch haacked/feature-analytics
+hogli start  # Work on feature
+
+# Stop and switch to bug fix
+# Ctrl+C to stop
+phw switch bugfix/login-issue
+hogli start  # Switch to bug fix work
+
+# Stop and switch to PR review
+# Ctrl+C to stop
+phw switch pr-1234-teammate
+hogli start  # Review PR
+```
+
+### Managing Your Worktrees
+
+```bash
+# See all your worktrees
+phw list
+
+# Output:
+# All PostHog Worktrees:
+#
+# Branch                        Path                                           Location
+# ------                        ----                                           --------
+# haacked/improved-workflow     /Users/username/dev/posthog/posthog            other
+# haacked/analytics-dashboard   /Users/username/.worktrees/posthog/haacked/... current
+# main                         /Users/username/.worktrees/posthog/main        current
+# pr-5678-teammate             /Users/username/.worktrees/posthog/pr-5678-... current
+#
+# Legend:
+#   current = in current worktree base (/Users/username/.worktrees/posthog)
+#   other   = in different location
+
+# Remove when done (works regardless of location)
+phw remove pr-5678-teammate
 ```
 
 ### Worktree Location Management
@@ -70,162 +236,6 @@ phw remove pr-1234-teammate  # Works even though it's in old location!
 
 This uses Git's native worktree tracking (`git worktree list`) rather than trying to guess paths.
 
-## Quick Start
-
-### 1. One-Time Setup
-
-In all these examples, replace `~/dev/posthog/posthog` with your local path to the PostHog repo.
-
-```bash
-# Install dependencies
-brew install direnv gh jq
-
-# Add direnv hook to your shell (~/.zshrc or ~/.bashrc)
-eval "$(direnv hook zsh)"  # or bash
-
-# Add the phw function for auto-cd functionality
-echo 'source ~/dev/posthog/posthog/bin/phw' >> ~/.zshrc  # or ~/.bashrc
-
-# Reload your shell
-source ~/.zshrc  # or ~/.bashrc
-
-# Verify setup in main repo
-cd ~/dev/posthog/posthog
-flox activate
-# You should see Flox environment activate and uv sync run
-```
-
-### 2. Daily Workflow with `phw`
-
-After setup, use the `phw` command for everything:
-
-#### Create a NEW branch
-
-```bash
-# creates branch haacked/new-feature and worktree haacked/new-feature off of master
-phw create haacked/new-feature
-# You're now IN the worktree with Flox activated!
-bin/start
-# Access at http://localhost:8000
-
-# Or specify a different base branch
-phw create haacked/new-feature master
-```
-
-#### Work on EXISTING branch
-
-```bash
-phw checkout haacked/new-feature
-# Creates worktree for existing branch, Flox activated!
-bin/start
-# Access at http://localhost:8000
-```
-
-#### Switch to EXISTING worktree
-
-```bash
-phw switch haacked/new-feature
-# Switches to already created worktree, Flox activated!
-bin/start
-# Access at http://localhost:8000
-```
-
-#### Review a Pull Request
-
-```bash
-phw pr 12345
-# Fetched PR, switched to worktree, ready to test!
-bin/start
-# Access at http://localhost:8000
-```
-
-## Real-World Example
-
-```bash
-# 9:00 AM - Start working on new dashboard
-phw create haacked/analytics-dashboard
-bin/migrate  # Run migrations
-bin/start    # Start development
-# Work on feature at http://localhost:8000
-
-# 10:30 AM - Urgent production bug!
-# Stop current PostHog instance first
-# Ctrl+C to stop bin/start
-phw checkout master
-# Already in main worktree with Flox activated
-git pull origin master
-bin/start    # Start development
-# Fix bug, test at http://localhost:8000
-
-# 11:00 AM - Review teammate's PR
-# Stop current instance first
-phw pr 5678
-# Automatically fetches PR and switches to it
-bin/start
-# Review at http://localhost:8000
-
-# 2:00 PM - Back to feature work
-# Stop current instance and switch back
-phw switch haacked/analytics-dashboard
-# You may see interactive prompt - press Enter to skip nesting, or run 'exit' first
-bin/start    # Continue where you left off
-
-# 5:00 PM - Cleanup
-phw list                                # See all worktrees
-phw remove pr-5678-teammate            # Done with PR review
-```
-
-## Common Workflows
-
-### Switching Between Worktrees
-
-Since you can only run one PostHog instance at a time, the workflow focuses on quickly switching between isolated environments:
-
-```bash
-# Create isolated worktrees for different tasks
-phw create haacked/feature-analytics
-phw checkout bugfix/login-issue
-phw pr 1234
-
-# Work on feature
-phw switch haacked/feature-analytics
-bin/start  # Work on feature
-
-# Stop and switch to bug fix
-# Ctrl+C to stop
-phw switch bugfix/login-issue
-bin/start  # Switch to bug fix work
-
-# Stop and switch to PR review
-# Ctrl+C to stop
-phw switch pr-1234-teammate
-bin/start  # Review PR
-```
-
-### Managing Your Worktrees
-
-```bash
-# See all your worktrees
-phw list
-
-# Output:
-# All PostHog Worktrees:
-#
-# Branch                        Path                                           Location
-# ------                        ----                                           --------
-# haacked/improved-workflow     /Users/username/dev/posthog/posthog            other
-# haacked/analytics-dashboard   /Users/username/.worktrees/posthog/haacked/... current
-# main                         /Users/username/.worktrees/posthog/main        current
-# pr-5678-teammate             /Users/username/.worktrees/posthog/pr-5678-... current
-#
-# Legend:
-#   current = in current worktree base (/Users/username/.worktrees/posthog)
-#   other   = in different location
-
-# Remove when done (works regardless of location)
-phw remove pr-5678-teammate
-```
-
 ## Quick Reference
 
 ### Commands
@@ -244,7 +254,7 @@ phw list                            # List all worktrees
 - **Isolated environments**: Each worktree has its own Flox environment and Python dependencies
 - **Quick switching**: Move between branches without losing work or rebuilding dependencies
 - **Clean separation**: Different features, bug fixes, and PR reviews stay completely separate
-- **Standard tools**: Uses familiar `bin/start` command in each worktree
+- **Standard tools**: Uses familiar `hogli start` command in each worktree
 
 ## How It Works
 
@@ -349,12 +359,11 @@ flox activate
 
 ### phw command not found
 
-```bash
-# Make sure you've sourced the phw script
-source ~/dev/posthog/posthog/bin/phw
+Make sure the Flox environment is activated:
 
-# Add it permanently to your shell profile
-echo 'source ~/dev/posthog/posthog/bin/phw' >> ~/.zshrc
+```bash
+cd ~/dev/posthog/posthog
+flox activate
 ```
 
 ### Dependencies out of sync
@@ -398,18 +407,20 @@ git worktree prune
 For a complete one-time setup, run:
 
 ```bash
-# For zsh users
+# For zsh users (replace ~/dev/posthog/posthog with your repo path)
 brew install direnv gh jq && \
 echo 'eval "$(direnv hook zsh)"' >> ~/.zshrc && \
-echo 'source ~/dev/posthog/posthog/bin/phw' >> ~/.zshrc && \
 source ~/.zshrc && \
+cd ~/dev/posthog/posthog && \
+flox activate -- true && \
 echo "✅ Setup complete! You can now use 'phw' commands."
 
-# For bash users
+# For bash users (replace ~/dev/posthog/posthog with your repo path)
 brew install direnv gh jq && \
 echo 'eval "$(direnv hook bash)"' >> ~/.bashrc && \
-echo 'source ~/dev/posthog/posthog/bin/phw' >> ~/.bashrc && \
 source ~/.bashrc && \
+cd ~/dev/posthog/posthog && \
+flox activate -- true && \
 echo "✅ Setup complete! You can now use 'phw' commands."
 ```
 

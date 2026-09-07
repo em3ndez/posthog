@@ -4,6 +4,9 @@ import { expectLogic, partial } from 'kea-test-utils'
 
 import { FEATURE_FLAGS } from 'lib/constants'
 import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+import { DashboardLoadAction, dashboardLogic } from 'scenes/dashboard/dashboardLogic'
+import { dashboardResult } from 'scenes/dashboard/dashboardLogic.testHelpers'
+import { insightsApi } from 'scenes/insights/utils/api'
 
 import { useMocks } from '~/mocks/jest'
 import { initKeaTests } from '~/test/init'
@@ -50,9 +53,10 @@ function useSetupWithUrlCapture(options: { userInsightCount?: number; variant?: 
 
     useMocks({
         get: {
-            '/api/environments/:team_id/insights/': (req) => {
-                capturedUrls.push(req.url)
-                if (req.url.searchParams.get('user') === 'true') {
+            '/api/environments/:team_id/insights/': ({ request }) => {
+                const url = new URL(request.url)
+                capturedUrls.push(url)
+                if (url.searchParams.get('user') === 'true') {
                     return [200, { count: userInsightCount, results: [] }]
                 }
                 return [200, { count: 0, results: [] }]
@@ -182,11 +186,12 @@ describe('addSavedInsightsModalLogic', () => {
         beforeEach(() => {
             useMocks({
                 get: {
-                    '/api/environments/:team_id/insights/': (req) => {
-                        if (req.url.searchParams.get('user') === 'true') {
+                    '/api/environments/:team_id/insights/': ({ request }) => {
+                        const url = new URL(request.url)
+                        if (url.searchParams.get('user') === 'true') {
                             return [200, { count: 0, results: [] }]
                         }
-                        const search = req.url.searchParams.get('search') ?? ''
+                        const search = url.searchParams.get('search') ?? ''
                         const results = [createInsight(1, search || 'default'), createInsight(2, search || 'default')]
                         return [200, { count: results.length, results }]
                     },
@@ -207,11 +212,12 @@ describe('addSavedInsightsModalLogic', () => {
 
             useMocks({
                 get: {
-                    '/api/environments/:team_id/insights/': (req) => {
-                        if (req.url.searchParams.get('user') === 'true') {
+                    '/api/environments/:team_id/insights/': ({ request }) => {
+                        const url = new URL(request.url)
+                        if (url.searchParams.get('user') === 'true') {
                             return [200, { count: 0, results: [] }]
                         }
-                        const search = req.url.searchParams.get('search')
+                        const search = url.searchParams.get('search')
                         const label = search || 'unfiltered'
                         return [200, { count: 1, results: [createInsight(1, label)] }]
                     },
@@ -259,5 +265,23 @@ describe('addSavedInsightsModalLogic', () => {
 
             expect(apiCallCount).toBe(1)
         })
+    })
+
+    it('refreshes the mounted dashboard after adding an insight', async () => {
+        initKeaTests()
+        const dashboard = dashboardLogic({ id: 1, dashboard: dashboardResult(1, []) })
+        dashboard.mount()
+        const loadDashboard = jest.spyOn(dashboard.actions, 'loadDashboard').mockImplementation()
+        jest.spyOn(insightsApi, 'update').mockResolvedValue(createInsight(1))
+
+        const logic = addSavedInsightsModalLogic()
+        logic.mount()
+
+        await expectLogic(logic, () => logic.actions.addInsightToDashboard(createInsight(1), 1)).toFinishAllListeners()
+
+        expect(loadDashboard).toHaveBeenCalledWith({ action: DashboardLoadAction.Update })
+
+        logic.unmount()
+        dashboard.unmount()
     })
 })

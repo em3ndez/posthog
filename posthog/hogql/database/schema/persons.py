@@ -1,8 +1,6 @@
-from typing import Optional, Self, cast
+from typing import TYPE_CHECKING, Optional, Self, cast
 
 import posthoganalytics
-
-from posthog.schema import PersonsArgMaxVersion
 
 from posthog.hogql import ast
 from posthog.hogql.ast import And, CompareOperation, CompareOperationOp, Field, JoinExpr, SelectQuery
@@ -10,6 +8,7 @@ from posthog.hogql.base import Expr
 from posthog.hogql.constants import HogQLQuerySettings
 from posthog.hogql.context import HogQLContext
 from posthog.hogql.database.argmax import argmax_select
+from posthog.hogql.database.lazy_join_tags import PERSONS_PDI, PERSONS_REVENUE_ANALYTICS
 from posthog.hogql.database.models import (
     BooleanDatabaseField,
     DateTimeDatabaseField,
@@ -19,38 +18,52 @@ from posthog.hogql.database.models import (
     LazyJoinToAdd,
     LazyTable,
     LazyTableToAdd,
-    StringDatabaseField,
     StringJSONDatabaseField,
     Table,
+    UUIDDatabaseField,
 )
-from posthog.hogql.database.schema.persons_pdi import PersonsPDITable, persons_pdi_join
-from posthog.hogql.database.schema.persons_revenue_analytics import (
-    PersonsRevenueAnalyticsTable,
-    join_with_persons_revenue_analytics_table,
-)
+from posthog.hogql.database.schema.persons_pdi import PersonsPDITable
+from posthog.hogql.database.schema.persons_revenue_analytics import PersonsRevenueAnalyticsTable
 from posthog.hogql.database.schema.util.where_clause_extractor import WhereClauseExtractor
 from posthog.hogql.errors import ResolutionError
 from posthog.hogql.parser import parse_select
 from posthog.hogql.visitor import CloningVisitor, clone_expr
 
-from posthog.models.organization import Organization
+from posthog.schema_enums import PersonsArgMaxVersion
+
+if TYPE_CHECKING:
+    from posthog.models.organization import Organization
 
 PERSONS_FIELDS: dict[str, FieldOrTable] = {
-    "id": StringDatabaseField(name="id", nullable=False),
-    "created_at": DateTimeDatabaseField(name="created_at", nullable=False),
+    "id": UUIDDatabaseField(
+        name="id", nullable=False, description="Stable person identifier; join target for `events.person_id`."
+    ),
+    "created_at": DateTimeDatabaseField(
+        name="created_at", nullable=False, description="When the person was first seen by PostHog."
+    ),
     "team_id": IntegerDatabaseField(name="team_id", nullable=False),
-    "properties": StringJSONDatabaseField(name="properties", nullable=False),
-    "is_identified": BooleanDatabaseField(name="is_identified", nullable=False),
-    "last_seen_at": DateTimeDatabaseField(name="last_seen_at", nullable=True),
+    "properties": StringJSONDatabaseField(
+        name="properties",
+        nullable=False,
+        description="JSON map of person properties (latest known values). Access keys with `properties.email` etc.",
+    ),
+    "is_identified": BooleanDatabaseField(
+        name="is_identified",
+        nullable=False,
+        description="True once the person has been identified (vs. an anonymous distinct_id).",
+    ),
+    "last_seen_at": DateTimeDatabaseField(
+        name="last_seen_at", nullable=True, description="Timestamp of the most recent event for this person."
+    ),
     "pdi": LazyJoin(
         from_field=["id"],
         join_table=PersonsPDITable(),
-        join_function=persons_pdi_join,
+        resolver=PERSONS_PDI,
     ),
     "revenue_analytics": LazyJoin(
         from_field=["id"],
         join_table=PersonsRevenueAnalyticsTable(),
-        join_function=join_with_persons_revenue_analytics_table,
+        resolver=PERSONS_REVENUE_ANALYTICS,
     ),
 }
 
@@ -158,16 +171,39 @@ def select_from_persons_table(
         if filter is not None:
             cast(ast.SelectQuery, cast(ast.CompareOperation, select.where).right).where = filter
 
-        # START order_by/limit optimization.
-        # only apply this to queries that directly select from the persons table
-        if (
+        # Deferred: posthog.hogql.property imports database schema modules, so a top-level import here is circular.
+        from posthog.hogql.property import has_aggregation, has_window_function  # noqa: PLC0415
+
+        # Push ORDER BY + LIMIT into the inner deduplication subquery so ClickHouse can stop early.
+        # Skip when there's an outer WHERE -- a premature inner LIMIT would exclude valid rows
+        # before the filter runs (e.g. cohort members dropped because LIMIT grabbed other rows first).
+        # Skip aggregate, DISTINCT, and window-function selects too: they must see every person, and
+        # the executor stamps a default LIMIT on every query, so pushing it down would cap
+        # e.g. `SELECT count() FROM persons` at the page size instead of counting the whole team.
+        # HAVING, QUALIFY, ARRAY JOIN, LIMIT BY, and WITH TIES / PERCENT also filter or reshape
+        # rows after deduplication, so they need the full person set as well.
+        can_push_to_inner = (
             node.select_from
             and node.select_from.type
             and hasattr(node.select_from.type, "table")
             and node.select_from.type.table
             and isinstance(node.select_from.type.table, PersonsTable)
             and not node.group_by  # TODO: support group_by
-        ):
+            and node.limit
+            and not node.where
+            and not node.prewhere
+            and not node.having
+            and not node.qualify
+            and not node.array_join_op
+            and not node.limit_by
+            and not node.limit_with_ties
+            and not node.limit_percent
+            and not node.distinct
+            and not any(has_aggregation(expr) for expr in node.select)
+            and not node.window_exprs
+            and not any(has_window_function(expr) for expr in node.select)
+        )
+        if can_push_to_inner:
             compare = cast(ast.CompareOperation, select.where)
             right_select = cast(ast.SelectQuery, compare.right)
             if node.order_by:
@@ -184,16 +220,11 @@ def select_from_persons_table(
                         order_by_without_virtual_fields.append(order_by)
                 right_select.order_by = order_by_without_virtual_fields
 
-            # Patch: push limit+offset+1 to inner subquery for correct pagination, always set offset=0
-            if node.limit:
-                node_limit = cast(ast.Constant, node.limit)
-                node_offset = cast(ast.Constant, node.offset)
-                effective_limit = (
-                    (node_limit.value if node.limit else 100) + (node_offset.value if node.offset else 0) + 1
-                )
-                right_select.limit = ast.Constant(value=effective_limit)
-                right_select.offset = ast.Constant(value=0)
-                # Do NOT set node.limit/node.offset directly, outer paginator will slice results
+            node_limit = cast(ast.Constant, node.limit)
+            node_offset = cast(ast.Constant, node.offset)
+            effective_limit = node_limit.value + (node_offset.value if node.offset else 0) + 1
+            right_select.limit = ast.Constant(value=effective_limit)
+            right_select.offset = ast.Constant(value=0)
 
         for field_name, field_chain in join_or_table.fields_accessed.items():
             # We need to always select the 'id' field for the join constraint. The field name here is likely to
@@ -283,6 +314,10 @@ def join_with_persons_table(
 
 
 class RawPersonsTable(Table):
+    description: str = (
+        "Raw, un-deduplicated persons rows (one per version). Query `persons` instead unless you need to "
+        "resolve the latest version yourself via `is_deleted`/`version`."
+    )
     fields: dict[str, FieldOrTable] = {
         **PERSONS_FIELDS,
         "is_deleted": BooleanDatabaseField(name="is_deleted", nullable=False),
@@ -300,6 +335,7 @@ class RawPersonsTable(Table):
 # It pulls any "persons.id in ()" statement inside of the argmax subselect
 # This is useful when executing a query for a large team.
 class PersonsTable(LazyTable):
+    description: str = "Deduplicated people in the project, with their latest properties. One row per person."
     fields: dict[str, FieldOrTable] = PERSONS_FIELDS
     filter: Optional[Expr] = None
 

@@ -99,11 +99,11 @@ export class DecompressionWorkerManager {
         this.snappyInitialized = true
     }
 
-    async decompress(compressedData: Uint8Array, metadata?: { isParallel?: boolean }): Promise<Uint8Array> {
+    async decompress(compressedData: Uint8Array): Promise<Uint8Array> {
         await this.readyPromise
 
         if (this.shouldUseWorker()) {
-            return this.decompressWithFallback(compressedData, metadata)
+            return this.decompressWithFallback(compressedData)
         }
         return this.decompressMainThread(compressedData)
     }
@@ -112,33 +112,26 @@ export class DecompressionWorkerManager {
         return this.worker !== null && !this.workerInitFailed
     }
 
-    private async decompressWithFallback(
-        compressedData: Uint8Array,
-        metadata?: { isParallel?: boolean }
-    ): Promise<Uint8Array> {
+    private async decompressWithFallback(compressedData: Uint8Array): Promise<Uint8Array> {
         try {
-            return await this.decompressWithWorker(compressedData, metadata)
+            return await this.decompressWithWorker(compressedData)
         } catch (error) {
-            this.reportWorkerFailure(error, compressedData.length, metadata?.isParallel)
+            this.reportWorkerFailure(error, compressedData.length)
             return await this.decompressMainThread(compressedData)
         }
     }
 
-    private reportWorkerFailure(error: unknown, dataSize: number, isParallel?: boolean): void {
+    private reportWorkerFailure(error: unknown, dataSize: number): void {
         console.warn('[DecompressionWorkerManager] Worker decompression failed, falling back to main thread:', error)
         if (this.posthog) {
             this.posthog.capture('replay_worker_decompression_failed', {
                 error: this.getErrorMessage(error),
                 dataSize,
-                isParallel,
             })
         }
     }
 
-    private async decompressWithWorker(
-        compressedData: Uint8Array,
-        metadata?: { isParallel?: boolean }
-    ): Promise<Uint8Array> {
+    private async decompressWithWorker(compressedData: Uint8Array): Promise<Uint8Array> {
         const id = this.messageId++
 
         return new Promise<Uint8Array>((resolve, reject) => {
@@ -151,7 +144,6 @@ export class DecompressionWorkerManager {
                     console.error('[DecompressionWorkerManager] Worker decompression timeout', {
                         id,
                         dataSize: compressedData.length,
-                        isParallel: metadata?.isParallel,
                         timeoutMs: DECOMPRESSION_TIMEOUT_MS,
                     })
                     reject(new Error('Worker decompression timeout'))
@@ -169,13 +161,18 @@ export class DecompressionWorkerManager {
                 },
             })
 
+            // Callers hand us views into one shared snapshot buffer, and the fallback below needs
+            // the bytes again if the worker fails. Transfer a copy this request owns, so neither
+            // the other views nor the fallback see a detached buffer.
+            const owned = new Uint8Array(compressedData)
+
             const message: DecompressionRequest = {
                 id,
-                compressedData,
+                compressedData: owned,
             }
 
             try {
-                this.worker!.postMessage(message, { transfer: [compressedData.buffer] })
+                this.worker!.postMessage(message, { transfer: [owned.buffer] })
             } catch (error) {
                 clearTimeout(timeout)
                 this.pendingRequests.delete(id)
@@ -185,6 +182,10 @@ export class DecompressionWorkerManager {
     }
 
     private async decompressMainThread(compressedData: Uint8Array): Promise<Uint8Array> {
+        // The worker path leaves the main-thread WASM uninitialized, so a worker that reports
+        // ready and then fails still has to init here before it can fall back.
+        await this.initSnappy()
+
         try {
             return decompress_raw(compressedData)
         } catch (error) {

@@ -1,5 +1,8 @@
 {
     "name": "@posthog/products-managed-migrations",
+    "scripts": {
+        "backend:test": "pytest -c ../../pytest.ini --rootdir ../.. backend/tests backend/api/test -v --tb=short"
+    },
     "dependencies": {
         "kea": "catalog:",
         "kea-forms": "catalog:",
@@ -7,7 +10,7 @@
         "kea-router": "catalog:"
     },
     "peerDependencies": {
-        "@posthog/icons": "*",
+        "@posthog/icons": "catalog:",
         "@posthog/lemon-ui": "*",
         "@types/react": "*",
         "react": "*"

@@ -12,7 +12,6 @@ import {
     LemonInput,
     LemonLabel,
     LemonSelect,
-    LemonTag,
     Tooltip,
 } from '@posthog/lemon-ui'
 
@@ -20,7 +19,7 @@ import { CyclotronJobInputs } from 'lib/components/CyclotronJob/CyclotronJobInpu
 import { TaxonomicFilterGroupType } from 'lib/components/TaxonomicFilter/types'
 import { LemonField } from 'lib/lemon-ui/LemonField'
 import { ActionFilter } from 'scenes/insights/filters/ActionFilter/ActionFilter'
-import { MathAvailability } from 'scenes/insights/filters/ActionFilter/ActionFilterRow/ActionFilterRow'
+import { MathAvailability } from 'scenes/insights/filters/ActionFilter/ActionFilterRow/types'
 
 import { groupsModel } from '~/models/groupsModel'
 import { EntityTypes, HogFunctionConfigurationType, HogFunctionMappingType } from '~/types'
@@ -76,7 +75,6 @@ export const MappingSummary = memo(function MappingSummary({
                       : humanize(firstInputValue)}
             </span>
             <span className="flex-1" />
-            {mapping.disabled ? <LemonTag type="danger">Disabled</LemonTag> : null}
         </span>
     )
 })
@@ -94,51 +92,47 @@ export function HogFunctionMapping({
 }): JSX.Element | null {
     const { groupsTaxonomicTypes } = useValues(groupsModel)
     const { showSource, sampleGlobalsWithInputs } = useValues(hogFunctionConfigurationLogic)
+    const hideEventFilter = mapping.use_all_events_by_default === true
 
     return (
         <>
             <div className="p-3 pl-10 deprecated-space-y-2">
-                {mapping.disabled ? (
-                    <LemonBanner
-                        type="warning"
-                        className="p-2"
-                        action={{
-                            children: 'Enable',
-                            onClick: () => onChange({ ...mapping, disabled: false }),
-                        }}
-                    >
-                        This mapping is disabled. It will not trigger the function.
-                    </LemonBanner>
-                ) : null}
-                <LemonLabel>Match events and actions</LemonLabel>
-                <ActionFilter
-                    filters={mapping.filters ?? ({} as any)}
-                    setFilters={(f: any) => onChange({ ...mapping, filters: f })}
-                    typeKey={`match-group-${index}`}
-                    mathAvailability={MathAvailability.None}
-                    hideRename
-                    hideDuplicate
-                    showNestedArrow={false}
-                    actionsTaxonomicGroupTypes={[TaxonomicFilterGroupType.Events, TaxonomicFilterGroupType.Actions]}
-                    propertiesTaxonomicGroupTypes={[
-                        TaxonomicFilterGroupType.EventProperties,
-                        TaxonomicFilterGroupType.EventFeatureFlags,
-                        TaxonomicFilterGroupType.Elements,
-                        TaxonomicFilterGroupType.PersonProperties,
-                        TaxonomicFilterGroupType.HogQLExpression,
-                        ...groupsTaxonomicTypes,
-                    ]}
-                    propertyFiltersPopover
-                    addFilterDefaultOptions={{
-                        id: '$pageview',
-                        name: '$pageview',
-                        type: EntityTypes.EVENTS,
-                    }}
-                    buttonProps={{
-                        type: 'secondary',
-                    }}
-                    buttonCopy="Add event matcher"
-                />
+                {!hideEventFilter && (
+                    <>
+                        <LemonLabel>Match events and actions</LemonLabel>
+                        <ActionFilter
+                            filters={mapping.filters ?? ({} as any)}
+                            setFilters={(f: any) => onChange({ ...mapping, filters: f })}
+                            typeKey={`match-group-${index}`}
+                            mathAvailability={MathAvailability.None}
+                            hideRename
+                            hideDuplicate
+                            showNestedArrow={false}
+                            actionsTaxonomicGroupTypes={[
+                                TaxonomicFilterGroupType.Events,
+                                TaxonomicFilterGroupType.Actions,
+                            ]}
+                            propertiesTaxonomicGroupTypes={[
+                                TaxonomicFilterGroupType.EventProperties,
+                                TaxonomicFilterGroupType.EventFeatureFlags,
+                                TaxonomicFilterGroupType.Elements,
+                                TaxonomicFilterGroupType.PersonProperties,
+                                TaxonomicFilterGroupType.HogQLExpression,
+                                ...groupsTaxonomicTypes,
+                            ]}
+                            propertyFiltersPopover
+                            addFilterDefaultOptions={{
+                                id: '$pageview',
+                                name: '$pageview',
+                                type: EntityTypes.EVENTS,
+                            }}
+                            buttonProps={{
+                                type: 'secondary',
+                            }}
+                            buttonCopy="Add event matcher"
+                        />
+                    </>
+                )}
                 <Group name={['mappings', index]}>
                     <CyclotronJobInputs
                         configuration={{
@@ -252,13 +246,6 @@ export function HogFunctionMappings(): JSX.Element | null {
                     }
                 }
 
-                const toggleDisabled = (mapping: HogFunctionMappingType): void => {
-                    const index = mappingsValue.findIndex((m) => m === mapping)
-                    if (index !== -1) {
-                        onChange(mappingsValue.map((m, i) => (i === index ? { ...m, disabled: !m.disabled } : m)))
-                    }
-                }
-
                 const renameMapping = (mapping: HogFunctionMappingType): void => {
                     LemonDialog.openForm({
                         title: 'Rename mapping',
@@ -328,11 +315,6 @@ export function HogFunctionMappings(): JSX.Element | null {
                                                         dropdown: {
                                                             overlay: (
                                                                 <div className="deprecated-space-y-px">
-                                                                    <LemonButton
-                                                                        onClick={() => toggleDisabled(mapping)}
-                                                                    >
-                                                                        {mapping.disabled ? 'Enable' : 'Disable'}
-                                                                    </LemonButton>
                                                                     <LemonButton onClick={() => renameMapping(mapping)}>
                                                                         Rename
                                                                     </LemonButton>

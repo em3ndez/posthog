@@ -12,9 +12,8 @@ from posthog.schema import (
     AssistantTrendsFilter,
     AssistantTrendsQuery,
     NodeKind,
+    TrendsFormulaNode,
 )
-
-from ee.hogai.chat_agent.trends.toolkit import TRENDS_SCHEMA
 
 from ..base import MaxPublicEval
 from ..scorers import PlanAndQueryOutput, PlanCorrectness, QueryAndPlanAlignment, QueryKindSelection, TimeRangeRelevancy
@@ -146,7 +145,9 @@ Formula:
                 dateRange={"date_from": "-30d", "date_to": None},
                 filterTestAccounts=True,
                 interval="day",
-                trendsFilter=AssistantTrendsFilter(display="ActionsLineGraph", showLegend=True, formulas=["A/B"]),
+                trendsFilter=AssistantTrendsFilter(
+                    display="ActionsLineGraph", showLegend=True, formulaNodes=[TrendsFormulaNode(formula="A/B")]
+                ),
                 series=[
                     AssistantTrendsEventsNode(
                         event="$identify",
@@ -330,7 +331,9 @@ Formula:
                 dateRange={"date_from": "-30d", "date_to": None},
                 filterTestAccounts=True,
                 interval="day",
-                trendsFilter=AssistantTrendsFilter(display="BoldNumber", showLegend=True, formulas=["B/A * 100"]),
+                trendsFilter=AssistantTrendsFilter(
+                    display="BoldNumber", showLegend=True, formulaNodes=[TrendsFormulaNode(formula="B/A * 100")]
+                ),
                 series=[
                     AssistantTrendsEventsNode(
                         event=None,
@@ -428,7 +431,7 @@ async def eval_trends(call_root_for_insight_generation, pytestconfig):
             ),
             QueryAndPlanAlignment(
                 query_kind=NodeKind.TRENDS_QUERY,
-                json_schema=TRENDS_SCHEMA,
+                query_model=AssistantTrendsQuery,
                 evaluation_criteria="""
 1. Events alignment: Verify that all events mentioned in the plan are correctly represented in the query's `series` array. For "All events", the `event` field should be `null`.
 2. Series math: Ensure the math operation for each event in the query matches what's specified in the plan, for example:

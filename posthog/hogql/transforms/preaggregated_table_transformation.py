@@ -26,6 +26,7 @@ from posthog.hogql import ast
 from posthog.hogql.ast import CompareOperationOp
 from posthog.hogql.base import AST
 from posthog.hogql.context import HogQLContext
+from posthog.hogql.database.schema.events import EventsTable
 from posthog.hogql.helpers.timestamp_visitor import (
     is_end_of_day_constant,
     is_end_of_hour_constant,
@@ -35,7 +36,7 @@ from posthog.hogql.helpers.timestamp_visitor import (
 )
 from posthog.hogql.visitor import CloningVisitor
 
-from posthog.hogql_queries.web_analytics.pre_aggregated.properties import (
+from products.web_analytics.backend.hogql_queries.pre_aggregated.properties import (
     EVENT_PROPERTY_TO_FIELD,
     SESSION_PROPERTY_TO_FIELD,
 )
@@ -272,47 +273,42 @@ def _get_supported_field(field: ast.Field) -> tuple[str, ast.Field] | None:
     """
     Check if a field represents a supported property and return (property_name, field) if valid.
     """
-    # Handle properties.x pattern
-    if len(field.chain) == 2 and field.chain[0] == "properties":
-        property_name = field.chain[1]
-        if isinstance(property_name, str) and property_name in EVENT_PROPERTY_TO_FIELD:
-            return (property_name, ast.Field(chain=[EVENT_PROPERTY_TO_FIELD[property_name]]))
+    match field.chain:
+        # Handle properties.x pattern
+        case ["properties", property_name]:
+            if isinstance(property_name, str) and property_name in EVENT_PROPERTY_TO_FIELD:
+                return (property_name, ast.Field(chain=[EVENT_PROPERTY_TO_FIELD[property_name]]))
 
-    # Handle properties.metadata.x pattern (for nested properties like metadata.loggedIn)
-    elif len(field.chain) == 3 and field.chain[0] == "properties":
-        property_name = f"{field.chain[1]}.{field.chain[2]}"
-        if isinstance(property_name, str) and property_name in EVENT_PROPERTY_TO_FIELD:
-            return (property_name, ast.Field(chain=[EVENT_PROPERTY_TO_FIELD[property_name]]))
+        # Handle properties.metadata.x pattern (for nested properties like metadata.loggedIn)
+        case ["properties", parent, child]:
+            property_name = f"{parent}.{child}"
+            if property_name in EVENT_PROPERTY_TO_FIELD:
+                return (property_name, ast.Field(chain=[EVENT_PROPERTY_TO_FIELD[property_name]]))
 
-    # Handle events.properties.x pattern
-    elif len(field.chain) == 3 and field.chain[0] == "events" and field.chain[1] == "properties":
-        property_name = field.chain[2]
-        if isinstance(property_name, str) and property_name in EVENT_PROPERTY_TO_FIELD:
-            return (property_name, ast.Field(chain=[EVENT_PROPERTY_TO_FIELD[property_name]]))
+        # Handle events.properties.x pattern
+        case ["events", "properties", property_name]:
+            if isinstance(property_name, str) and property_name in EVENT_PROPERTY_TO_FIELD:
+                return (property_name, ast.Field(chain=[EVENT_PROPERTY_TO_FIELD[property_name]]))
 
-    # Handle events.properties.metadata.x pattern (for nested properties like metadata.loggedIn)
-    elif len(field.chain) == 4 and field.chain[0] == "events" and field.chain[1] == "properties":
-        property_name = f"{field.chain[2]}.{field.chain[3]}"
-        if isinstance(property_name, str) and property_name in EVENT_PROPERTY_TO_FIELD:
-            return (property_name, ast.Field(chain=[EVENT_PROPERTY_TO_FIELD[property_name]]))
+        # Handle events.properties.metadata.x pattern (for nested properties like metadata.loggedIn)
+        case ["events", "properties", parent, child]:
+            property_name = f"{parent}.{child}"
+            if property_name in EVENT_PROPERTY_TO_FIELD:
+                return (property_name, ast.Field(chain=[EVENT_PROPERTY_TO_FIELD[property_name]]))
 
-    # Handle session.x pattern
-    elif len(field.chain) == 2 and field.chain[0] == "session":
-        property_name = field.chain[1]
-        if isinstance(property_name, str) and property_name in SESSION_PROPERTY_TO_FIELD:
-            return (property_name, ast.Field(chain=[SESSION_PROPERTY_TO_FIELD[property_name]]))
+        # Handle session.x pattern
+        case ["session", property_name]:
+            if isinstance(property_name, str) and property_name in SESSION_PROPERTY_TO_FIELD:
+                return (property_name, ast.Field(chain=[SESSION_PROPERTY_TO_FIELD[property_name]]))
 
-    # Handle events.session.x pattern
-    elif len(field.chain) == 3 and field.chain[0] == "events" and field.chain[1] == "session":
-        property_name = field.chain[2]
-        if isinstance(property_name, str) and property_name in SESSION_PROPERTY_TO_FIELD:
-            return (property_name, ast.Field(chain=[SESSION_PROPERTY_TO_FIELD[property_name]]))
+        # Handle events.session.x pattern
+        case ["events", "session", property_name]:
+            if isinstance(property_name, str) and property_name in SESSION_PROPERTY_TO_FIELD:
+                return (property_name, ast.Field(chain=[SESSION_PROPERTY_TO_FIELD[property_name]]))
 
-    # Handle team_id and events.team_id
-    elif (len(field.chain) == 1 and field.chain[0] == "team_id") or (
-        len(field.chain) == 2 and field.chain[1] == "team_id"
-    ):
-        return ("team_id", ast.Field(chain=["team_id"]))
+        # Handle team_id and events.team_id
+        case ["team_id"] | [_, "team_id"]:
+            return ("team_id", ast.Field(chain=["team_id"]))
 
     return None
 
@@ -398,10 +394,18 @@ def _is_constant_one(expr: ast.Expr) -> bool:
     return isinstance(expr, ast.Constant) and expr.value == 1
 
 
-def _is_valid_select_from(node: Optional[ast.JoinExpr]) -> bool:
+def _is_valid_select_from(node: Optional[ast.JoinExpr], context: HogQLContext) -> bool:
     if not node or not isinstance(node.table, ast.Field):
         return False
-    if node.table.chain != ["events"]:
+    # Require a database so we can resolve the chain to a real Table instance. Without a database
+    # we cannot distinguish `events` from `posthog.events` or catch aliases, so skip the transform.
+    if context.database is None:
+        return False
+    try:
+        resolved_table = context.database.get_table([str(c) for c in node.table.chain])
+    except Exception:
+        return False
+    if not isinstance(resolved_table, EventsTable):
         return False
     if node.constraint:
         return False
@@ -435,7 +439,7 @@ def _shallow_transform_select(node: ast.SelectQuery, context: HogQLContext) -> a
     ):
         return node
 
-    if not _is_valid_select_from(node.select_from):
+    if not _is_valid_select_from(node.select_from, context):
         return node
 
     visitor = ExprTransformer(context)

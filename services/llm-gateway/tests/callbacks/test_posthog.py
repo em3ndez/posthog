@@ -1,10 +1,32 @@
 import json
+from typing import Any
 from unittest.mock import MagicMock, patch
+from uuid import UUID
 
 import pytest
 
 from llm_gateway.auth.models import AuthenticatedUser
-from llm_gateway.callbacks.posthog import PostHogCallback, _replace_binary_content, _truncate_for_capture
+from llm_gateway.callbacks.posthog import (
+    _MAX_CAPTURE_SIZE,
+    PostHogCallback,
+    _normalize_trace_id,
+    _replace_binary_content,
+    _truncate_for_capture,
+)
+from llm_gateway.request_context import RequestContext, set_request_context
+
+
+def _is_uuid(value: str) -> bool:
+    try:
+        UUID(value)
+        return True
+    except ValueError:
+        return False
+
+
+def _run_sync(executor, fn, *args):
+    """Execute the function synchronously, bypassing the thread pool for tests."""
+    fn(*args)
 
 
 class TestPostHogCallback:
@@ -34,10 +56,29 @@ class TestPostHogCallback:
             "response": "Hello! How can I help?",
         }
 
+    @pytest.fixture
+    def mock_posthog_client(self):
+        mock_client = MagicMock()
+        with patch("llm_gateway.callbacks.posthog.Posthog", return_value=mock_client) as mock_cls:
+            yield mock_cls, mock_client
+
+    @pytest.fixture(autouse=True)
+    def mock_event_loop(self):
+        mock_loop = MagicMock()
+        mock_loop.run_in_executor.side_effect = _run_sync
+        with patch("llm_gateway.callbacks.posthog.asyncio") as mock_asyncio:
+            mock_asyncio.get_running_loop.return_value = mock_loop
+            yield mock_loop
+
     @pytest.mark.asyncio
     async def test_on_success_captures_event(
-        self, callback: PostHogCallback, auth_user: AuthenticatedUser, standard_logging_object: dict
+        self,
+        callback: PostHogCallback,
+        auth_user: AuthenticatedUser,
+        standard_logging_object: dict,
+        mock_posthog_client: tuple,
     ) -> None:
+        mock_cls, mock_client = mock_posthog_client
         kwargs = {
             "standard_logging_object": standard_logging_object,
             "litellm_params": {},
@@ -46,16 +87,23 @@ class TestPostHogCallback:
         with (
             patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
             patch("llm_gateway.callbacks.posthog.get_product", return_value="wizard"),
-            patch("llm_gateway.callbacks.posthog.posthoganalytics") as mock_posthog,
         ):
             await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
 
-            mock_posthog.capture.assert_called_once()
-            call_kwargs = mock_posthog.capture.call_args.kwargs
+            mock_cls.assert_called_once_with(
+                "test-key",
+                host="https://test.posthog.com",
+                sync_mode=True,
+                enable_local_evaluation=False,
+                _use_ai_lane=True,
+                _enable_multimodal_capture=True,
+            )
+            mock_client.capture.assert_called_once()
+            call_kwargs = mock_client.capture.call_args.kwargs
 
             assert call_kwargs["distinct_id"] == "user-distinct-id-123"
             assert call_kwargs["event"] == "$ai_generation"
-            assert call_kwargs["groups"] == {"project": 456}
+            assert call_kwargs["groups"] == {"instance": "https://us.posthog.com", "project": 456}
 
             props = call_kwargs["properties"]
             assert props["$ai_model"] == "claude-3-opus"
@@ -66,30 +114,341 @@ class TestPostHogCallback:
             assert props["$ai_total_cost_usd"] == 0.05
             assert props["team_id"] == 456
             assert props["ai_product"] == "wizard"
-            mock_posthog.flush.assert_not_called()
+            mock_client.shutdown.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_ai_lane_capture_off_builds_standard_lane_client(
+        self,
+        auth_user: AuthenticatedUser,
+        standard_logging_object: dict,
+        mock_posthog_client: tuple,
+    ) -> None:
+        # The local-dev knob: with ai_lane_capture=False the client must drop to the standard
+        # capture lane (and with it multimodal capture), or local stacks keep losing every event.
+        mock_cls, _ = mock_posthog_client
+        callback = PostHogCallback(api_key="test-key", host="https://test.posthog.com", ai_lane_capture=False)
+        kwargs = {"standard_logging_object": standard_logging_object, "litellm_params": {}}
+
+        with (
+            patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
+            patch("llm_gateway.callbacks.posthog.get_product", return_value="wizard"),
+        ):
+            await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        assert mock_cls.call_args.kwargs["_use_ai_lane"] is False
+        assert mock_cls.call_args.kwargs["_enable_multimodal_capture"] is False
+
+    @pytest.mark.parametrize(
+        "event_method, effort, caller_effort, expected",
+        [
+            # gateway-resolved effort is stamped, on both success and error events
+            ("_on_success", "medium", None, "medium"),
+            ("_on_failure", "high", None, "high"),
+            # omitted when the gateway found none
+            ("_on_success", None, None, None),
+            # gateway-owned: a caller header can neither override a resolved value...
+            ("_on_success", "medium", "spoofed", "medium"),
+            # ...nor sneak one in when the gateway found none (success and error paths)
+            ("_on_success", None, "spoofed", None),
+            ("_on_failure", None, "spoofed", None),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_effort_is_gateway_owned(
+        self,
+        callback: PostHogCallback,
+        auth_user: AuthenticatedUser,
+        standard_logging_object: dict,
+        mock_posthog_client: tuple,
+        event_method: str,
+        effort: str | None,
+        caller_effort: str | None,
+        expected: str | None,
+    ) -> None:
+        _, mock_client = mock_posthog_client
+        kwargs = {"standard_logging_object": standard_logging_object, "litellm_params": {}}
+        caller_props = {"$ai_effort": caller_effort} if caller_effort is not None else {}
+
+        with (
+            patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
+            patch("llm_gateway.callbacks.posthog.get_product", return_value="posthog_code"),
+            patch("llm_gateway.callbacks.posthog.get_effort", return_value=effort),
+            patch("llm_gateway.callbacks.posthog.get_posthog_properties", return_value=caller_props),
+        ):
+            await getattr(callback, event_method)(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        props = mock_client.capture.call_args.kwargs["properties"]
+        if expected is None:
+            assert "$ai_effort" not in props
+        else:
+            assert props["$ai_effort"] == expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("event_method", ["_on_success", "_on_failure"])
+    @pytest.mark.parametrize(
+        "auth_method,is_staff,team_id,expected_team_id",
+        [
+            ("personal_api_key", True, 456, 999),
+            ("personal_api_key", False, 456, 456),
+            ("oauth_access_token", False, 456, 456),
+            ("oauth_access_token", False, None, None),
+        ],
+    )
+    async def test_team_attribution(
+        self,
+        callback: PostHogCallback,
+        standard_logging_object: dict,
+        mock_posthog_client: tuple,
+        event_method: str,
+        auth_method: str,
+        is_staff: bool,
+        team_id: int | None,
+        expected_team_id: int | None,
+    ) -> None:
+        _, mock_client = mock_posthog_client
+        kwargs = {"standard_logging_object": standard_logging_object, "litellm_params": {}}
+        auth_user = AuthenticatedUser(
+            user_id=123,
+            team_id=team_id,
+            auth_method=auth_method,
+            distinct_id="user-distinct-id-123",
+            is_staff=is_staff,
+        )
+
+        with (
+            patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
+            patch("llm_gateway.callbacks.posthog.get_product", return_value="signals"),
+            patch("llm_gateway.callbacks.posthog.get_posthog_properties", return_value={"team_id": "999"}),
+        ):
+            await getattr(callback, event_method)(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        call_kwargs = mock_client.capture.call_args.kwargs
+        props = mock_client.capture.call_args.kwargs["properties"]
+        if expected_team_id is None:
+            assert "team_id" not in props
+        else:
+            assert props["team_id"] == expected_team_id
+            assert isinstance(props["team_id"], int)
+        expected_groups: dict[str, str | int] = {"instance": "https://us.posthog.com"}
+        if team_id is not None:
+            expected_groups["project"] = team_id
+        assert call_kwargs["groups"] == expected_groups
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("event_method", ["_on_success", "_on_failure"])
+    async def test_llm_gateway_request_id_joins_events_to_the_access_log(
+        self,
+        callback: PostHogCallback,
+        standard_logging_object: dict,
+        mock_posthog_client: tuple,
+        auth_user: AuthenticatedUser,
+        event_method: str,
+    ) -> None:
+        """Both paths carry the join key, read from a real request context rather than a stub."""
+        _, mock_client = mock_posthog_client
+        kwargs = {"standard_logging_object": standard_logging_object, "litellm_params": {}}
+        set_request_context(RequestContext(request_id="req-abc-123"))
+
+        with patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user):
+            await getattr(callback, event_method)(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        assert mock_client.capture.call_args.kwargs["properties"]["llm_gateway_request_id"] == "req-abc-123"
+
+    @pytest.mark.asyncio
+    async def test_span_id_is_unique_per_event_within_one_request(
+        self,
+        callback: PostHogCallback,
+        standard_logging_object: dict,
+        mock_posthog_client: tuple,
+        auth_user: AuthenticatedUser,
+    ) -> None:
+        """A provider fallback or a retry emits two events under one request context.
+
+        Span ids must still differ: the trace view keys on `$ai_span_id`, so a shared
+        value collapses one event into the other. The request id here is UUID-shaped
+        because callers send `x-request-id` that way, which leaves the inequality
+        rather than the shape check as the assertion carrying the invariant.
+        """
+        _, mock_client = mock_posthog_client
+        kwargs = {"standard_logging_object": standard_logging_object, "litellm_params": {}}
+        request_id = "bdf42359-9364-4db7-8958-c001f28c9255"
+        set_request_context(RequestContext(request_id=request_id))
+
+        with patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user):
+            await callback._on_failure(kwargs, None, 0.0, 1.0, end_user_id=None)
+            await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        captured = [call.kwargs["properties"] for call in mock_client.capture.call_args_list]
+        assert len(captured) == 2
+        assert all(_is_uuid(p["$ai_span_id"]) for p in captured)
+        assert captured[0]["$ai_span_id"] != captured[1]["$ai_span_id"]
+        assert all(p["$ai_span_id"] != request_id for p in captured)
+        assert [p["llm_gateway_request_id"] for p in captured] == [request_id, request_id]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("event_method", ["_on_success", "_on_failure"])
+    async def test_request_id_is_dropped_without_a_request_context(
+        self,
+        callback: PostHogCallback,
+        standard_logging_object: dict,
+        mock_posthog_client: tuple,
+        auth_user: AuthenticatedUser,
+        event_method: str,
+    ) -> None:
+        """No request context means no join key, and a caller cannot supply one instead."""
+        _, mock_client = mock_posthog_client
+        kwargs = {"standard_logging_object": standard_logging_object, "litellm_params": {}}
+        set_request_context(RequestContext(request_id=""))
+
+        with (
+            patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
+            patch(
+                "llm_gateway.callbacks.posthog.get_posthog_properties",
+                return_value={"llm_gateway_request_id": "caller-supplied"},
+            ),
+        ):
+            await getattr(callback, event_method)(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        properties = mock_client.capture.call_args.kwargs["properties"]
+        assert "llm_gateway_request_id" not in properties
+        assert _is_uuid(properties["$ai_span_id"])
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("event_method", ["_on_success", "_on_failure"])
+    async def test_caller_cannot_override_the_gateway_owned_ids(
+        self,
+        callback: PostHogCallback,
+        standard_logging_object: dict,
+        mock_posthog_client: tuple,
+        auth_user: AuthenticatedUser,
+        event_method: str,
+    ) -> None:
+        """`x-posthog-property-*` merges before the owned properties are re-asserted."""
+        _, mock_client = mock_posthog_client
+        kwargs = {"standard_logging_object": standard_logging_object, "litellm_params": {}}
+        set_request_context(RequestContext(request_id="req-abc-123"))
+
+        with (
+            patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
+            patch(
+                "llm_gateway.callbacks.posthog.get_posthog_properties",
+                return_value={"llm_gateway_request_id": "spoofed", "$ai_span_id": "collapsed"},
+            ),
+        ):
+            await getattr(callback, event_method)(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        properties = mock_client.capture.call_args.kwargs["properties"]
+        assert properties["llm_gateway_request_id"] == "req-abc-123"
+        assert properties["$ai_span_id"] != "collapsed"
+        assert _is_uuid(properties["$ai_span_id"])
+
+    @pytest.mark.asyncio
+    async def test_on_success_invalid_header_team_id_falls_back_to_auth_team(
+        self,
+        callback: PostHogCallback,
+        auth_user: AuthenticatedUser,
+        standard_logging_object: dict,
+        mock_posthog_client: tuple,
+    ) -> None:
+        _, mock_client = mock_posthog_client
+        kwargs = {"standard_logging_object": standard_logging_object, "litellm_params": {}}
+
+        with (
+            patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
+            patch("llm_gateway.callbacks.posthog.get_product", return_value="signals"),
+            patch("llm_gateway.callbacks.posthog.get_posthog_properties", return_value={"team_id": "not-a-number"}),
+        ):
+            await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+            props = mock_client.capture.call_args.kwargs["properties"]
+            assert props["team_id"] == 456
+            assert isinstance(props["team_id"], int)
+
+    @pytest.mark.asyncio
+    async def test_on_success_invalid_header_team_id_dropped_without_auth_team(
+        self,
+        callback: PostHogCallback,
+        standard_logging_object: dict,
+        mock_posthog_client: tuple,
+    ) -> None:
+        _, mock_client = mock_posthog_client
+        kwargs = {"standard_logging_object": standard_logging_object, "litellm_params": {}}
+
+        with (
+            patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=None),
+            patch("llm_gateway.callbacks.posthog.get_product", return_value="signals"),
+            patch("llm_gateway.callbacks.posthog.get_posthog_properties", return_value={"team_id": "not-a-number"}),
+        ):
+            await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+            props = mock_client.capture.call_args.kwargs["properties"]
+            assert "team_id" not in props
+
+    @pytest.mark.asyncio
+    async def test_on_success_headers_cannot_override_ai_product_or_billable(
+        self,
+        callback: PostHogCallback,
+        auth_user: AuthenticatedUser,
+        standard_logging_object: dict,
+        mock_posthog_client: tuple,
+    ) -> None:
+        """ai_product and $ai_billable are gateway-owned: caller headers can't override them.
+
+        Otherwise a typo'd header would silently mis-bill or misattribute the generation.
+        """
+        _, mock_client = mock_posthog_client
+        kwargs = {"standard_logging_object": standard_logging_object, "litellm_params": {}}
+
+        with (
+            patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
+            patch("llm_gateway.callbacks.posthog.get_product", return_value="posthog_code"),
+            patch(
+                "llm_gateway.callbacks.posthog.get_posthog_properties",
+                return_value={"ai_product": "spoofed", "$ai_billable": False},
+            ),
+        ):
+            await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+            props = mock_client.capture.call_args.kwargs["properties"]
+            # route-derived product wins over the header value
+            assert props["ai_product"] == "posthog_code"
+            # config-derived billable flag wins (posthog_code is billable) — a caller
+            # can't opt out of billing by spoofing the header
+            assert props["$ai_billable"] is True
 
     @pytest.mark.asyncio
     async def test_on_success_uses_uuid_when_no_auth_user(
-        self, callback: PostHogCallback, standard_logging_object: dict
+        self,
+        callback: PostHogCallback,
+        standard_logging_object: dict,
+        mock_posthog_client: tuple,
     ) -> None:
+        _, mock_client = mock_posthog_client
         kwargs = {"standard_logging_object": standard_logging_object, "litellm_params": {}}
 
         with (
             patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=None),
             patch("llm_gateway.callbacks.posthog.get_product", return_value="llm_gateway"),
-            patch("llm_gateway.callbacks.posthog.posthoganalytics") as mock_posthog,
             patch("llm_gateway.callbacks.posthog.uuid4", return_value=MagicMock(hex="test-uuid")),
         ):
             await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
 
-            call_kwargs = mock_posthog.capture.call_args.kwargs
-            # distinct_id should be a UUID string since no auth user
-            assert "groups" not in call_kwargs  # No team_id means no groups
+            call_kwargs = mock_client.capture.call_args.kwargs
+            # distinct_id should be a UUID string since no auth user.
+            # The instance group is always set so the destination project can
+            # resolve $group_<N> for the region URL filter in the usage report,
+            # even when no authenticated team is known.
+            assert call_kwargs["groups"] == {"instance": "https://us.posthog.com"}
 
     @pytest.mark.asyncio
     async def test_on_success_uses_end_user_id_for_distinct_id(
-        self, callback: PostHogCallback, auth_user: AuthenticatedUser, standard_logging_object: dict
+        self,
+        callback: PostHogCallback,
+        auth_user: AuthenticatedUser,
+        standard_logging_object: dict,
+        mock_posthog_client: tuple,
     ) -> None:
+        _, mock_client = mock_posthog_client
         kwargs = {
             "standard_logging_object": standard_logging_object,
             "litellm_params": {"metadata": {"user_id": "trace-id-123"}},
@@ -98,21 +457,22 @@ class TestPostHogCallback:
         with (
             patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
             patch("llm_gateway.callbacks.posthog.get_product", return_value="llm_gateway"),
-            patch("llm_gateway.callbacks.posthog.posthoganalytics") as mock_posthog,
         ):
             await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id="end-user-123")
 
-            call_kwargs = mock_posthog.capture.call_args.kwargs
+            call_kwargs = mock_client.capture.call_args.kwargs
             assert call_kwargs["distinct_id"] == "end-user-123"
 
             props = call_kwargs["properties"]
-            assert props["$ai_trace_id"] == "trace-id-123"
+            assert props["$ai_trace_id"] == _normalize_trace_id("trace-id-123")
+            assert _is_uuid(props["$ai_trace_id"])
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("method_name", ["_on_success", "_on_failure"])
     async def test_oauth_uses_auth_user_distinct_id_not_end_user_id(
-        self, callback: PostHogCallback, method_name: str
+        self, callback: PostHogCallback, method_name: str, mock_posthog_client: tuple
     ) -> None:
+        _, mock_client = mock_posthog_client
         oauth_user = AuthenticatedUser(
             user_id=123,
             team_id=456,
@@ -136,18 +496,18 @@ class TestPostHogCallback:
         with (
             patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=oauth_user),
             patch("llm_gateway.callbacks.posthog.get_product", return_value="wizard"),
-            patch("llm_gateway.callbacks.posthog.posthoganalytics") as mock_posthog,
         ):
             method = getattr(callback, method_name)
             await method(kwargs, None, 0.0, 1.0, end_user_id="123")
 
-            call_kwargs = mock_posthog.capture.call_args.kwargs
+            call_kwargs = mock_client.capture.call_args.kwargs
             assert call_kwargs["distinct_id"] == "real-posthog-distinct-id"
 
     @pytest.mark.asyncio
     async def test_on_failure_captures_error_event(
-        self, callback: PostHogCallback, auth_user: AuthenticatedUser
+        self, callback: PostHogCallback, auth_user: AuthenticatedUser, mock_posthog_client: tuple
     ) -> None:
+        _, mock_client = mock_posthog_client
         kwargs = {
             "standard_logging_object": {
                 "model": "claude-3-opus",
@@ -159,13 +519,12 @@ class TestPostHogCallback:
 
         with (
             patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
-            patch("llm_gateway.callbacks.posthog.get_product", return_value="twig"),
-            patch("llm_gateway.callbacks.posthog.posthoganalytics") as mock_posthog,
+            patch("llm_gateway.callbacks.posthog.get_product", return_value="posthog_code"),
         ):
             await callback._on_failure(kwargs, None, 0.0, 1.0, end_user_id=None)
 
-            mock_posthog.capture.assert_called_once()
-            call_kwargs = mock_posthog.capture.call_args.kwargs
+            mock_client.capture.assert_called_once()
+            call_kwargs = mock_client.capture.call_args.kwargs
 
             assert call_kwargs["distinct_id"] == "user-distinct-id-123"
             assert call_kwargs["event"] == "$ai_generation"
@@ -174,13 +533,14 @@ class TestPostHogCallback:
             assert props["$ai_model"] == "claude-3-opus"
             assert props["$ai_is_error"] is True
             assert props["$ai_error"] == "Rate limit exceeded"
-            assert props["ai_product"] == "twig"
-            mock_posthog.flush.assert_not_called()
+            assert props["ai_product"] == "posthog_code"
+            mock_client.shutdown.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_on_success_without_optional_fields(
-        self, callback: PostHogCallback, auth_user: AuthenticatedUser
+        self, callback: PostHogCallback, auth_user: AuthenticatedUser, mock_posthog_client: tuple
     ) -> None:
+        _, mock_client = mock_posthog_client
         kwargs = {
             "standard_logging_object": {
                 "model": "gpt-4",
@@ -192,11 +552,10 @@ class TestPostHogCallback:
         with (
             patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
             patch("llm_gateway.callbacks.posthog.get_product", return_value="llm_gateway"),
-            patch("llm_gateway.callbacks.posthog.posthoganalytics") as mock_posthog,
         ):
             await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
 
-            props = mock_posthog.capture.call_args.kwargs["properties"]
+            props = mock_client.capture.call_args.kwargs["properties"]
             assert props["$ai_input_tokens"] == 0
             assert props["$ai_output_tokens"] == 0
             assert "$ai_total_cost_usd" not in props
@@ -205,11 +564,257 @@ class TestPostHogCallback:
     def test_callback_name_is_posthog(self, callback: PostHogCallback) -> None:
         assert callback.callback_name == "posthog"
 
+    @pytest.mark.parametrize(
+        "model,provider,usage_object,expected",
+        [
+            pytest.param(
+                "claude-sonnet-4-6",
+                "anthropic",
+                {"cache_read_input_tokens": 60, "cache_creation_input_tokens": 30},
+                {"$ai_cache_read_input_tokens": 60, "$ai_cache_creation_input_tokens": 30},
+                id="anthropic_reports_cache_read_and_write",
+            ),
+            pytest.param(
+                "claude-sonnet-4-6",
+                "anthropic",
+                {"cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+                {"$ai_cache_read_input_tokens": 0, "$ai_cache_creation_input_tokens": 0},
+                id="anthropic_keeps_explicit_zeros",
+            ),
+            pytest.param(
+                "gpt-5.2",
+                "openai",
+                {"prompt_tokens_details": {"cached_tokens": 60}},
+                {"$ai_cache_read_input_tokens": 60},
+                id="openai_reports_cached_tokens_on_details",
+            ),
+            pytest.param(
+                "gpt-5.2",
+                "openai",
+                {"prompt_tokens_details": {"cached_tokens": 0}},
+                {},
+                id="openai_drops_cache_miss",
+            ),
+            pytest.param("gpt-5.2", "openai", {}, {}, id="provider_reports_no_cache_usage"),
+        ],
+    )
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("product", ["wizard", "twig", "llm_gateway"])
-    async def test_on_success_includes_ai_product(
-        self, callback: PostHogCallback, auth_user: AuthenticatedUser, standard_logging_object: dict, product: str
+    async def test_on_success_maps_cache_tokens_for_each_provider_usage_shape(
+        self,
+        callback: PostHogCallback,
+        auth_user: AuthenticatedUser,
+        mock_posthog_client: tuple,
+        model: str,
+        provider: str,
+        usage_object: dict,
+        expected: dict,
     ) -> None:
+        _, mock_client = mock_posthog_client
+        kwargs = {
+            "standard_logging_object": {
+                "model": model,
+                "custom_llm_provider": provider,
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "metadata": {"usage_object": usage_object},
+            },
+            "litellm_params": {},
+        }
+
+        with (
+            patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
+            patch("llm_gateway.callbacks.posthog.get_product", return_value="slack_app"),
+        ):
+            await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        props = mock_client.capture.call_args.kwargs["properties"]
+        assert {
+            key: props[key]
+            for key in ("$ai_cache_read_input_tokens", "$ai_cache_creation_input_tokens")
+            if key in props
+        } == expected
+
+    @pytest.mark.parametrize("hook", ["_on_success", "_on_failure"])
+    @pytest.mark.parametrize(
+        ("model", "provider", "expected_provider", "expected_model"),
+        [
+            pytest.param("moonshotai/kimi-k3", "openai", "modal", "moonshotai/kimi-k3", id="modal_kimi"),
+            pytest.param("gpt-5.2", "openai", "openai", "gpt-5.2", id="unaliased_passthrough"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_relabels_aliased_provider(
+        self,
+        callback: PostHogCallback,
+        auth_user: AuthenticatedUser,
+        mock_posthog_client: tuple[MagicMock, MagicMock],
+        hook: str,
+        model: str,
+        provider: str,
+        expected_provider: str,
+        expected_model: str,
+    ) -> None:
+        _, mock_client = mock_posthog_client
+        kwargs = {
+            "standard_logging_object": {"model": model, "custom_llm_provider": provider},
+            "litellm_params": {},
+        }
+
+        with (
+            patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
+            patch("llm_gateway.callbacks.posthog.get_product", return_value="posthog_code"),
+        ):
+            await getattr(callback, hook)(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        props = mock_client.capture.call_args.kwargs["properties"]
+        assert (props["$ai_provider"], props["$ai_model"]) == (expected_provider, expected_model)
+
+    @pytest.mark.parametrize(
+        "cost_breakdown,expected_props",
+        [
+            pytest.param(
+                {
+                    "input_cost": 0.003,
+                    "cache_read_cost": 0.001,
+                    "cache_creation_cost": 0.002,
+                    "output_cost": 0.006,
+                    "total_cost": 0.012,
+                },
+                {
+                    "$ai_input_cost_usd": 0.003,
+                    "$ai_output_cost_usd": 0.006,
+                    "$ai_cache_read_cost_usd": 0.001,
+                    "$ai_cache_creation_cost_usd": 0.002,
+                },
+                id="anthropic_with_cache",
+            ),
+            pytest.param(
+                {"input_cost": 0.02, "output_cost": 0.03},
+                {"$ai_input_cost_usd": 0.02, "$ai_output_cost_usd": 0.03},
+                id="no_cache_components",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_on_success_emits_cost_breakdown(
+        self,
+        callback: PostHogCallback,
+        auth_user: AuthenticatedUser,
+        mock_posthog_client: tuple,
+        cost_breakdown: dict,
+        expected_props: dict,
+    ) -> None:
+        _, mock_client = mock_posthog_client
+        kwargs = {
+            "standard_logging_object": {
+                "model": "claude-sonnet-4-6",
+                "custom_llm_provider": "anthropic",
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "response_cost": cost_breakdown.get("total_cost"),
+                "cost_breakdown": cost_breakdown,
+            },
+            "litellm_params": {},
+        }
+
+        with (
+            patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
+            patch("llm_gateway.callbacks.posthog.get_product", return_value="slack_app"),
+        ):
+            await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        props = mock_client.capture.call_args.kwargs["properties"]
+        # Each LiteLLM cost_breakdown component maps 1:1 to its own PostHog
+        # property — disjoint, so the sum reconciles to $ai_total_cost_usd.
+        for key, value in expected_props.items():
+            assert props[key] == value
+        for key in ("$ai_cache_read_cost_usd", "$ai_cache_creation_cost_usd"):
+            if key not in expected_props:
+                assert key not in props
+
+    @pytest.mark.asyncio
+    async def test_on_success_omits_per_side_cost_when_breakdown_absent(
+        self,
+        callback: PostHogCallback,
+        auth_user: AuthenticatedUser,
+        standard_logging_object: dict,
+        mock_posthog_client: tuple,
+    ) -> None:
+        _, mock_client = mock_posthog_client
+        kwargs = {"standard_logging_object": standard_logging_object, "litellm_params": {}}
+
+        with (
+            patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
+            patch("llm_gateway.callbacks.posthog.get_product", return_value="slack_app"),
+        ):
+            await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        props = mock_client.capture.call_args.kwargs["properties"]
+        assert "$ai_input_cost_usd" not in props
+        assert "$ai_output_cost_usd" not in props
+        assert "$ai_cache_read_cost_usd" not in props
+        assert "$ai_cache_creation_cost_usd" not in props
+
+    @pytest.mark.asyncio
+    async def test_on_success_emits_reasoning_tokens_when_present(
+        self, callback: PostHogCallback, auth_user: AuthenticatedUser, mock_posthog_client: tuple
+    ) -> None:
+        _, mock_client = mock_posthog_client
+        kwargs = {
+            "standard_logging_object": {
+                "model": "gpt-5.2",
+                "custom_llm_provider": "openai",
+                "prompt_tokens": 50,
+                "completion_tokens": 200,
+                "metadata": {
+                    "usage_object": {
+                        "completion_tokens_details": {"reasoning_tokens": 120},
+                    },
+                },
+            },
+            "litellm_params": {},
+        }
+
+        with (
+            patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
+            patch("llm_gateway.callbacks.posthog.get_product", return_value="slack_app_routing"),
+        ):
+            await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        props = mock_client.capture.call_args.kwargs["properties"]
+        assert props["$ai_reasoning_tokens"] == 120
+
+    @pytest.mark.asyncio
+    async def test_on_success_omits_reasoning_tokens_when_absent(
+        self,
+        callback: PostHogCallback,
+        auth_user: AuthenticatedUser,
+        standard_logging_object: dict,
+        mock_posthog_client: tuple,
+    ) -> None:
+        _, mock_client = mock_posthog_client
+        kwargs = {"standard_logging_object": standard_logging_object, "litellm_params": {}}
+
+        with (
+            patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
+            patch("llm_gateway.callbacks.posthog.get_product", return_value="slack_app"),
+        ):
+            await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        props = mock_client.capture.call_args.kwargs["properties"]
+        assert "$ai_reasoning_tokens" not in props
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("product", ["wizard", "posthog_code", "llm_gateway"])
+    async def test_on_success_includes_ai_product(
+        self,
+        callback: PostHogCallback,
+        auth_user: AuthenticatedUser,
+        standard_logging_object: dict,
+        product: str,
+        mock_posthog_client: tuple,
+    ) -> None:
+        _, mock_client = mock_posthog_client
         kwargs = {
             "standard_logging_object": standard_logging_object,
             "litellm_params": {},
@@ -218,18 +823,18 @@ class TestPostHogCallback:
         with (
             patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
             patch("llm_gateway.callbacks.posthog.get_product", return_value=product),
-            patch("llm_gateway.callbacks.posthog.posthoganalytics") as mock_posthog,
         ):
             await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
 
-            props = mock_posthog.capture.call_args.kwargs["properties"]
+            props = mock_client.capture.call_args.kwargs["properties"]
             assert props["ai_product"] == product
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("product", ["wizard", "twig", "llm_gateway"])
+    @pytest.mark.parametrize("product", ["wizard", "posthog_code", "llm_gateway"])
     async def test_on_failure_includes_ai_product(
-        self, callback: PostHogCallback, auth_user: AuthenticatedUser, product: str
+        self, callback: PostHogCallback, auth_user: AuthenticatedUser, product: str, mock_posthog_client: tuple
     ) -> None:
+        _, mock_client = mock_posthog_client
         kwargs = {
             "standard_logging_object": {
                 "model": "claude-3-opus",
@@ -242,17 +847,93 @@ class TestPostHogCallback:
         with (
             patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
             patch("llm_gateway.callbacks.posthog.get_product", return_value=product),
-            patch("llm_gateway.callbacks.posthog.posthoganalytics") as mock_posthog,
         ):
             await callback._on_failure(kwargs, None, 0.0, 1.0, end_user_id=None)
 
-            props = mock_posthog.capture.call_args.kwargs["properties"]
+            props = mock_client.capture.call_args.kwargs["properties"]
             assert props["ai_product"] == product
 
     @pytest.mark.asyncio
-    async def test_on_success_uses_passed_end_user_id(
-        self, callback: PostHogCallback, auth_user: AuthenticatedUser, standard_logging_object: dict
+    @pytest.mark.parametrize("product", ["slack_app", "slack_app_routing", "posthog_code"])
+    async def test_on_success_marks_billable_products_billable(
+        self,
+        callback: PostHogCallback,
+        auth_user: AuthenticatedUser,
+        standard_logging_object: dict,
+        product: str,
+        mock_posthog_client: tuple,
     ) -> None:
+        _, mock_client = mock_posthog_client
+        kwargs = {"standard_logging_object": standard_logging_object, "litellm_params": {}}
+
+        with (
+            patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
+            patch("llm_gateway.callbacks.posthog.get_product", return_value=product),
+        ):
+            await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        props = mock_client.capture.call_args.kwargs["properties"]
+        assert props["$ai_billable"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("product", ["background_agents", "wizard", "llm_gateway"])
+    async def test_on_success_does_not_mark_other_products_billable(
+        self,
+        callback: PostHogCallback,
+        auth_user: AuthenticatedUser,
+        standard_logging_object: dict,
+        product: str,
+        mock_posthog_client: tuple,
+    ) -> None:
+        _, mock_client = mock_posthog_client
+        kwargs = {"standard_logging_object": standard_logging_object, "litellm_params": {}}
+
+        with (
+            patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
+            patch("llm_gateway.callbacks.posthog.get_product", return_value=product),
+        ):
+            await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        props = mock_client.capture.call_args.kwargs["properties"]
+        assert props["$ai_billable"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("product", ["slack_app", "slack_app_routing", "posthog_code"])
+    async def test_on_failure_marks_billable_products_billable(
+        self,
+        callback: PostHogCallback,
+        auth_user: AuthenticatedUser,
+        mock_posthog_client: tuple,
+        product: str,
+    ) -> None:
+        _, mock_client = mock_posthog_client
+        kwargs = {
+            "standard_logging_object": {
+                "model": "claude-sonnet-4-6",
+                "custom_llm_provider": "anthropic",
+                "error_str": "boom",
+            },
+            "litellm_params": {},
+        }
+
+        with (
+            patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
+            patch("llm_gateway.callbacks.posthog.get_product", return_value=product),
+        ):
+            await callback._on_failure(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        props = mock_client.capture.call_args.kwargs["properties"]
+        assert props["$ai_billable"] is True
+
+    @pytest.mark.asyncio
+    async def test_on_success_uses_passed_end_user_id(
+        self,
+        callback: PostHogCallback,
+        auth_user: AuthenticatedUser,
+        standard_logging_object: dict,
+        mock_posthog_client: tuple,
+    ) -> None:
+        _, mock_client = mock_posthog_client
         kwargs = {
             "standard_logging_object": standard_logging_object,
             "litellm_params": {"metadata": {"user_id": "metadata-user-id"}},
@@ -261,21 +942,22 @@ class TestPostHogCallback:
         with (
             patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
             patch("llm_gateway.callbacks.posthog.get_product", return_value="growth"),
-            patch("llm_gateway.callbacks.posthog.posthoganalytics") as mock_posthog,
         ):
             await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id="openai-end-user-456")
 
-            call_kwargs = mock_posthog.capture.call_args.kwargs
+            call_kwargs = mock_client.capture.call_args.kwargs
             assert call_kwargs["distinct_id"] == "openai-end-user-456"
-            assert call_kwargs["groups"] == {"project": 456}
+            assert call_kwargs["groups"] == {"instance": "https://us.posthog.com", "project": 456}
 
             props = call_kwargs["properties"]
-            assert props["$ai_trace_id"] == "metadata-user-id"
+            assert props["$ai_trace_id"] == _normalize_trace_id("metadata-user-id")
+            assert _is_uuid(props["$ai_trace_id"])
 
     @pytest.mark.asyncio
     async def test_on_failure_uses_passed_end_user_id(
-        self, callback: PostHogCallback, auth_user: AuthenticatedUser
+        self, callback: PostHogCallback, auth_user: AuthenticatedUser, mock_posthog_client: tuple
     ) -> None:
+        _, mock_client = mock_posthog_client
         kwargs = {
             "standard_logging_object": {
                 "model": "gpt-4",
@@ -288,13 +970,287 @@ class TestPostHogCallback:
         with (
             patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
             patch("llm_gateway.callbacks.posthog.get_product", return_value="growth"),
-            patch("llm_gateway.callbacks.posthog.posthoganalytics") as mock_posthog,
         ):
             await callback._on_failure(kwargs, None, 0.0, 1.0, end_user_id="openai-end-user-789")
 
-            call_kwargs = mock_posthog.capture.call_args.kwargs
+            call_kwargs = mock_client.capture.call_args.kwargs
             assert call_kwargs["distinct_id"] == "openai-end-user-789"
-            assert call_kwargs["properties"]["$ai_trace_id"] == "trace-id-from-metadata"
+            assert call_kwargs["properties"]["$ai_trace_id"] == _normalize_trace_id("trace-id-from-metadata")
+            assert _is_uuid(call_kwargs["properties"]["$ai_trace_id"])
+
+    @pytest.mark.asyncio
+    async def test_on_success_uses_configured_region_url_in_groups(
+        self,
+        auth_user: AuthenticatedUser,
+        standard_logging_object: dict,
+        mock_posthog_client: tuple,
+    ) -> None:
+        _, mock_client = mock_posthog_client
+        callback = PostHogCallback(
+            api_key="eu-key",
+            host="https://eu.i.posthog.com",
+            region_url="https://eu.posthog.com",
+        )
+        kwargs = {"standard_logging_object": standard_logging_object, "litellm_params": {}}
+
+        with (
+            patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
+            patch("llm_gateway.callbacks.posthog.get_product", return_value="slack_app"),
+        ):
+            await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        call_kwargs = mock_client.capture.call_args.kwargs
+        assert call_kwargs["groups"] == {"instance": "https://eu.posthog.com", "project": 456}
+        # $group_1 is stamped explicitly so the usage-report query's hardcoded
+        # filter matches regardless of how the destination team registers
+        # `instance` in GroupTypeMapping.
+        assert call_kwargs["properties"]["$group_1"] == "https://eu.posthog.com"
+
+    @pytest.mark.asyncio
+    async def test_on_success_mirrors_to_secondary_destination_when_configured(
+        self,
+        auth_user: AuthenticatedUser,
+        standard_logging_object: dict,
+    ) -> None:
+        mock_client = MagicMock()
+        with patch("llm_gateway.callbacks.posthog.Posthog", return_value=mock_client) as mock_cls:
+            callback = PostHogCallback(
+                api_key="eu-key",
+                host="https://eu.i.posthog.com",
+                region_url="https://eu.posthog.com",
+                secondary_api_key="us-key",
+                secondary_host="https://us.i.posthog.com",
+            )
+            kwargs = {"standard_logging_object": standard_logging_object, "litellm_params": {}}
+
+            with (
+                patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
+                patch("llm_gateway.callbacks.posthog.get_product", return_value="slack_app"),
+            ):
+                await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+            # One Posthog client constructed per destination, each captured once.
+            primary_call, secondary_call = mock_cls.call_args_list
+            assert primary_call.args == ("eu-key",)
+            assert primary_call.kwargs["host"] == "https://eu.i.posthog.com"
+            assert secondary_call.args == ("us-key",)
+            assert secondary_call.kwargs["host"] == "https://us.i.posthog.com"
+            assert mock_client.capture.call_count == 2
+
+            # Both copies carry the EU origin region — via the SDK `groups` arg
+            # and via an explicit $group_1 property — so the US-region usage
+            # report filter ($group_1 = 'https://us.posthog.com') excludes the
+            # mirrored copy and does not double-count.
+            for capture_call in mock_client.capture.call_args_list:
+                assert capture_call.kwargs["groups"] == {
+                    "instance": "https://eu.posthog.com",
+                    "project": 456,
+                }
+                assert capture_call.kwargs["properties"]["$group_1"] == "https://eu.posthog.com"
+
+    @pytest.mark.asyncio
+    async def test_on_success_skips_secondary_destination_when_unconfigured(
+        self,
+        callback: PostHogCallback,
+        auth_user: AuthenticatedUser,
+        standard_logging_object: dict,
+        mock_posthog_client: tuple,
+    ) -> None:
+        mock_cls, mock_client = mock_posthog_client
+        kwargs = {"standard_logging_object": standard_logging_object, "litellm_params": {}}
+
+        with (
+            patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
+            patch("llm_gateway.callbacks.posthog.get_product", return_value="slack_app"),
+        ):
+            await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        assert mock_cls.call_count == 1
+        assert mock_client.capture.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_on_failure_mirrors_to_secondary_destination_when_configured(
+        self,
+        auth_user: AuthenticatedUser,
+    ) -> None:
+        mock_client = MagicMock()
+        with patch("llm_gateway.callbacks.posthog.Posthog", return_value=mock_client) as mock_cls:
+            callback = PostHogCallback(
+                api_key="eu-key",
+                host="https://eu.i.posthog.com",
+                region_url="https://eu.posthog.com",
+                secondary_api_key="us-key",
+                secondary_host="https://us.i.posthog.com",
+            )
+            kwargs = {
+                "standard_logging_object": {
+                    "model": "claude-sonnet-4-6",
+                    "custom_llm_provider": "anthropic",
+                    "error_str": "boom",
+                },
+                "litellm_params": {},
+            }
+
+            with (
+                patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
+                patch("llm_gateway.callbacks.posthog.get_product", return_value="slack_app"),
+            ):
+                await callback._on_failure(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+            primary_call, secondary_call = mock_cls.call_args_list
+            assert primary_call.args == ("eu-key",)
+            assert primary_call.kwargs["host"] == "https://eu.i.posthog.com"
+            assert secondary_call.args == ("us-key",)
+            assert secondary_call.kwargs["host"] == "https://us.i.posthog.com"
+            assert mock_client.capture.call_count == 2
+
+            for capture_call in mock_client.capture.call_args_list:
+                assert capture_call.kwargs["groups"] == {
+                    "instance": "https://eu.posthog.com",
+                    "project": 456,
+                }
+                assert capture_call.kwargs["properties"]["$group_1"] == "https://eu.posthog.com"
+                assert capture_call.kwargs["properties"]["$ai_is_error"] is True
+
+    @pytest.mark.asyncio
+    async def test_on_success_prefers_traceparent_trace_id(
+        self, callback, standard_logging_object, mock_posthog_client
+    ):
+        kwargs = {
+            "standard_logging_object": standard_logging_object,
+            "litellm_params": {"metadata": {"user_id": '{"session_id": "blob"}'}},
+        }
+        with (
+            patch(
+                "llm_gateway.callbacks.posthog.get_traceparent_trace_id",
+                return_value="0af76519-16cd-43dd-8448-eb211c80319c",
+            ),
+            patch("llm_gateway.callbacks.posthog._capture_ai_event") as mock_capture,
+        ):
+            await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        props = mock_capture.call_args.kwargs["properties"]
+        assert props["$ai_trace_id"] == "0af76519-16cd-43dd-8448-eb211c80319c"
+
+    @pytest.mark.asyncio
+    async def test_on_success_falls_back_to_metadata_hash_without_traceparent(
+        self, callback, standard_logging_object, mock_posthog_client
+    ):
+        blob = '{"session_id": "blob"}'
+        kwargs = {
+            "standard_logging_object": standard_logging_object,
+            "litellm_params": {"metadata": {"user_id": blob}},
+        }
+        with (
+            patch(
+                "llm_gateway.callbacks.posthog.get_traceparent_trace_id",
+                return_value=None,
+            ),
+            patch("llm_gateway.callbacks.posthog._capture_ai_event") as mock_capture,
+        ):
+            await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        props = mock_capture.call_args.kwargs["properties"]
+        assert props["$ai_trace_id"] == _normalize_trace_id(blob)
+
+    @pytest.mark.asyncio
+    async def test_on_success_explicit_trace_id_header_wins_over_traceparent(
+        self, callback, standard_logging_object, mock_posthog_client
+    ):
+        kwargs = {
+            "standard_logging_object": standard_logging_object,
+            "litellm_params": {"metadata": {}},
+        }
+        with (
+            patch(
+                "llm_gateway.callbacks.posthog.get_traceparent_trace_id",
+                return_value="0af76519-16cd-43dd-8448-eb211c80319c",
+            ),
+            patch(
+                "llm_gateway.callbacks.posthog.get_posthog_properties",
+                return_value={"$ai_trace_id": "explicit-client-id"},
+            ),
+            patch("llm_gateway.callbacks.posthog._capture_ai_event") as mock_capture,
+        ):
+            await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        props = mock_capture.call_args.kwargs["properties"]
+        assert props["$ai_trace_id"] == "explicit-client-id"
+
+    @pytest.mark.asyncio
+    async def test_on_success_session_id_header_passes_through(
+        self, callback, standard_logging_object, mock_posthog_client
+    ):
+        kwargs = {
+            "standard_logging_object": standard_logging_object,
+            "litellm_params": {"metadata": {}},
+        }
+        with (
+            patch(
+                "llm_gateway.callbacks.posthog.get_posthog_properties",
+                return_value={"$ai_session_id": "sess-123"},
+            ),
+            patch("llm_gateway.callbacks.posthog._capture_ai_event") as mock_capture,
+        ):
+            await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        props = mock_capture.call_args.kwargs["properties"]
+        assert props["$ai_session_id"] == "sess-123"
+
+    @pytest.mark.asyncio
+    async def test_on_failure_prefers_traceparent_trace_id(self, callback, mock_posthog_client):
+        kwargs = {
+            "standard_logging_object": {
+                "model": "claude-3-opus",
+                "custom_llm_provider": "anthropic",
+                "error_str": "boom",
+            },
+            "litellm_params": {"metadata": {"user_id": '{"session_id": "blob"}'}},
+        }
+        with (
+            patch(
+                "llm_gateway.callbacks.posthog.get_traceparent_trace_id",
+                return_value="0af76519-16cd-43dd-8448-eb211c80319c",
+            ),
+            patch("llm_gateway.callbacks.posthog._capture_ai_event") as mock_capture,
+        ):
+            await callback._on_failure(kwargs, None, 0.0, 1.0, end_user_id=None)
+
+        props = mock_capture.call_args.kwargs["properties"]
+        assert props["$ai_trace_id"] == "0af76519-16cd-43dd-8448-eb211c80319c"
+        assert props["$ai_is_error"] is True
+
+
+class TestNormalizeTraceId:
+    def test_returns_fresh_uuid_when_value_is_falsy(self) -> None:
+        falsy_inputs: list[Any] = [None, "", 0, []]
+        for raw in falsy_inputs:
+            value = _normalize_trace_id(raw)
+            assert _is_uuid(value)
+
+    def test_returns_fresh_uuids_each_call_when_value_is_falsy(self) -> None:
+        assert _normalize_trace_id(None) != _normalize_trace_id(None)
+
+    def test_passes_through_existing_uuid(self) -> None:
+        existing = "550e8400-e29b-41d4-a716-446655440000"
+        assert _normalize_trace_id(existing) == existing
+
+    def test_hashes_non_uuid_string_deterministically(self) -> None:
+        raw = '{"session_id": "abc", "thread_ts": "1.234"}'
+        first = _normalize_trace_id(raw)
+        second = _normalize_trace_id(raw)
+        assert first == second
+        assert _is_uuid(first)
+        assert first != raw
+
+    def test_distinct_inputs_produce_distinct_uuids(self) -> None:
+        assert _normalize_trace_id("trace-a") != _normalize_trace_id("trace-b")
+
+    def test_serializes_dict_input_with_stable_key_order(self) -> None:
+        first = _normalize_trace_id({"a": 1, "b": 2})
+        second = _normalize_trace_id({"b": 2, "a": 1})
+        assert first == second
+        assert _is_uuid(first)
 
 
 class TestReplaceBinaryContent:
@@ -350,7 +1306,7 @@ class TestReplaceBinaryContent:
         assert _replace_binary_content(input_data) == expected
 
 
-_MAX_SIZE = 800 * 1024
+_MAX_SIZE = _MAX_CAPTURE_SIZE
 _TRUNCATION_MARKER = "[truncated: content too large for capture]"
 
 
@@ -380,6 +1336,11 @@ class TestTruncateForCapture:
     def test_small_events_not_truncated(self, description: str, properties: dict) -> None:
         result = _truncate_for_capture(properties)
         assert result == properties
+
+    def test_threshold_below_kafka_message_limit(self) -> None:
+        # Capture rejects events over Kafka's message.max.bytes (~1 MB) with a 413,
+        # so the truncation threshold must stay under it with headroom for the envelope.
+        assert _MAX_CAPTURE_SIZE < 1_000_000
 
     def test_large_output_truncated(self) -> None:
         large_output = "x" * (_MAX_SIZE + 1)
@@ -442,9 +1403,10 @@ class TestTruncateForCapture:
 
     @pytest.mark.asyncio
     async def test_on_success_truncates_oversized_content(self) -> None:
+        mock_client = MagicMock()
         callback = PostHogCallback(api_key="test-key", host="https://test.posthog.com")
         auth_user = AuthenticatedUser(user_id=123, team_id=456, auth_method="personal_api_key", distinct_id="user-123")
-        large_response = "R" * (900 * 1024)
+        large_response = "R" * (16 * 1024 * 1024)
         kwargs = {
             "standard_logging_object": {
                 "model": "claude-3-opus",
@@ -459,14 +1421,19 @@ class TestTruncateForCapture:
             "litellm_params": {},
         }
 
+        mock_loop = MagicMock()
+        mock_loop.run_in_executor.side_effect = _run_sync
+
         with (
             patch("llm_gateway.callbacks.posthog.get_auth_user", return_value=auth_user),
             patch("llm_gateway.callbacks.posthog.get_product", return_value="wizard"),
-            patch("llm_gateway.callbacks.posthog.posthoganalytics") as mock_posthog,
+            patch("llm_gateway.callbacks.posthog.Posthog", return_value=mock_client),
+            patch("llm_gateway.callbacks.posthog.asyncio") as mock_asyncio,
         ):
+            mock_asyncio.get_running_loop.return_value = mock_loop
             await callback._on_success(kwargs, None, 0.0, 1.0, end_user_id=None)
 
-            props = mock_posthog.capture.call_args.kwargs["properties"]
+            props = mock_client.capture.call_args.kwargs["properties"]
             assert props["$ai_output_choices"] == _TRUNCATION_MARKER
             assert props["$ai_model"] == "claude-3-opus"
             assert props["$ai_input_tokens"] == 10

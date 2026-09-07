@@ -1,5 +1,4 @@
 import { useValues } from 'kea'
-import { useThumbSurvey } from 'posthog-js/react/surveys'
 import { useCallback, useEffect, useState } from 'react'
 
 import {
@@ -12,6 +11,7 @@ import {
     IconThumbsUpFilled,
 } from '@posthog/icons'
 import { LemonButton, LemonSkeleton } from '@posthog/lemon-ui'
+import { useThumbSurvey } from '@posthog/react/surveys'
 
 import api from 'lib/api'
 import { dayjs } from 'lib/dayjs'
@@ -222,9 +222,7 @@ export function OpenQuestionSummaryV2({
                 }`}
             >
                 <div className="px-3 pb-3">
-                    <div className="prose prose-base max-w-none">
-                        <LemonMarkdown>{summary.content}</LemonMarkdown>
-                    </div>
+                    <LemonMarkdown className="text-base">{summary.content}</LemonMarkdown>
 
                     <div className="flex items-center justify-between text-xs text-muted mt-3 pt-2 border-t">
                         <div className="flex items-center gap-2">

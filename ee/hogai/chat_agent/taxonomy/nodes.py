@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from functools import cached_property
-from typing import Generic, TypeVar
+from typing import Generic, TypeVar, cast
 
 from langchain_core.agents import AgentAction
 from langchain_core.messages import (
@@ -16,7 +16,6 @@ from pydantic import ValidationError
 from posthog.schema import MaxEventContext
 
 from posthog.models import Team, User
-from posthog.models.group_type_mapping import GroupTypeMapping
 
 from ee.hogai.chat_agent.taxonomy.tools import TaxonomyTool
 from ee.hogai.core.mixins import StateClassMixin, TaxonomyUpdateDispatcherNodeMixin
@@ -51,16 +50,16 @@ class TaxonomyAgentNode(
     def __init__(self, team: Team, user: User, toolkit_class: type["TaxonomyAgentToolkit"]):
         super().__init__(team, user)
         self._toolkit = toolkit_class(team=team, user=user)
-        self._state_class, self._partial_state_class = self._get_state_class(TaxonomyAgentNode)
+        state_classes = self._get_state_class(TaxonomyAgentNode)
+        self._state_class = state_classes.state_class
+        self._partial_state_class = state_classes.partial_state_class
 
     @cached_property
     def _team_group_types(self) -> list[str]:
         """Get all available group names for this team."""
-        return list(
-            GroupTypeMapping.objects.filter(project_id=self._team.project.id)
-            .order_by("group_type_index")
-            .values_list("group_type", flat=True)
-        )
+        from posthog.models.group_type_mapping import get_group_types_for_project
+
+        return [m["group_type"] for m in get_group_types_for_project(self._team.project.id)]
 
     @cached_property
     def _all_entities(self) -> list[str]:
@@ -111,7 +110,9 @@ class TaxonomyAgentNode(
         Generate the output format for events. Can be overridden by subclasses.
         Default implementation uses YAML format but it can be overridden to use XML format.
         """
-        return format_events_yaml(events_in_context, self._team)
+        return format_events_yaml(
+            events_in_context, self._team, self._user, event_source=self.context_manager.event_source
+        )
 
     def run(self, state: TaxonomyStateType, config: RunnableConfig) -> TaxonomyPartialStateType:
         """Process the state and return filtering options."""
@@ -171,7 +172,9 @@ class TaxonomyAgentToolsNode(
     def __init__(self, team: Team, user: User, toolkit_class: type["TaxonomyAgentToolkit"]):
         super().__init__(team, user)
         self._toolkit = toolkit_class(team=team, user=user)
-        self._state_class, self._partial_state_class = self._get_state_class(TaxonomyAgentToolsNode)
+        state_classes = self._get_state_class(TaxonomyAgentToolsNode)
+        self._state_class = state_classes.state_class
+        self._partial_state_class = state_classes.partial_state_class
 
     async def arun(self, state: TaxonomyStateType, config: RunnableConfig) -> TaxonomyPartialStateType:
         intermediate_steps = state.intermediate_steps or []
@@ -269,4 +272,4 @@ class TaxonomyAgentToolsNode(
         ]
         reset_state.output = output
         reset_state.billable = state.billable
-        return reset_state  # type: ignore[return-value]
+        return cast("TaxonomyPartialStateType", reset_state)

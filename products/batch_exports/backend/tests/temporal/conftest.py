@@ -6,6 +6,7 @@ import datetime as dt
 import pytest
 
 from django.conf import settings
+from django.test import override_settings
 
 import psycopg
 import pytest_asyncio
@@ -17,6 +18,7 @@ from temporalio.testing import ActivityEnvironment
 
 from posthog.conftest import create_clickhouse_tables
 from posthog.models import Organization, Team
+from posthog.models.integration import Integration
 from posthog.models.team.util import delete_batch_exports
 from posthog.models.utils import uuid7
 from posthog.temporal.common.clickhouse import ClickHouseClient
@@ -26,10 +28,26 @@ from posthog.temporal.tests.utils.events import generate_test_events_in_clickhou
 
 from products.batch_exports.backend.temporal import ACTIVITIES, WORKFLOWS
 from products.batch_exports.backend.temporal.metrics import BatchExportsMetricsInterceptor
-from products.batch_exports.backend.tests.temporal.utils.persons import (
-    generate_test_person_distinct_id2_in_clickhouse,
-    generate_test_persons_in_clickhouse,
+from products.batch_exports.backend.tests.temporal.utils.clickhouse import (
+    truncate_events,
+    truncate_persons,
+    truncate_sessions,
 )
+from products.batch_exports.backend.tests.temporal.utils.persons import (
+    PersonDistinctId2Values,
+    PersonValues,
+    generate_test_person_distinct_id2,
+    generate_test_persons_in_clickhouse,
+    insert_person_distinct_id2_values_in_clickhouse,
+)
+
+
+@pytest_asyncio.fixture
+async def truncate_clickhouse_tables(clickhouse_client):
+    yield
+    await truncate_events(clickhouse_client)
+    await truncate_persons(clickhouse_client)
+    await truncate_sessions(clickhouse_client)
 
 
 @pytest.fixture(scope="package", autouse=True)
@@ -42,12 +60,27 @@ def clickhouse_create_db_and_tables():
         cluster=settings.CLICKHOUSE_CLUSTER,
         verify_ssl_cert=settings.CLICKHOUSE_VERIFY,
         randomize_replica_paths=True,
+        # don't use the egress proxy, clickhouse is internal
+        trust_env=False,
     )
 
     database.create_database()  # Create database if it doesn't exist
     create_clickhouse_tables()  # Create all expected tables
 
     yield
+
+
+@pytest.fixture(autouse=True)
+def reduced_staging_partitions():
+    """Cap CH→S3 staging fan-out at 2 partition files instead of the production default of 10.
+
+    Ten concurrent S3 writers per tiny staging insert, multiplied across xdist workers, contends on
+    the shared CI objectstorage and produces 20s+ staging stalls that trip workflow execution
+    timeouts. Two partitions keep the multi-file read path exercised; tests that assert partition
+    behavior set their own override.
+    """
+    with override_settings(BATCH_EXPORT_CLICKHOUSE_S3_PARTITIONS=2):
+        yield
 
 
 @pytest.fixture
@@ -104,6 +137,21 @@ async def another_ateam(aorganization):
     await sync_to_async(team.delete)()
 
 
+@pytest_asyncio.fixture
+async def s3_compatible_integration(ateam):
+    """An s3-compatible Integration pointing at the local object storage used by these tests."""
+    return await Integration.objects.acreate(
+        team_id=ateam.pk,
+        kind=Integration.IntegrationKind.S3_COMPATIBLE,
+        integration_id=f"object-storage-{uuid.uuid4()}",
+        config={"name": "object-storage-test", "endpoint_url": settings.OBJECT_STORAGE_ENDPOINT},
+        sensitive_config={
+            "aws_access_key_id": "object_storage_root_user",
+            "aws_secret_access_key": "object_storage_root_password",
+        },
+    )
+
+
 @pytest.fixture
 def activity_environment():
     """Return a testing temporal ActivityEnvironment."""
@@ -134,7 +182,6 @@ async def temporal_client():
         settings.TEMPORAL_HOST,
         settings.TEMPORAL_PORT,
         settings.TEMPORAL_NAMESPACE,
-        settings.TEMPORAL_CLIENT_ROOT_CA,
         settings.TEMPORAL_CLIENT_CERT,
         settings.TEMPORAL_CLIENT_KEY,
     )
@@ -378,6 +425,43 @@ def events_table(request) -> str | None:
     return None
 
 
+async def _insert_person_distinct_ids_for_persons(
+    clickhouse_client: ClickHouseClient, team_id: int, persons: list[PersonValues]
+) -> list[PersonDistinctId2Values]:
+    person_distinct_ids: list[PersonDistinctId2Values] = []
+    other_team_person_distinct_ids: list[PersonDistinctId2Values] = []
+
+    for person in persons:
+        person_id = uuid.UUID(person["id"])
+        timestamp = dt.datetime.fromisoformat(person["_timestamp"])
+        distinct_id = f"distinct-id-{person_id}"
+
+        person_distinct_ids.append(
+            generate_test_person_distinct_id2(
+                count=1,
+                team_id=team_id,
+                person_id=person_id,
+                distinct_id=distinct_id,
+                timestamp=timestamp,
+            )
+        )
+        other_team_person_distinct_ids.append(
+            generate_test_person_distinct_id2(
+                count=1,
+                team_id=team_id + random.randint(1, 1000),
+                person_id=person_id,
+                distinct_id=distinct_id,
+                timestamp=timestamp,
+            )
+        )
+
+    await insert_person_distinct_id2_values_in_clickhouse(
+        client=clickhouse_client,
+        persons=person_distinct_ids + other_team_person_distinct_ids,
+    )
+    return person_distinct_ids
+
+
 @pytest.fixture
 async def generate_test_data(
     ateam,
@@ -454,14 +538,8 @@ async def generate_test_data(
     )
 
     persons_to_export_created = []
-    for person in persons:
-        person_distinct_id, _ = await generate_test_person_distinct_id2_in_clickhouse(
-            client=clickhouse_client,
-            team_id=ateam.pk,
-            person_id=uuid.UUID(person["id"]),
-            distinct_id=f"distinct-id-{uuid.UUID(person['id'])}",
-            timestamp=dt.datetime.fromisoformat(person["_timestamp"]),
-        )
+    person_distinct_ids = await _insert_person_distinct_ids_for_persons(clickhouse_client, ateam.pk, persons)
+    for person, person_distinct_id in zip(persons, person_distinct_ids, strict=True):
         person_to_export = {
             "team_id": person["team_id"],
             "person_id": person["id"],
@@ -488,14 +566,8 @@ async def generate_test_persons_data(ateam, clickhouse_client, data_interval_sta
     )
 
     persons_to_export_created = []
-    for person in persons:
-        person_distinct_id, _ = await generate_test_person_distinct_id2_in_clickhouse(
-            client=clickhouse_client,
-            team_id=ateam.pk,
-            person_id=uuid.UUID(person["id"]),
-            distinct_id=f"distinct-id-{uuid.UUID(person['id'])}",
-            timestamp=dt.datetime.fromisoformat(person["_timestamp"]),
-        )
+    person_distinct_ids = await _insert_person_distinct_ids_for_persons(clickhouse_client, ateam.pk, persons)
+    for person, person_distinct_id in zip(persons, person_distinct_ids, strict=True):
         person_to_export = {
             "team_id": person["team_id"],
             "person_id": person["id"],

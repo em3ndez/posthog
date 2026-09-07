@@ -23,29 +23,35 @@ export function StickinessCriteria({ insightProps }: EditorFilterProps): JSX.Ele
     ]
 
     return (
-        <div className="flex items-center gap-2">
-            <OperatorSelect
-                className="flex-1"
-                operator={currentOperator}
-                operators={operators}
-                onChange={(newOperator: PropertyOperator) => {
-                    updateInsightFilter({
-                        stickinessCriteria: { operator: newOperator as StickinessOperator, value: currentValue },
-                    })
-                }}
-            />
+        <div className="flex items-center gap-2 @min-[0px]/editor-panel:flex-wrap">
+            <div className="flex-1 @min-[0px]/editor-panel:flex-none @min-[0px]/editor-panel:min-w-0">
+                <OperatorSelect
+                    operator={currentOperator}
+                    operators={operators}
+                    onChange={(newOperator: PropertyOperator) => {
+                        updateInsightFilter({
+                            stickinessCriteria: { operator: newOperator as StickinessOperator, value: currentValue },
+                        })
+                    }}
+                />
+            </div>
             <LemonInput
                 type="number"
-                className="ml-2 w-20"
+                className="w-20"
                 defaultValue={currentValue}
                 min={1}
                 onChange={(newValue: number | undefined) => {
-                    if (newValue !== undefined) {
-                        updateInsightFilter({ stickinessCriteria: { operator: currentOperator, value: newValue } })
+                    // A cleared or half-typed number field reports NaN, which would serialize to null and
+                    // fail the backend's integer validation, so drop any non-finite value.
+                    if (newValue === undefined || !Number.isFinite(newValue)) {
+                        return
                     }
+                    // The backend requires an integer of at least 1, so never post 0 or a negative value.
+                    const value = Math.max(1, Math.floor(newValue))
+                    updateInsightFilter({ stickinessCriteria: { operator: currentOperator, value } })
                 }}
             />
-            time(s) per interval
+            <span className="@min-[0px]/editor-panel:whitespace-nowrap">time(s) per interval</span>
         </div>
     )
 }

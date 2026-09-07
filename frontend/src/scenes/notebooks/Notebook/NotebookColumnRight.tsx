@@ -1,15 +1,18 @@
 import clsx from 'clsx'
 import { BuiltLogic, useValues } from 'kea'
 
-import { uuid } from 'lib/utils'
+import { uuid } from 'lib/utils/dom'
 
 import { NotebookNodeChildRenderer } from '../Nodes/NodeWrapper'
-import { notebookNodeLogicType } from '../Nodes/notebookNodeLogicType'
+import type { notebookNodeLogicType } from '../Nodes/notebookNodeLogic'
+import { isMarkdownNotebookContent } from './markdownNotebookV2'
+import { NotebookKernelInfo } from './NotebookKernelInfo'
 import { notebookLogic } from './notebookLogic'
 
 export const NotebookColumnRight = (): JSX.Element | null => {
-    const { isShowingLeftColumn, nodeLogicsWithChildren } = useValues(notebookLogic)
-    const isShowing = nodeLogicsWithChildren.length && !isShowingLeftColumn
+    const { content, isShowingLeftColumn, nodeLogicsWithChildren, showKernelInfo } = useValues(notebookLogic)
+    const shouldShowMarkdownKernelInfo = isMarkdownNotebookContent(content) && showKernelInfo
+    const isShowing = (nodeLogicsWithChildren.length > 0 || shouldShowMarkdownKernelInfo) && !isShowingLeftColumn
 
     return (
         <div
@@ -21,6 +24,7 @@ export const NotebookColumnRight = (): JSX.Element | null => {
             <div className="NotebookColumn__content">
                 {isShowing ? (
                     <>
+                        {shouldShowMarkdownKernelInfo ? <NotebookKernelInfo /> : null}
                         {nodeLogicsWithChildren.map((x, i) => (
                             <Widgets key={i} nodeLogic={x} />
                         ))}
@@ -36,7 +40,10 @@ const Widgets = ({ nodeLogic }: { nodeLogic: BuiltLogic<notebookNodeLogicType> }
 
     // TODO: IMPORTANT: The nodeId is basically now required, so we should be checking that in the logic
     // otherwise we end up in horrible re-rendering loops
-    children.forEach((content) => {
+    // A node's children attribute can be a non-array value, so guard before iterating.
+    const childNodes = Array.isArray(children) ? children : []
+
+    childNodes.forEach((content) => {
         if (!content.attrs.nodeId) {
             content.attrs.nodeId = uuid()
         }
@@ -44,7 +51,7 @@ const Widgets = ({ nodeLogic }: { nodeLogic: BuiltLogic<notebookNodeLogicType> }
 
     return (
         <>
-            {children?.map((child) => (
+            {childNodes.map((child) => (
                 <NotebookNodeChildRenderer key={child.attrs.nodeId} content={child} />
             ))}
         </>

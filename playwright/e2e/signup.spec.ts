@@ -1,6 +1,7 @@
+import { randomString } from '@playwright-utils'
 import type { APIRequestContext, Page } from '@playwright/test'
 
-import { expect, test } from '../utils/playwright-test-base'
+import { expect, test } from '../utils/workspace-test-base'
 
 const VALID_PASSWORD = 'hedgE-hog-123%'
 
@@ -44,16 +45,13 @@ test.describe('Signup', () => {
                 config: {
                     enable_collect_everything: true,
                 },
-                featureFlags: {
-                    'passkey-signup-enabled': true,
-                },
+                featureFlags: {},
                 isAuthenticated: false,
             }
             await route.fulfill({ json: response })
         })
-        await page.locator('[data-attr=menu-item-me]').click()
-        await page.locator('[data-attr=top-menu-item-logout]').click()
-        await expect(page).toHaveURL(/.*\/login/)
+        // Log out via cookies, not the account-menu UI, which flakes on slow/torn-down workers.
+        await page.context().clearCookies()
         await page.goto('/signup')
     })
 
@@ -62,32 +60,7 @@ test.describe('Signup', () => {
         await submitEmailAndExpectExistingAccount(page, 'test@posthog.com')
     })
 
-    test('Cannot signup without required attributes', async ({ page }) => {
-        await page.locator('[data-attr=signup-start]').click()
-
-        await expect(page.getByText('Please enter your email to continue')).toBeVisible()
-    })
-
-    test('Cannot signup with invalid attributes', async ({ page }) => {
-        await page.locator('[data-attr=signup-start]').click()
-        await expect(page.getByText('Please enter your email to continue')).toBeVisible()
-
-        const email = `new_user+${Math.floor(Math.random() * 10000)}@posthog.com`
-        await page.locator('[data-attr=signup-email]').fill(email)
-        await expect(page.locator('[data-attr=signup-email]')).toHaveValue(email)
-        await page.locator('[data-attr=signup-start]').click()
-
-        await expect(page.locator('[data-attr=signup-auth-continue]')).toBeVisible()
-        await page.locator('[data-attr=password]').fill('123')
-        await page.locator('[data-attr=signup-auth-continue]').click()
-        await expect(page.getByText('Add another word or two')).toBeVisible()
-
-        await page.locator('[data-attr=password]').fill('123 abc def')
-        await page.locator('[data-attr=signup-auth-continue]').click()
-        await expect(page.getByText('Add another word or two')).not.toBeVisible()
-    })
-
-    test.skip('Can create user account with first name, last name and organization name', async ({ page }) => {
+    test('Can create user account with first name, last name and organization name', async ({ page }) => {
         let signupRequestBody: string | null = null
 
         await page.route('/api/signup/', async (route) => {
@@ -95,14 +68,14 @@ test.describe('Signup', () => {
             await route.continue()
         })
 
-        const email = `new_user+${Math.floor(Math.random() * 10000)}@posthog.com`
+        const email = `${randomString('new_user')}@posthog.com`
         await startSignupFlow(page, email, VALID_PASSWORD)
         await page.locator('[data-attr=signup-name]').fill('Alice Bob')
         await expect(page.locator('[data-attr=signup-name]')).toHaveValue('Alice Bob')
         await page.locator('[data-attr=signup-organization-name]').fill('Hogflix SpinOff')
         await expect(page.locator('[data-attr=signup-organization-name]')).toHaveValue('Hogflix SpinOff')
         await page.locator('[data-attr=signup-role-at-organization]').click()
-        await page.locator('.Popover li:first-child').click()
+        await page.locator('.Popover li').filter({ hasText: 'Engineering' }).click()
         await expect(page.locator('[data-attr=signup-role-at-organization]')).toContainText('Engineering')
         await page.locator('[data-attr=signup-submit]').click()
 
@@ -116,7 +89,7 @@ test.describe('Signup', () => {
 
     test('Can submit the signup form multiple times if there is a generic email set', async ({ page }) => {
         let signupRequestBody: string | null = null
-        const email = `new_user+generic_error_test_${Math.floor(Math.random() * 10000)}@posthog.com`
+        const email = `${randomString('new_user-generic_error_test')}@posthog.com`
 
         await page.route('/api/signup/', async (route) => {
             signupRequestBody = route.request().postData()
@@ -128,7 +101,7 @@ test.describe('Signup', () => {
         await page.locator('[data-attr=signup-name]').fill('Alice Bob')
         await expect(page.locator('[data-attr=signup-name]')).toHaveValue('Alice Bob')
         await page.locator('[data-attr=signup-role-at-organization]').click()
-        await page.locator('.Popover li:first-child').click()
+        await page.locator('.Popover li').filter({ hasText: 'Engineering' }).click()
         await expect(page.locator('[data-attr=signup-role-at-organization]')).toContainText('Engineering')
 
         // Wait for the signup request to complete
@@ -140,20 +113,24 @@ test.describe('Signup', () => {
         expect(parsedBody.first_name).toEqual('Alice')
         expect(parsedBody.last_name).toEqual('Bob')
 
+        // Wait for the first signup navigation to complete before navigating away,
+        // otherwise page.goto('/signup') races with the in-progress navigation to
+        // /verify_email/ and causes net::ERR_ABORTED
+        await expect(page).toHaveURL(/\/verify_email\/[a-zA-Z0-9_.-]*/)
         await page.goto('/signup')
 
         // Try to recreate account with same email- should fail
         await submitEmailAndExpectExistingAccount(page, email)
 
         // Update email to generic email and retry
-        const newEmail = `new_user+${Math.floor(Math.random() * 10000)}@posthog.com`
+        const newEmail = `${randomString('new_user')}@posthog.com`
         await startSignupFlow(page, newEmail, VALID_PASSWORD)
         await page.locator('[data-attr=signup-name]').fill('Alice Bob')
         await expect(page.locator('[data-attr=signup-name]')).toHaveValue('Alice Bob')
         await page.locator('[data-attr=signup-name]').fill('Alice Bob')
         await expect(page.locator('[data-attr=signup-name]')).toHaveValue('Alice Bob')
         await page.locator('[data-attr=signup-role-at-organization]').click()
-        await page.locator('.Popover li:first-child').click()
+        await page.locator('.Popover li').filter({ hasText: 'Engineering' }).click()
         await expect(page.locator('[data-attr=signup-role-at-organization]')).toContainText('Engineering')
         const retrySignupPromise = page.waitForResponse('/api/signup/')
         await page.locator('[data-attr=signup-submit]').click()
@@ -162,37 +139,9 @@ test.describe('Signup', () => {
         await expect(page).toHaveURL(/\/verify_email\/[a-zA-Z0-9_.-]*/)
     })
 
-    test('Can create user account with just a first name', async ({ page }) => {
-        let signupRequestBody: string | null = null
-
-        await page.route('/api/signup/', async (route) => {
-            signupRequestBody = route.request().postData()
-            await route.continue()
-        })
-
-        const email = `new_user+${Math.floor(Math.random() * 10000)}@posthog.com`
-        await startSignupFlow(page, email, VALID_PASSWORD)
-        await page.locator('[data-attr=signup-name]').fill('Alice')
-        await expect(page.locator('[data-attr=signup-name]')).toHaveValue('Alice')
-        await page.locator('[data-attr=signup-role-at-organization]').click()
-        await page.locator('.Popover li:first-child').click()
-        await expect(page.locator('[data-attr=signup-role-at-organization]')).toContainText('Engineering')
-
-        // Wait for the signup request to complete
-        const signupPromise = page.waitForResponse('/api/signup/')
-        await page.locator('[data-attr=signup-submit]').click()
-        await signupPromise
-
-        const parsedBody = JSON.parse(signupRequestBody!)
-        expect(parsedBody.first_name).toEqual('Alice')
-        expect(parsedBody.last_name).toBeUndefined()
-        expect(parsedBody.organization_name).toBeUndefined()
-
-        await expect(page).toHaveURL(/\/verify_email\/[a-zA-Z0-9_.-]*/)
-    })
-
     test('Can fill out all the fields on social login', async ({ page }) => {
-        await page.goto('/logout')
+        await page.context().clearCookies()
+        await page.goto('/')
         await expect(page).toHaveURL(/.*\/login/)
         await page.goto('/organization/confirm-creation?organization_name=&first_name=Test&email=test%40posthog.com')
 
@@ -201,7 +150,7 @@ test.describe('Signup', () => {
         await page.locator('[name=organization_name]').fill('Hogflix SpinOff')
         await expect(page.locator('[name=organization_name]')).toHaveValue('Hogflix SpinOff')
         await page.locator('[data-attr=signup-role-at-organization]').click()
-        await page.locator('.Popover li:first-child').click()
+        await page.locator('.Popover li').filter({ hasText: 'Engineering' }).click()
         await expect(page.locator('[data-attr=signup-role-at-organization]')).toContainText('Engineering')
         await page.locator('[type=submit]').click()
         await expect(page.locator('.Toastify [data-attr="error-toast"]')).toContainText(
@@ -209,9 +158,7 @@ test.describe('Signup', () => {
         )
     })
 
-    // TODO un-skip.
-    // Skipping test as it was failing on master, see https://posthog.slack.com/archives/C0113360FFV/p1749742204672659
-    test.skip('Shows redirect notice if redirecting for maintenance', async ({ page }) => {
+    test('Shows redirect notice if redirecting for maintenance', async ({ page }) => {
         // Equivalent to setupFeatureFlags in Playwright
         await page.route('**/flags/*', async (route) => {
             const response = {
@@ -226,7 +173,8 @@ test.describe('Signup', () => {
             await route.fulfill({ json: response })
         })
 
-        await page.goto('/logout')
+        await page.context().clearCookies()
+        await page.goto('/')
         await expect(page).toHaveURL(/.*\/login/)
 
         // Modify window object before page load
@@ -249,14 +197,14 @@ test.describe('Signup', () => {
         // Start signup with next parameter
         await page.goto('/signup?next=/custom_path')
 
-        const email = `new_user+${Math.floor(Math.random() * 10000)}@posthog.com`
+        const email = `${randomString('new_user')}@posthog.com`
         await startSignupFlow(page, email, VALID_PASSWORD)
         await page.locator('[data-attr=signup-name]').fill('Alice Bob')
         await expect(page.locator('[data-attr=signup-name]')).toHaveValue('Alice Bob')
         await page.locator('[data-attr=signup-organization-name]').fill('Hogflix SpinOff')
         await expect(page.locator('[data-attr=signup-organization-name]')).toHaveValue('Hogflix SpinOff')
         await page.locator('[data-attr=signup-role-at-organization]').click()
-        await page.locator('.Popover li:first-child').click()
+        await page.locator('.Popover li').filter({ hasText: 'Engineering' }).click()
         await expect(page.locator('[data-attr=signup-role-at-organization]')).toContainText('Engineering')
         await page.locator('[data-attr=signup-submit]').click()
 

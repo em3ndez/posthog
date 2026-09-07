@@ -5,6 +5,7 @@ from semantic_version import Version
 
 FROZEN_POSTHOG_VERSION = Version("1.43.0")  # Frozen at the last self-hosted version, just for backwards compat now
 INTERNAL_BOT_EMAIL_SUFFIX = "@posthogbot.user"
+POSTHOG_INTERNAL_EMAIL_SUFFIX = "@posthog.com"
 
 
 # N.B. Keep this in sync with frontend enum (types.ts)
@@ -12,13 +13,13 @@ INTERNAL_BOT_EMAIL_SUFFIX = "@posthogbot.user"
 class AvailableFeature(StrEnum):
     ZAPIER = "zapier"
     ORGANIZATIONS_PROJECTS = "organizations_projects"
-    ENVIRONMENTS = "environments"
     SOCIAL_SSO = "social_sso"
     SAML = "saml"
     SCIM = "scim"
     SSO_ENFORCEMENT = "sso_enforcement"
     ADVANCED_PERMISSIONS = "advanced_permissions"  # TODO: Remove this once access_control is propagated
     ACCESS_CONTROL = "access_control"
+    PROPERTY_ACCESS_CONTROL = "property_access_control"
     INGESTION_TAXONOMY = "ingestion_taxonomy"
     PATHS_ADVANCED = "paths_advanced"
     CORRELATION_ANALYSIS = "correlation_analysis"
@@ -39,6 +40,8 @@ class AvailableFeature(StrEnum):
     MANAGED_REVERSE_PROXY = "managed_reverse_proxy"
     DATA_PIPELINES = "data_pipelines"
     ALERTS = "alerts"
+    HIGH_FREQUENCY_ALERTS = "high_frequency_alerts"
+    REAL_TIME_ALERTS = "real_time_alerts"
     DATA_COLOR_THEMES = "data_color_themes"
     API_QUERIES_CONCURRENCY = "api_queries_concurrency"
     ORGANIZATION_INVITE_SETTINGS = "organization_invite_settings"
@@ -46,8 +49,17 @@ class AvailableFeature(StrEnum):
     ORGANIZATION_SECURITY_SETTINGS = "organization_security_settings"
     ORGANIZATION_APP_QUERY_CONCURRENCY_LIMIT = "organization_app_query_concurrency_limit"
     SESSION_REPLAY_DATA_RETENTION = "session_replay_data_retention"
+    PRODUCT_ANALYTICS_DATA_RETENTION = "product_analytics_data_retention"
+    LOGS_RETENTION_30D = "logs_retention_30d"
     AUDIT_LOGS = "audit_logs"
     APPROVALS = "approvals"
+    XAA_AUTHENTICATION = "xaa_authentication"
+    POSTHOG_CODE_USAGE = "posthog_code_usage"
+
+
+LOGS_RETENTION_FEATURES_BY_DAYS: dict[int, AvailableFeature] = {
+    30: AvailableFeature.LOGS_RETENTION_30D,
+}
 
 
 TREND_FILTER_TYPE_ACTIONS = "actions"
@@ -59,24 +71,28 @@ TRENDS_LINEAR = "ActionsLineGraph"
 TRENDS_TABLE = "ActionsTable"
 TRENDS_FUNNEL = "FunnelViz"
 TRENDS_PIE = "ActionsPie"
+TRENDS_DONUT = "ActionsDonut"
 TRENDS_PATHS = "PathsViz"
 TRENDS_BAR = "ActionsBar"
 TRENDS_BAR_VALUE = "ActionsBarValue"
 TRENDS_WORLD_MAP = "WorldMap"
 TRENDS_BOLD_NUMBER = "BoldNumber"
+TRENDS_METRIC = "Metric"
 TRENDS_CALENDAR_HEATMAP = "CalendarHeatmap"
+TRENDS_BOX_PLOT = "BoxPlot"
 
 # Sync with frontend NON_TIME_SERIES_DISPLAY_TYPES
 NON_TIME_SERIES_DISPLAY_TYPES = [
     TRENDS_TABLE,
     TRENDS_PIE,
+    TRENDS_DONUT,
     TRENDS_BAR_VALUE,
     TRENDS_WORLD_MAP,
     TRENDS_BOLD_NUMBER,
     TRENDS_CALENDAR_HEATMAP,
 ]
 # Sync with frontend NON_BREAKDOWN_DISPLAY_TYPES
-NON_BREAKDOWN_DISPLAY_TYPES = [TRENDS_BOLD_NUMBER, TRENDS_CALENDAR_HEATMAP]
+NON_BREAKDOWN_DISPLAY_TYPES = [TRENDS_BOLD_NUMBER, TRENDS_METRIC, TRENDS_CALENDAR_HEATMAP, TRENDS_BOX_PLOT]
 
 # CONSTANTS
 INSIGHT_TRENDS = "TRENDS"
@@ -102,10 +118,12 @@ DISPLAY_TYPES = Literal[
     "ActionsLineGraphCumulative",
     "ActionsTable",
     "ActionsPie",
+    "ActionsDonut",
     "ActionsBar",
     "ActionsBarValue",
     "WorldMap",
     "BoldNumber",
+    "Metric",
     "CalendarHeatmap",
 ]
 
@@ -311,6 +329,16 @@ class FlagRequestType(StrEnum):
 
 SURVEY_TARGETING_FLAG_PREFIX = "survey-targeting-"
 PRODUCT_TOUR_TARGETING_FLAG_PREFIX = "product-tour-targeting-"
+
+# Server-side evaluation via posthoganalytics; keep in sync with frontend FEATURE_FLAGS.
+SUBSCRIPTION_AI_PROMPT_FEATURE_FLAG_KEY = "ai-subscriptions"
+# Enable only after every subscriptions worker has deployed the gallery claim boundary. Older workers
+# share the v2 activity name and would otherwise send the legacy layout during a rolling deployment.
+SUBSCRIPTION_SLACK_GALLERY_FEATURE_FLAG_KEY = "subscription-slack-gallery"
+EXPERIMENTS_SYNC_QUERIES_FEATURE_FLAG_KEY = "experiments-sync-queries"
+EXPERIMENTS_RETENTION_METRIC_EVENTS_PREAGGREGATION_FEATURE_FLAG_KEY = (
+    "experiments-retention-metric-events-preaggregation"
+)
 GENERATED_DASHBOARD_PREFIX = "Generated Dashboard"
 
 ENRICHED_DASHBOARD_INSIGHT_IDENTIFIER = "Feature Viewed"

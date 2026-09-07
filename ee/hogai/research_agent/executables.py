@@ -22,14 +22,17 @@ class ResearchAgentExecutable(PlanModeExecutable):
     THINKING_CONFIG = {"type": "enabled", "budget_tokens": 4096}
     MAX_TOKENS = 16_384
 
+    def _get_model_name(self, state: AssistantState) -> str:
+        return "claude-opus-4-6" if state.supermode == AgentMode.RESEARCH else "claude-sonnet-4-6"
+
     def _get_model(self, state: AssistantState, tools: list["MaxTool"]):
         base_model = MaxChatAnthropic(
-            model="claude-opus-4-5-20251101",
+            model=self._get_model_name(state),
             streaming=True,
             stream_usage=True,
             user=self._user,
             team=self._team,
-            betas=["interleaved-thinking-2025-05-14", "context-1m-2025-08-07"],
+            betas=["interleaved-thinking-2025-05-14"],
             max_tokens=self.MAX_TOKENS,
             thinking=self.THINKING_CONFIG,
             conversation_start_dt=state.start_dt,
@@ -49,8 +52,7 @@ class ResearchAgentToolsExecutable(PlanModeToolsExecutable):
     def transition_supermode(self) -> AgentMode:
         return AgentMode.RESEARCH
 
-    @property
-    def transition_prompt(self) -> str:
+    async def get_transition_prompt(self) -> str:
         return SWITCH_TO_RESEARCH_MODE_PROMPT
 
     def _should_transition(self, state: AssistantState, result: PartialAssistantState) -> bool:

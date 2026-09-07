@@ -7,7 +7,6 @@ from posthog.schema import (
 
 from posthog.hogql import ast
 from posthog.hogql.parser import parse_expr, parse_select
-from posthog.hogql.printer import to_printed_hogql
 from posthog.hogql.query import execute_hogql_query
 
 from posthog.clickhouse.query_tagging import Product, tags_context
@@ -27,13 +26,15 @@ class VectorSearchQueryRunner(TaxonomyCacheMixin, AnalyticsQueryRunner[VectorSea
             query = self.to_query()
 
         with self.timings.measure("to_printed_hogql"):
-            hogql = to_printed_hogql(query, self.team)
+            hogql = self.response_hogql(query)
 
         with tags_context(product=Product.MAX_AI), self.timings.measure("execute_hogql_query"):
             response = execute_hogql_query(
                 query_type="VectorSearchQuery",
                 query=query,
                 team=self.team,
+                user=self.user,
+                context=self.build_hogql_context(),
                 timings=self.timings,
                 modifiers=self.modifiers,
                 limit_context=self.limit_context,
@@ -79,7 +80,7 @@ class VectorSearchQueryRunner(TaxonomyCacheMixin, AnalyticsQueryRunner[VectorSea
                 exprs=[
                     base_filter,
                     parse_expr(
-                        "JSONExtractUInt(properties, 'embedding_version') = {version}",
+                        "toInt(properties.embedding_version) = {version}",
                         {"version": ast.Constant(value=self.query.embeddingVersion)},
                     ),
                 ]

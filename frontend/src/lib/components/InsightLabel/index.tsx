@@ -6,10 +6,12 @@ import { useValues } from 'kea'
 import { LemonTag } from '@posthog/lemon-ui'
 
 import { EntityFilterInfo } from 'lib/components/EntityFilterInfo'
+import { parseAliasToReadable } from 'lib/components/PathCleanFilters/PathCleanFilterItem'
 import { PropertyKeyInfo } from 'lib/components/PropertyKeyInfo'
 import { SeriesLetter } from 'lib/components/SeriesGlyph'
 import { Tooltip } from 'lib/lemon-ui/Tooltip'
-import { capitalizeFirstLetter, hexToRGBA, midEllipsis } from 'lib/utils'
+import { hexToRGBA } from 'lib/utils/colors'
+import { capitalizeFirstLetter, midEllipsis } from 'lib/utils/strings'
 import { formatEventName } from 'scenes/insights/utils'
 import { mathsLogic } from 'scenes/trends/mathsLogic'
 
@@ -27,7 +29,7 @@ export enum IconSize {
 // InsightsLabel pretty prints the action (or event) returned from /insights
 interface InsightsLabelProps {
     seriesColor?: string
-    action?: ActionFilter
+    action?: ActionFilter | null
     value?: string
     className?: string
     breakdownValue?: BreakdownKeyType
@@ -47,6 +49,10 @@ interface InsightsLabelProps {
     showSingleName?: boolean // If label has default name and custom name, only show custom name. By default show both.
     pillMidEllipsis?: boolean // Whether to use mid ellipsis if pill text needs to be truncated
     pillMaxWidth?: number // Max width of each pill in px
+    showPathCleaningHighlight?: boolean // Whether to show path cleaning highlights on the breakdown value
+    /** When true, hides the HogQL/SQL math tag when the series has a custom name set.
+     *  Pass only in legend rows — not in tooltips — to prevent long SQL expressions eating label space. */
+    hideHogQLTagWhenCustomName?: boolean
 }
 
 interface MathTagProps {
@@ -78,10 +84,10 @@ function MathTag({ math, mathProperty, mathHogQL, mathGroupTypeIndex }: MathTagP
     if (math && ['sum', 'avg', 'min', 'max', 'median', 'p75', 'p90', 'p95', 'p99'].includes(math)) {
         return (
             <>
-                <LemonTag>{(mathDefinitions as any)[math]?.name || capitalizeFirstLetter(math)}</LemonTag>
+                <LemonTag>{mathDefinitions[math]?.name || capitalizeFirstLetter(math)}</LemonTag>
                 {mathProperty && (
                     <>
-                        <span>of</span>
+                        <span className="shrink-0">of</span>
                         <PropertyKeyInfo disableIcon value={mathProperty} />
                     </>
                 )}
@@ -92,7 +98,7 @@ function MathTag({ math, mathProperty, mathHogQL, mathGroupTypeIndex }: MathTagP
         return <LemonTag className="max-w-60 text-ellipsis overflow-hidden">{String(mathHogQL) || 'SQL'}</LemonTag>
     }
     // Use mathDefinitions first, then fall back to capitalizing the math string
-    return <LemonTag>{(mathDefinitions as any)[math]?.name || capitalizeFirstLetter(math)}</LemonTag>
+    return <LemonTag>{mathDefinitions[math]?.name || capitalizeFirstLetter(math)}</LemonTag>
 }
 
 export function InsightLabel({
@@ -117,6 +123,8 @@ export function InsightLabel({
     pillMidEllipsis = false,
     pillMaxWidth,
     showSingleName = false,
+    showPathCleaningHighlight = false,
+    hideHogQLTagWhenCustomName = false,
 }: InsightsLabelProps): JSX.Element {
     const showEventName = _showEventName || !breakdownValue || (hasMultipleSeries && !Array.isArray(breakdownValue))
 
@@ -137,7 +145,7 @@ export function InsightLabel({
     )
 
     return (
-        <div className={clsx('insights-label', className)}>
+        <div className={clsx('insights-label', className)} data-attr="insight-label">
             <div className="flex items-center w-fit">
                 {!(hasMultipleSeries && !breakdownValue) && !hideIcon && (
                     <div
@@ -185,16 +193,17 @@ export function InsightLabel({
                         </>
                     )}
 
-                    {((action?.math && action.math !== 'total') || showCountedByTag) && (
-                        <div className="flex flex-nowrap items-center gap-x-1">
-                            <MathTag
-                                math={action?.math}
-                                mathProperty={action?.math_property}
-                                mathHogQL={action?.math_hogql}
-                                mathGroupTypeIndex={action?.math_group_type_index}
-                            />
-                        </div>
-                    )}
+                    {((action?.math && action.math !== 'total') || showCountedByTag) &&
+                        !(hideHogQLTagWhenCustomName && action?.custom_name && action?.math === 'hogql') && (
+                            <div className="insights-label__math flex flex-nowrap items-center gap-x-1">
+                                <MathTag
+                                    math={action?.math}
+                                    mathProperty={action?.math_property}
+                                    mathHogQL={action?.math_hogql}
+                                    mathGroupTypeIndex={action?.math_group_type_index}
+                                />
+                            </div>
+                        )}
 
                     {pillValues.length > 0 && (
                         <div className="flex flex-wrap gap-1">
@@ -203,7 +212,11 @@ export function InsightLabel({
                                     <LemonTag className="tag-pill">
                                         {/* eslint-disable-next-line react/forbid-dom-props */}
                                         <span className="truncate" style={{ maxWidth: pillMaxWidth }}>
-                                            {pillMidEllipsis ? midEllipsis(String(pill), 50) : pill}
+                                            {showPathCleaningHighlight
+                                                ? parseAliasToReadable(pill?.toString() ?? '')
+                                                : pillMidEllipsis
+                                                  ? midEllipsis(String(pill), 50)
+                                                  : pill}
                                         </span>
                                     </LemonTag>
                                 </Tooltip>

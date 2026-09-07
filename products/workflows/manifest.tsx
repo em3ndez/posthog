@@ -1,6 +1,6 @@
 import { urls } from 'scenes/urls'
 
-import { ProductKey } from '~/queries/schema/schema-general'
+import { ProductItemCategory, ProductKey } from '~/queries/schema/schema-general'
 
 import { FileSystemIconColor, ProductManifest } from '../../frontend/src/types'
 import type { WorkflowsSceneTab } from './frontend/WorkflowsScene'
@@ -14,6 +14,7 @@ export const manifest: ProductManifest = {
             iconType: 'workflows',
             projectBased: true,
             description: 'Automate user communication and internal processes',
+            docsHref: 'https://posthog.com/docs/workflows',
         },
         Workflow: {
             import: () => import('./frontend/Workflows/WorkflowScene'),
@@ -65,7 +66,7 @@ export const manifest: ProductManifest = {
             intents: [ProductKey.WORKFLOWS],
             href: urls.workflows(),
             type: 'workflows',
-            category: 'Tools',
+            category: ProductItemCategory.TOOLS,
             iconType: 'workflows',
             iconColor: ['var(--color-product-workflows-light)'] as FileSystemIconColor,
             sceneKey: 'Workflows',

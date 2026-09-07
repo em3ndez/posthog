@@ -1,26 +1,169 @@
-import { Layouts } from 'react-grid-layout'
+import { deepEqual as equal } from 'fast-equals'
+import { ResponsiveLayouts } from 'react-grid-layout'
 
 import { lemonToast } from '@posthog/lemon-ui'
+import { getDashboardWidgetCatalogEntry } from '@posthog/products-dashboards/frontend/widget_types/catalog'
 
 import api, { ApiMethodOptions, getJSONOrNull } from 'lib/api'
+import { ApiError } from 'lib/api-error'
+import type { Dayjs } from 'lib/dayjs'
 import { currentSessionId } from 'lib/internalMetrics'
-import { objectClean, shouldCancelQuery, toParams } from 'lib/utils'
 import { accessLevelSatisfied } from 'lib/utils/accessControlUtils'
+import { DashboardEventSource } from 'lib/utils/eventUsageLogic'
+import { objectClean } from 'lib/utils/objects'
+import { isDeterministicClientError, shouldCancelQuery } from 'lib/utils/requests'
+import { toParams } from 'lib/utils/url'
 
 import { getQueryBasedInsightModel } from '~/queries/nodes/InsightViz/utils'
-import { pollForResults } from '~/queries/query'
+import { parseErrorMessage, pollForResults } from '~/queries/query'
 import { DashboardFilter, HogQLVariable, TileFilters } from '~/queries/schema/schema-general'
 import {
     AccessControlLevel,
     AccessControlResourceType,
     DashboardLayoutSize,
+    DashboardPlacement,
+    DashboardTemplateEditorType,
+    DashboardTile,
+    DashboardType,
+    DashboardWidgetType,
+    InsightFilterOverrideContext,
     InsightModel,
     QueryBasedInsightModel,
     TileLayout,
 } from '~/types'
 
+import { SHARED_DASHBOARD_AUTO_FORCE_IF_STALE_MINUTES } from './dashboardConstants'
+
+export function getInsightQueryError(insight: QueryBasedInsightModel): ApiError | null {
+    const queryStatus = insight.query_status
+    if (!queryStatus?.error) {
+        return null
+    }
+
+    const parsedError = parseErrorMessage(queryStatus.error_message ?? undefined)
+    return new ApiError(undefined, 400, undefined, {
+        detail: parsedError.message,
+        code: queryStatus.error_code ?? parsedError.code,
+        queryId: queryStatus.id,
+    })
+}
+
+/** Shape used for staff JSON export, customer save-as-template, and API `create_from_template_json`. */
+export function dashboardToSaveableTemplate(
+    dashboard: DashboardType<InsightModel> | null | undefined
+): DashboardTemplateEditorType | undefined {
+    if (!dashboard) {
+        return undefined
+    }
+    return {
+        template_name: dashboard.name,
+        dashboard_description: dashboard.description,
+        dashboard_filters: dashboard.filters,
+        tags: dashboard.tags || [],
+        tiles: dashboard.tiles
+            .filter((tile) => !tile.error)
+            .map((tile) => {
+                if (tile.text) {
+                    return {
+                        type: 'TEXT' as const,
+                        body: tile.text.body,
+                        layouts: tile.layouts,
+                        color: tile.color,
+                        transparent_background: tile.transparent_background,
+                    }
+                }
+                if (tile.insight) {
+                    return {
+                        type: 'INSIGHT' as const,
+                        name: tile.insight.name,
+                        description: tile.insight.description || '',
+                        query: tile.insight.query,
+                        layouts: tile.layouts,
+                        color: tile.color,
+                        transparent_background: tile.transparent_background,
+                    }
+                }
+                if (tile.button_tile) {
+                    return {
+                        type: 'BUTTON' as const,
+                        button_tile: {
+                            url: tile.button_tile.url,
+                            text: tile.button_tile.text,
+                            placement: tile.button_tile.placement,
+                            style: tile.button_tile.style,
+                        },
+                        layouts: tile.layouts,
+                        color: tile.color,
+                        transparent_background: tile.transparent_background,
+                    }
+                }
+                if (tile.widget) {
+                    return {
+                        type: 'WIDGET' as const,
+                        widget_type: tile.widget.widget_type,
+                        config: tile.widget.config,
+                        layouts: tile.layouts,
+                        color: tile.color,
+                        transparent_background: tile.transparent_background,
+                    }
+                }
+                throw new Error('Unknown tile type')
+            }),
+        variables: [],
+    }
+}
+
+export function getDashboardTileDisplayName(tile: DashboardTile<QueryBasedInsightModel>): string {
+    if (tile.insight) {
+        return tile.insight.name || tile.insight.derived_name || 'Unnamed insight'
+    }
+    if (tile.widget) {
+        const customName = tile.widget.name?.trim()
+        if (customName) {
+            return customName
+        }
+        const catalogEntry = getDashboardWidgetCatalogEntry(tile.widget.widget_type)
+        return catalogEntry?.headerTitle ?? catalogEntry?.label ?? tile.widget.widget_type
+    }
+    if (tile.text) {
+        return 'Text card'
+    }
+    if (tile.button_tile) {
+        return tile.button_tile.text || 'Button'
+    }
+
+    return 'Tile'
+}
+
+/** Which widget payload is set on a dashboard tile row. Add a branch per `DashboardWidgetType` when new tile kinds ship. */
+export function getDashboardWidgetType(
+    tile: Pick<DashboardTile<InsightModel | QueryBasedInsightModel>, 'insight' | 'text' | 'button_tile' | 'widget'>
+): DashboardWidgetType {
+    if (tile.insight) {
+        return 'insight'
+    }
+    if (tile.widget) {
+        return 'widget'
+    }
+    if (tile.text) {
+        return 'text'
+    }
+    if (tile.button_tile) {
+        return 'button_tile'
+    }
+
+    throw new Error(
+        'Dashboard tile has no widget payload. If a new widget type was added to `DashboardTile`, handle it in getDashboardWidgetType.'
+    )
+}
+
+/** Widget tiles are hidden on export; on public/shared views they render with a login placeholder. */
+export function isWidgetTileVisibleOnPlacement(placement: DashboardPlacement): boolean {
+    return placement !== DashboardPlacement.Export
+}
+
 export const BREAKPOINTS: Record<DashboardLayoutSize, number> = {
-    sm: 1024,
+    sm: 768,
     xs: 0,
 }
 export const BREAKPOINT_COLUMN_COUNTS: Record<DashboardLayoutSize, number> = { sm: 12, xs: 1 }
@@ -36,16 +179,35 @@ export const IS_TEST_MODE = process.env.NODE_ENV === 'test'
 export const SEARCH_PARAM_QUERY_VARIABLES_KEY = 'query_variables'
 export const SEARCH_PARAM_FILTERS_KEY = 'query_filters'
 
-/**
- * Once a dashboard has more tiles than this,
- * we don't automatically preview dashboard date/filter/breakdown changes.
- * Users will need to click the 'Apply and preview filters' button.
- */
-export const MAX_TILES_FOR_AUTOPREVIEW = 5
+export const DEFAULT_AUTO_PREVIEW_TILE_LIMIT = 10
 
 const RATE_LIMIT_ERROR_MESSAGE = 'concurrency_limit_exceeded'
 
-export const AUTO_REFRESH_INITIAL_INTERVAL_SECONDS = 1800
+// A refresh that was rejected (concurrency limit, server-side calculation error) still resolves with an
+// insight-shaped payload: no result, an errored query_status. Committing it to the dashboard would wipe
+// the tile's existing data and render as an empty insight instead of an error.
+export function isRefreshRejectionStub(insight: QueryBasedInsightModel): boolean {
+    return !!insight.query_status?.error && insight.result == null
+}
+
+function staleAgeMinutes(effectiveLastRefresh: Dayjs | null): number | null {
+    if (!effectiveLastRefresh) {
+        return null
+    }
+    if (!effectiveLastRefresh.isValid()) {
+        return null
+    }
+    const ms = Number(effectiveLastRefresh.valueOf())
+    if (!Number.isFinite(ms)) {
+        return null
+    }
+    return (Date.now() - ms) / 60_000
+}
+
+export function shouldSharedDashboardAutoForceForStaleTime(effectiveLastRefresh: Dayjs | null): boolean {
+    const ageMinutes = staleAgeMinutes(effectiveLastRefresh)
+    return ageMinutes !== null && ageMinutes >= SHARED_DASHBOARD_AUTO_FORCE_IF_STALE_MINUTES
+}
 
 // Helper function for exponential backoff
 const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms))
@@ -90,11 +252,11 @@ export async function runWithLimit<T>(tasks: (() => Promise<T>)[], limit: number
     return results
 }
 
-export const layoutsByTile = (layouts: Layouts): Record<string, Record<DashboardLayoutSize, TileLayout>> => {
+export const layoutsByTile = (layouts: ResponsiveLayouts): Record<string, Record<DashboardLayoutSize, TileLayout>> => {
     const itemLayouts: Record<string, Record<DashboardLayoutSize, TileLayout>> = {}
 
     Object.entries(layouts).forEach(([col, layout]) => {
-        layout.forEach((layoutItem) => {
+        layout?.forEach((layoutItem) => {
             const i = String(layoutItem.i)
             if (!itemLayouts[i]) {
                 itemLayouts[i] = {} as Record<DashboardLayoutSize, TileLayout>
@@ -225,6 +387,10 @@ export async function getInsightWithRetry(
                 throw e // Re-throw cancellation errors
             }
 
+            if (isDeterministicClientError(e)) {
+                throw e // A 4xx won't change on retry, so surface it immediately
+            }
+
             attempt++
             if (attempt >= maxAttempts) {
                 throw e // Re-throw the error after max attempts
@@ -241,9 +407,12 @@ export async function getInsightWithRetry(
 export const parseURLVariables = (searchParams: Record<string, any>): Record<string, Partial<HogQLVariable>> => {
     const variables: Record<string, Partial<HogQLVariable>> = {}
 
-    if (searchParams[SEARCH_PARAM_QUERY_VARIABLES_KEY]) {
+    const raw = searchParams[SEARCH_PARAM_QUERY_VARIABLES_KEY]
+    if (raw) {
         try {
-            const parsedVariables = JSON.parse(searchParams[SEARCH_PARAM_QUERY_VARIABLES_KEY])
+            // kea-router auto-parses JSON-like values from the URL, so the value
+            // may already be an object when the URL doesn't have a trailing space.
+            const parsedVariables = typeof raw === 'string' ? JSON.parse(raw) : raw
             Object.assign(variables, parsedVariables)
         } catch (e) {
             console.error('Failed to parse query_variables from URL:', e)
@@ -253,7 +422,7 @@ export const parseURLVariables = (searchParams: Record<string, any>): Record<str
     return variables
 }
 
-export const encodeURLVariables = (variables: Record<string, string>): Record<string, string> => {
+export const encodeURLVariables = (variables: Record<string, any>): Record<string, string> => {
     const encodedVariables: Record<string, string> = {}
 
     if (Object.keys(variables).length > 0) {
@@ -266,9 +435,12 @@ export const encodeURLVariables = (variables: Record<string, string>): Record<st
 export const parseURLFilters = (searchParams: Record<string, any>): DashboardFilter => {
     const filters: DashboardFilter = {}
 
-    if (searchParams[SEARCH_PARAM_FILTERS_KEY]) {
+    const raw = searchParams[SEARCH_PARAM_FILTERS_KEY]
+    if (raw) {
         try {
-            const parsedFilters = JSON.parse(searchParams[SEARCH_PARAM_FILTERS_KEY])
+            // kea-router auto-parses JSON-like values from the URL, so the value
+            // may already be an object when the URL doesn't have a trailing space.
+            const parsedFilters = typeof raw === 'string' ? JSON.parse(raw) : raw
             Object.assign(filters, parsedFilters)
         } catch (e) {
             console.error(`Failed to parse ${SEARCH_PARAM_FILTERS_KEY} from URL:`, e)
@@ -288,6 +460,64 @@ export const encodeURLFilters = (filters: DashboardFilter): Record<string, strin
     return encodedFilters
 }
 
+/**
+ * An insight opened from a dashboard keys its variable overrides by variable id, while the dashboard URL keys them
+ * by code name. Convert them back so a link to the dashboard reopens it with the same filters and variable values.
+ */
+export const dashboardSearchParamsFromOverrides = (
+    variablesOverride: Record<string, HogQLVariable> | null | undefined,
+    filtersOverride: DashboardFilter | null | undefined
+): Record<string, string> => {
+    const urlVariables: Record<string, any> = {}
+
+    for (const variable of Object.values(variablesOverride ?? {})) {
+        if (!variable?.code_name) {
+            continue
+        }
+        const value = variable.isNull ? null : variable.value
+        if (value !== undefined) {
+            urlVariables[variable.code_name] = value
+        }
+    }
+
+    return { ...encodeURLVariables(urlVariables), ...encodeURLFilters(filtersOverride ?? {}) }
+}
+
+/**
+ * An empty override must stay in the URL when it clears a saved dashboard filter. Without that explicit
+ * value, a reload restores the saved filter. Empty overrides on unfiltered dashboards can be removed.
+ */
+export function searchParamsWithUrlFilters(
+    searchParams: Record<string, any>,
+    filters: DashboardFilter,
+    persistedFilters: DashboardFilter = {}
+): Record<string, any> {
+    const nextSearchParams = { ...searchParams }
+    if (!dashboardFilterOverrideChangesFilters(filters, persistedFilters)) {
+        delete nextSearchParams[SEARCH_PARAM_FILTERS_KEY]
+        return nextSearchParams
+    }
+    return { ...nextSearchParams, ...encodeURLFilters(filters) }
+}
+
+export function dashboardFilterOverrideChangesFilters(
+    filters: DashboardFilter,
+    persistedFilters: DashboardFilter
+): boolean {
+    return Object.entries(filters).some(([key, value]) => {
+        const persistedValue = (persistedFilters as Record<string, unknown>)[key]
+        if (key === 'properties') {
+            const properties = Array.isArray(value) ? value : []
+            const persistedProperties = Array.isArray(persistedValue) ? persistedValue : []
+            return !equal(properties, persistedProperties)
+        }
+        if (value == null && persistedValue == null) {
+            return false
+        }
+        return !equal(value, persistedValue)
+    })
+}
+
 export function combineDashboardFilters(...filters: DashboardFilter[]): DashboardFilter {
     return filters.reduce((combined, filter) => {
         Object.keys(filter).forEach((key) => {
@@ -298,4 +528,44 @@ export function combineDashboardFilters(...filters: DashboardFilter[]): Dashboar
         })
         return combined
     }, {} as DashboardFilter)
+}
+
+export function getEffectiveDateOverride(
+    filterOverrideContext: InsightFilterOverrideContext | null | undefined,
+    filtersOverride: DashboardFilter | undefined,
+    tileFiltersOverride: TileFilters | undefined
+): { dateFromOverride: string | null | undefined; dateToOverride: string | null | undefined } {
+    // The backend context already resolves the ignore flag into an empty dashboard layer; the raw-props
+    // fallback has to apply it itself.
+    const dashboardFilters = filterOverrideContext
+        ? filterOverrideContext.dashboard
+        : tileFiltersOverride?.ignoreDashboardFilters
+          ? undefined
+          : filtersOverride
+    const tileFilters = filterOverrideContext ? filterOverrideContext.tile : tileFiltersOverride
+    const tileHasDate = tileFilters?.date_from != null || tileFilters?.date_to != null
+    const source = tileHasDate ? tileFilters : dashboardFilters
+    return { dateFromOverride: source?.date_from, dateToOverride: source?.date_to }
+}
+
+const LAYOUT_EDIT_EVENT_SOURCES = new Set<DashboardEventSource>([
+    DashboardEventSource.SceneCommonButtons,
+    DashboardEventSource.CardEdgeHover,
+    DashboardEventSource.CardDragHandle,
+    DashboardEventSource.DashboardsList,
+])
+
+export function isLayoutEditEventSource(source: DashboardEventSource | null): boolean {
+    return source !== null && LAYOUT_EDIT_EVENT_SOURCES.has(source)
+}
+
+export function shouldSnapshotUrlAtEditModeEntry(source: DashboardEventSource | null): boolean {
+    return (
+        source !== null &&
+        (isLayoutEditEventSource(source) ||
+            source === DashboardEventSource.DashboardFilters ||
+            source === DashboardEventSource.DashboardVariableOverride ||
+            source === DashboardEventSource.DashboardInsightColorsModal ||
+            source === DashboardEventSource.DashboardHeaderOverridesBanner)
+    )
 }

@@ -1,25 +1,53 @@
 from typing import Any
 
 from django.db import transaction
-from django.db.models.signals import pre_delete
-from django.dispatch import receiver
 
-from drf_spectacular.utils import extend_schema
+from drf_spectacular.utils import extend_schema, extend_schema_field
 from rest_framework import serializers, viewsets
 from rest_framework.exceptions import ValidationError
 from rest_framework.request import Request
 from rest_framework.response import Response
 
-from posthog.api.feature_flag import FeatureFlagSerializer
+from posthog.api.documentation import FeatureFlagConditionGroupSchemaSerializer
 from posthog.api.routing import TeamAndOrgViewSetMixin
 from posthog.api.shared import UserBasicSerializer
-from posthog.models.activity_logging.activity_log import Detail, changes_between, log_activity
-from posthog.models.experiment import ExperimentHoldout
-from posthog.models.signals import model_activity_signal, mutable_receiver
+
+from products.access_control.backend.presentation.access_control import UserAccessControlSerializerMixin
+from products.experiments.backend.models.experiment import ExperimentHoldout
+from products.feature_flags.backend.api.feature_flag import FeatureFlagSerializer
+from products.feature_flags.backend.facade.filters import set_holdout
 
 
-class ExperimentHoldoutSerializer(serializers.ModelSerializer):
+@extend_schema_field(FeatureFlagConditionGroupSchemaSerializer(many=True))
+class HoldoutFiltersField(serializers.JSONField):
+    """JSONField typed as a list of feature-flag release-condition groups for OpenAPI generation.
+
+    Documentation-only — the runtime stays a plain JSONField, so `validate_filters` and the
+    server-managed `variant` normalization are unaffected.
+    """
+
+    pass
+
+
+class ExperimentHoldoutSerializer(UserAccessControlSerializerMixin, serializers.ModelSerializer):
+    """A holdout group — a stable slice of users excluded from experiment exposure."""
+
     created_by = UserBasicSerializer(read_only=True)
+    # Declared explicitly only to attach the typed schema; `required=False` mirrors the model's
+    # JSONField default. Help text for name/description is added via Meta.extra_kwargs so the
+    # model-derived constraints (e.g. max_length) are preserved.
+    filters = HoldoutFiltersField(
+        required=False,
+        help_text=(
+            "Non-empty list of release-condition groups defining the held-out population, using the same shape as "
+            "feature-flag release conditions. Each element's `rollout_percentage` (0–100, may be fractional) is the "
+            "**exclusion** percentage — the share of users held back from all experiments that reference this holdout. "
+            "`properties` optionally narrows the group by person/group properties. Do not set `variant`: the server "
+            "normalizes it to `holdout-{id}`. Note that only the first element's `rollout_percentage` is embedded into "
+            "each linked experiment's feature flag, and this population is shared across every experiment using the "
+            "holdout."
+        ),
+    )
 
     class Meta:
         model = ExperimentHoldout
@@ -31,13 +59,19 @@ class ExperimentHoldoutSerializer(serializers.ModelSerializer):
             "created_by",
             "created_at",
             "updated_at",
+            "user_access_level",
         ]
         read_only_fields = [
             "id",
             "created_by",
             "created_at",
             "updated_at",
+            "user_access_level",
         ]
+        extra_kwargs = {
+            "name": {"help_text": "Human-readable name for the holdout group."},
+            "description": {"help_text": "Optional description of what this holdout reserves and why."},
+        }
 
     def _get_filters_with_holdout_id(self, id: int, filters: list) -> list:
         variant_key = f"holdout-{id}"
@@ -52,6 +86,9 @@ class ExperimentHoldoutSerializer(serializers.ModelSerializer):
         return updated_filters
 
     def validate_filters(self, filters):
+        if not filters:
+            raise serializers.ValidationError("Filters must not be empty.")
+
         for filter in filters:
             rollout_percentage = filter.get("rollout_percentage")
             if rollout_percentage is None:
@@ -86,20 +123,29 @@ class ExperimentHoldoutSerializer(serializers.ModelSerializer):
                     existing_flag_serializer = FeatureFlagSerializer(
                         flag,
                         data={
-                            "filters": {**flag.filters, "holdout_groups": validated_data["filters"]},
+                            "filters": set_holdout(
+                                flag.filters,
+                                holdout_id=instance.id,
+                                # validate_filters guarantees a non-empty list with rollout_percentage present.
+                                exclusion_percentage=new_filters[0]["rollout_percentage"],
+                            ),
                         },
                         partial=True,
                         context=self.context,
                     )
                     existing_flag_serializer.is_valid(raise_exception=True)
                     existing_flag_serializer.save()
+                return super().update(instance, validated_data)
 
         return super().update(instance, validated_data)
 
 
-@extend_schema(tags=["experiments"])
+@extend_schema(extensions={"x-swagger-tag": "experiment_holdouts", "x-product": "experiments"})
 class ExperimentHoldoutViewSet(TeamAndOrgViewSetMixin, viewsets.ModelViewSet):
-    scope_object = "experiment"
+    # Deliberately NOT an AccessControlViewSetMixin: holdouts are shared project config that
+    # inherit experiment access, with no per-holdout grants. Exposing `/{id}/access_controls`
+    # would let an object-level holdout grant bypass resource-level experiment access.
+    scope_object = "experiment_holdout"
     queryset = ExperimentHoldout.objects.prefetch_related("created_by").all()
     serializer_class = ExperimentHoldoutSerializer
     ordering = "-created_at"
@@ -113,10 +159,7 @@ class ExperimentHoldoutViewSet(TeamAndOrgViewSetMixin, viewsets.ModelViewSet):
                 existing_flag_serializer = FeatureFlagSerializer(
                     flag,
                     data={
-                        "filters": {
-                            **flag.filters,
-                            "holdout_groups": None,
-                        }
+                        "filters": set_holdout(flag.filters, holdout_id=None, exclusion_percentage=None),
                     },
                     partial=True,
                     context={"request": request, "team": self.team, "team_id": self.team_id},
@@ -124,42 +167,4 @@ class ExperimentHoldoutViewSet(TeamAndOrgViewSetMixin, viewsets.ModelViewSet):
                 existing_flag_serializer.is_valid(raise_exception=True)
                 existing_flag_serializer.save()
 
-        return super().destroy(request, *args, **kwargs)
-
-
-@mutable_receiver(model_activity_signal, sender=ExperimentHoldout)
-def handle_experiment_holdout_change(
-    sender, scope, before_update, after_update, activity, user=None, was_impersonated=False, **kwargs
-):
-    # Log activity for the holdout itself
-    log_activity(
-        organization_id=after_update.team.organization_id,
-        team_id=after_update.team_id,
-        user=user or after_update.created_by,
-        was_impersonated=was_impersonated,
-        item_id=after_update.id,
-        scope="Experiment",  # log under Experiment scope so it appears in experiment activity log
-        activity=activity,
-        detail=Detail(
-            changes=changes_between(scope, previous=before_update, current=after_update),
-            name=after_update.name,
-            type="holdout",
-        ),
-    )
-
-
-@receiver(pre_delete, sender=ExperimentHoldout)
-def handle_experiment_holdout_delete(sender, instance, **kwargs):
-    from posthog.models.activity_logging.utils import activity_storage
-
-    # Log activity for the holdout itself
-    log_activity(
-        organization_id=instance.team.organization_id,
-        team_id=instance.team_id,
-        user=activity_storage.get_user() or getattr(instance, "last_modified_by", instance.created_by),
-        was_impersonated=activity_storage.get_was_impersonated(),
-        item_id=instance.id,
-        scope="Experiment",
-        activity="deleted",
-        detail=Detail(name=instance.name, type="holdout"),
-    )
+            return super().destroy(request, *args, **kwargs)

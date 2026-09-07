@@ -4,12 +4,10 @@ import { IconCheck, IconX } from '@posthog/icons'
 
 import { AutoSizer } from 'lib/components/AutoSizer'
 import { Resizer } from 'lib/components/Resizer/Resizer'
-import { useFeatureFlag } from 'lib/hooks/useFeatureFlag'
 import { LemonButton } from 'lib/lemon-ui/LemonButton'
 import { CodeEditor, CodeEditorProps } from 'lib/monaco/CodeEditor'
-import MaxTool from 'scenes/max/MaxTool'
+import { cn } from 'lib/utils/css-classes'
 
-import { iconForType } from '~/layout/panel-layout/ProjectTree/defaultTree'
 import { HogQLQuery } from '~/queries/schema/schema-general'
 
 import { editorSizingLogic } from './editorSizingLogic'
@@ -23,31 +21,43 @@ interface QueryPaneProps {
     originalValue?: string
     onRun?: () => void
     editorVimModeEnabled?: boolean
+    constrainHeight?: boolean
 }
 
 export function QueryPane(props: QueryPaneProps): JSX.Element {
-    const { queryPaneHeight, queryPaneResizerProps } = useValues(editorSizingLogic)
-    const {
-        setSuggestedQueryInput,
-        onAcceptSuggestedQueryInput,
-        onRejectSuggestedQueryInput,
-        reportAIQueryPromptOpen,
-    } = useActions(sqlEditorLogic)
+    const { queryPaneHeight, queryPaneDesiredSize, queryPaneResizerProps } = useValues(editorSizingLogic)
+    const { onAcceptSuggestedQueryInput, onRejectSuggestedQueryInput } = useActions(sqlEditorLogic)
     const { acceptText, rejectText, diffShowRunButton } = useValues(sqlEditorLogic)
-    const isRemovingSidePanelFlag = useFeatureFlag('UX_REMOVE_SIDEPANEL')
+    // Without an output pane beneath it the editor owns its column, so it takes whatever height the
+    // database tree gives the row rather than leaving dead space next to the schema list.
+    const fillsColumn = props.constrainHeight === false
 
     return (
         <>
             <div
-                className="relative flex flex-row w-full bg-primary"
+                // No min-h-0 here: Tailwind runs with `important`, so the utility would beat the
+                // inline min-height that keeps the editor readable when the tree is closed.
+                className={cn('relative flex flex-row w-full bg-primary', fillsColumn && 'flex-1')}
                 // eslint-disable-next-line react/forbid-dom-props
                 style={{
-                    height: `${queryPaneHeight}px`,
+                    height: fillsColumn ? undefined : `${queryPaneHeight}px`,
+                    minHeight: fillsColumn ? `${queryPaneHeight}px` : undefined,
+                    maxHeight: !fillsColumn && queryPaneDesiredSize === null ? '35%' : undefined,
                 }}
                 ref={queryPaneResizerProps.containerRef}
             >
                 <div className="relative flex flex-col w-full min-h-0">
-                    <div className="flex-1 min-h-0" data-attr="hogql-query-editor">
+                    {/*
+                     * A notebook cell puts this pane in a container that the browser sizes from
+                     * its content. The pane is a flex item there, so the editor inside it sets
+                     * the floor the pane can reach. Monaco reports the height it already has, so
+                     * a drag could only make the pane taller. The editor leaves the flow here so
+                     * that `queryPaneHeight` alone sets the height.
+                     */}
+                    <div
+                        className={cn('flex-1 min-h-0', fillsColumn && 'absolute inset-0')}
+                        data-attr="hogql-query-editor"
+                    >
                         <AutoSizer
                             renderProp={({ height, width }) =>
                                 height && width ? (
@@ -59,8 +69,8 @@ export function QueryPane(props: QueryPaneProps): JSX.Element {
                                         width={width}
                                         originalValue={props.originalValue}
                                         enableVimMode={props.editorVimModeEnabled}
-                                        {...props.codeEditorProps}
                                         autoFocus={true}
+                                        {...props.codeEditorProps}
                                         options={{
                                             minimap: {
                                                 enabled: false,
@@ -69,6 +79,7 @@ export function QueryPane(props: QueryPaneProps): JSX.Element {
                                             scrollBeyondLastLine: !!props.originalValue,
                                             automaticLayout: true,
                                             fixedOverflowWidgets: true,
+                                            glyphMargin: true,
                                             suggest: {
                                                 showInlineDetails: true,
                                             },
@@ -79,33 +90,6 @@ export function QueryPane(props: QueryPaneProps): JSX.Element {
                             }
                         />
                     </div>
-                    {!isRemovingSidePanelFlag && (
-                        <div className={`absolute right-4 ${props.editorVimModeEnabled ? 'bottom-12' : 'bottom-6'}`}>
-                            <MaxTool
-                                identifier="execute_sql"
-                                context={{
-                                    current_query: props.queryInput,
-                                }}
-                                contextDescription={{
-                                    text: 'Current query',
-                                    icon: iconForType('sql_editor'),
-                                }}
-                                callback={(toolOutput: string) => {
-                                    setSuggestedQueryInput(toolOutput, 'max_ai')
-                                }}
-                                suggestions={[]}
-                                onMaxOpen={() => {
-                                    reportAIQueryPromptOpen()
-                                }}
-                                introOverride={{
-                                    headline: 'What data do you want to analyze?',
-                                    description: 'Let me help you quickly write SQL, and tweak it.',
-                                }}
-                            >
-                                <div className="relative" />
-                            </MaxTool>
-                        </div>
-                    )}
                     {props.originalValue && (
                         <div
                             className="absolute flex gap-1 bg-bg-light rounded border py-1 px-1.5 z-10 left-1/2 -translate-x-1/2 bottom-4 whitespace-nowrap"

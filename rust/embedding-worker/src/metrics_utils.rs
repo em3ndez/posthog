@@ -12,6 +12,14 @@ pub const EMBEDDING_FAILED: &str = "embedding_worker_embedding_failed";
 pub const EMBEDDING_TOTAL_TIME: &str = "embedding_worker_embedding_total_time";
 pub const EMBEDDING_REQUEST_TIME: &str = "embedding_worker_embedding_request_time";
 pub const EMBEDDING_TOTAL_TOKENS: &str = "embedding_worker_embedding_total_tokens";
+pub const REQUESTS_SENT: &str = "embedding_worker_requests_sent";
+pub const RESPONSES_RECEIVED: &str = "embedding_worker_responses_received";
+pub const RECENTLY_SEEN_DOCUMENTS: &str = "embedding_worker_recently_seen_documents";
+pub const RECENTLY_SEEN_OPERATIONS: &str = "embedding_worker_recently_seen_operations";
+pub const RECENTLY_SEEN_OPERATION_TIME: &str = "embedding_worker_recently_seen_operation_time";
+pub const RECENTLY_SEEN_RETRIES: &str = "embedding_worker_recently_seen_retries";
+pub const RECENTLY_SEEN_WRITE_ERRORS: &str = "embedding_worker_recently_seen_write_errors";
+pub const RECENTLY_SEEN_READ_ERRORS: &str = "embedding_worker_recently_seen_read_errors";
 
 #[derive(Debug, Clone, Default)]
 pub struct RequestLabels {
@@ -34,7 +42,7 @@ impl RequestLabels {
     }
 
     pub fn and_model(self, model: EmbeddingModel) -> Self {
-        self.and([("model", model.name())])
+        self.and([("model", model.name()), ("provider", model.provider())])
     }
 
     pub fn render(&self) -> &[(String, String)] {

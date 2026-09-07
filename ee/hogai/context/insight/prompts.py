@@ -1,7 +1,7 @@
 INSIGHT_RESULT_TEMPLATE = """
 Name: {{{insight_name}}}
 {{#insight_id}}
-Insight ID: {{{insight_id}}}
+{{#insight_url}}Insight ID: {{{insight_id}}}{{/insight_url}}{{^insight_url}}Artifact ID: {{{insight_id}}}{{/insight_url}}
 {{/insight_id}}
 {{#insight_description}}
 Description: {{{insight_description}}}
@@ -10,7 +10,7 @@ Description: {{{insight_description}}}
 Insight URL: {{{insight_url}}}
 {{/insight_url}}
 {{^insight_url}}
-This insight cannot be accessed via a URL.
+This insight is not saved in the project, so it cannot be accessed via a URL. Any `Artifact ID` above is scoped to this conversation, not an insight short ID, so an `/insights/...` link built from it would 404. If the user wants a saved insight, tell them to open the chart as a new insight from the icon below it and save it from there.
 {{/insight_url}}
 {{#query_schema}}
 
@@ -45,15 +45,14 @@ The current date and time is {{{utc_datetime_display}}} UTC, which is {{{project
 {{#sql_query}}
 Always add `LIMIT 100` to your queries. The maximum allowed limit is 500 rows. If you need more data, paginate using LIMIT and OFFSET in subsequent queries.
 {{/sql_query}}
-{{#currency}}
-Assume currency values are in {{currency}} and ALWAYS include the proper prefix when displaying values that are likely to be currency values.
-{{/currency}}
 It's expected that the data point for the current period may show a drop in value, as data collection for it is still ongoing. Do not point this out.
-Do not copy the results table as the user sees it in the UI.{{#include_url_reminder}}
-{{/include_url_reminder}}
+Do not copy the results table as the user sees it in the UI.
 {{#has_truncated_values}}
 Some JSON/array values were truncated. You can write a more specific SQL query to explore individual properties or array elements if needed.
 {{/has_truncated_values}}
+{{#has_null_values}}
+Cells shown as `(null)` are SQL NULL: the column had no value for those rows, usually because the property is absent on that event. Treat them as missing data. Never report `(null)` as a value, and never conclude a property is set to "null" or "None" from them.
+{{/has_null_values}}
 </system_reminder>
 """.strip()
 
@@ -114,6 +113,32 @@ Date|$pageview -> sign up conversion|$pageview -> sign up drop-off
 """.strip()
 
 
+LIFECYCLE_EXAMPLE_PROMPT = """
+You are given a table with the results of a lifecycle query. Values are separated by the pipe character "|" and rows are separated by newlines. The first row is the header row. The first column is the date, and the remaining columns show the count of users in each lifecycle status for that period: New (first-time users), Returning (active in the previous period), Resurrecting (returning after inactivity), and Dormant (previously active but inactive, shown as negative values). If the query has multiple event series, each series is shown in a separate section with an "Event:" header.
+
+Important: for event and action series, lifecycle queries only include users with person profiles. Events with `$process_person_profile: false` are excluded entirely; these come from anonymous users on SDKs configured with `person_profiles: 'identified_only'`, the default in posthog-js. Data warehouse series are not affected by this exclusion.
+
+Example:
+```
+Date|New|Returning|Resurrecting|Dormant
+2025-10-01|6936|29541|13263|-16735
+2025-11-01|7101|30794|12662|-18946
+```
+""".strip()
+
+PATHS_EXAMPLE_PROMPT = """
+You are given a table with the results of a paths query. Values are separated by the pipe character "|" and rows are separated by newlines. The first row is the header row. Each row represents an edge in the user path graph, showing the source step, target step, the number of users who traversed that edge, and the average time to convert between steps. Source and target values are prefixed with their step number (e.g., "1_/home" means step 1 at "/home").
+
+Example:
+```
+Source|Target|Users|Avg. conversion time
+1_/home|2_/pricing|150|2m 30s
+1_/home|2_/docs|80|1m 15s
+2_/pricing|3_/signup|120|45s
+2_/docs|3_/signup|40|3m
+```
+""".strip()
+
 RETENTION_EXAMPLE_PROMPT = """
 You are given a matrix with the results of a retention query. Values are separated by the pipe character "|" and rows are separated by newlines. The first row is the header row with series names received from the query. The first column is the date, the second column is the count of persons who completed the action on that date, and the rest are the retention values for each day relative to the following days.
 
@@ -138,150 +163,27 @@ value4|value5|value6
 ```
 """.strip()
 
-REVENUE_ANALYTICS_GROSS_REVENUE_EXAMPLE_PROMPT = """
-You are given a table with the gross revenue results for a given period as specified. The results might be broken down by different values (e.g. product name, country, etc.). In the table, values are separated by the pipe character "|" and rows are separated by newlines. The first row is the header row with the different sources and breakdowns. The other rows are the results of the query.
-When referencing these numbers, make sure you're using the proper currency prefix based on the project's base currency.
+STICKINESS_EXAMPLE_PROMPT = """
+You are given a table with the results of a stickiness query. Values are separated by the pipe character "|" and rows are separated by newlines. The first row is the header row with series names received from the query. The first column is the interval (number of days/weeks the event was performed), and the rest are the values for each series.
 
 Example:
 ```
-Gross revenue for period: 2024-11-01 to 2025-02-01
-Breakdown by revenue_analytics_product.name
-Date|stripe.posthog_test - Product F|stripe.posthog_test - Product E
-2024-11-01|647.24356|64.24353
-2024-12-01|2507.2184|207.2432
+Interval|$pageview|signup
+1 day|200|100
+2 days|150|120
+3 days|100|80
 ```
-"""
+""".strip()
 
-REVENUE_ANALYTICS_METRICS_EXAMPLE_PROMPT = """
-You are given a table with some metrics revenue results for a given period. We include results for total/new/churned subscriptions and customers and also ARPU and LTV. The results might be broken down by different values (e.g. product name, country, etc.). In the table, values are separated by the pipe character "|" and rows are separated by newlines. The first row is the header row with the different sources and breakdowns. The other rows are the results of the query.
-For LTV, if there are no customers, the value is set to N/A. If there are customers but none has churned, the value is set to 0.
-When referencing these numbers, make sure you're using the proper currency prefix based on the project's base currency.
+BOX_PLOT_EXAMPLE_PROMPT = """
+You are given a table with the results of a box plot query showing statistical distributions of a numeric property over time. Values are separated by the pipe character "|" and rows are separated by newlines. The first row is the header row. Each row shows the distribution statistics for a date period: minimum, 25th percentile (P25), median, 75th percentile (P75), maximum, and mean.
 
 Example:
 ```
-Revenue metrics for period: 2024-11-01 to 2025-02-01
-Breakdown by revenue_analytics_product.name
-
-Subscription Count
-Date|stripe.posthog_test - Product E|stripe.posthog_test - Product F
-2024-11-01|0|1
-2024-12-01|0|2
-
-New Subscription Count
-Date|stripe.posthog_test - Product E|stripe.posthog_test - Product F
-2024-11-01|0|0
-2024-12-01|0|1
-
-Churned Subscription Count
-Date|stripe.posthog_test - Product E|stripe.posthog_test - Product F
-2024-11-01|0|0
-2024-12-01|0|0
-
-Customer Count
-Date|stripe.posthog_test - Product E|stripe.posthog_test - Product F
-2024-11-01|0|1
-2024-12-01|0|2
-
-New Customer Count
-Date|stripe.posthog_test - Product E|stripe.posthog_test - Product F
-2024-11-01|0|0
-2024-12-01|0|1
-"2025-01-01|3|1
-"2025-02-01|3|1
-
-Churned Customer Count
-Date|stripe.posthog_test - Product E|stripe.posthog_test - Product F
-2024-11-01|0|0
-2024-12-01|0|0
-
-ARPU
-Date|stripe.posthog_test - Product E|stripe.posthog_test - Product F
-2024-11-01|212.51292|152.235
-2024-12-01|277.54371|215.3234
-
-LTV
-Date|stripe.posthog_test - Product E|stripe.posthog_test - Product F
-2024-11-01|25.5|N/A
-2024-12-01|0|0
+Date|Min|P25|Median|P75|Max|Mean
+2025-01-20|1.2|5.5|12.3|25.8|100.4|18.7
+2025-01-21|0.8|4.2|10.1|22.5|95.2|16.3
 ```
-"""
-
-REVENUE_ANALYTICS_MRR_EXAMPLE_PROMPT = """
-You are given a table with the gross revenue results for a given period as specified. The results might be broken down by different values (e.g. product name, country, etc.). In the table, values are separated by the pipe character "|" and rows are separated by newlines. The first row is the header row with the different sources and breakdowns. The other rows are the results of the query.
-Besides total MRR, we also include results for new, expansion, contraction and churn MRR.
-When referencing these numbers, make sure you're using the proper currency prefix based on the project's base currency.
-
-Example:
-```
-MRR metrics for period: 2024-11-01 to 2025-02-01
-Breakdown by revenue_analytics_product.name
-
-Total MRR
-Date|stripe.posthog_test - Product C|stripe.posthog_test - Product D
-2024-11-30|5.75833|5.325
-2024-12-31|24.35234|4.335
-2025-01-31|19.96086|19.865
-2025-02-28|9.84295|19.845
-
-New MRR
-Date|stripe.posthog_test - Product C|stripe.posthog_test - Product D
-2024-11-30|0|0
-2024-12-31|5.75833|5.7325
-2025-01-31|18.59401|18.01
-2025-02-28|0|0
-
-Expansion MRR
-Date|stripe.posthog_test - Product C|stripe.posthog_test - Product D
-2024-11-30|0|0
-2024-12-31|0|0
-2025-01-31|0|8.38045
-2025-02-28|8.38045|25.12
-
-Contraction MRR
-Date|stripe.posthog_test - Product C|stripe.posthog_test - Product D
-2024-11-30|0|0
-2024-12-31|-4.39147|-45.391
-2025-01-31|-18.49837|-1.497
-2025-02-28|0|0
-
-Churned MRR
-Date|stripe.posthog_test - Product C|stripe.posthog_test - Product D
-2024-11-30|0|0
-2024-12-31|0|0
-2025-01-31|0|0
-2025-02-28|0|0
-```
-"""
-
-REVENUE_ANALYTICS_TOP_CUSTOMERS_EXAMPLE_PROMPT = """
-You are given a table with the results of a revenue analytics top customers query. Values are separated by the pipe character "|" and rows are separated by newlines. The first row is the header row with the different sources and breakdowns. The other rows are the results of the query.
-The results might be grouped by month or a total sum for the whole period. The table will specify the grouping.
-When referencing these numbers, make sure you're using the proper currency prefix based on the project's base currency.
-
-Example 1 - grouped by month:
-```
-Top customers for period: 2024-11-01 to 2025-02-01
-Grouped by month
-Customer Name|2025-02-01|2025-03-01
-John Doe|5.23615|73.23614
-Jane Doe|26.01009|84.0101
-John Doe Jr Jr|668.67503|864.03
-Jane Smith|85.47825|84.25
-John Smith|615.99731|814.915
-John Doe Jr|1105.82156|8104.56
-```
-
-Example 2 - grouped by all:
-```
-Top customers for period: 2024-11-01 to 2025-02-01
-Customer Name|Revenue
-John Doe Jr|1105.82156
-John Doe Jr Jr|668.67503
-John Smith|615.99731
-Jane Smith|85.47825
-Jane Doe|26.01009
-John Doe|5.23615
-```
-"""
+""".strip()
 
 FALLBACK_EXAMPLE_PROMPT = "You'll be given a JSON object with the results of a query."

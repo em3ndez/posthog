@@ -5,6 +5,7 @@ import { IconPerson } from '@posthog/icons'
 
 import { AnimatedCollapsible } from 'lib/components/AnimatedCollapsible'
 import { useOnMountEffect } from 'lib/hooks/useOnMountEffect'
+import { IconOpenInNew } from 'lib/lemon-ui/icons'
 import { LemonButton } from 'lib/lemon-ui/LemonButton'
 import { LemonInput } from 'lib/lemon-ui/LemonInput'
 import { LemonRadio } from 'lib/lemon-ui/LemonRadio'
@@ -12,12 +13,11 @@ import { LemonSwitch } from 'lib/lemon-ui/LemonSwitch'
 import { LemonTextArea } from 'lib/lemon-ui/LemonTextArea'
 import { Link } from 'lib/lemon-ui/Link'
 import { Spinner } from 'lib/lemon-ui/Spinner'
-import { IconOpenInNew } from 'lib/lemon-ui/icons'
-import { urls } from 'scenes/urls'
 
 import { ToolbarMenu } from '~/toolbar/bar/ToolbarMenu'
 import { flagsToolbarLogic } from '~/toolbar/flags/flagsToolbarLogic'
 import { toolbarConfigLogic } from '~/toolbar/toolbarConfigLogic'
+import { urls } from '~/toolbar/urls'
 import { joinWithUiHost } from '~/toolbar/utils'
 
 export const FlagsToolbarMenu = (): JSX.Element => {

@@ -11,32 +11,93 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from django.conf import settings
+from django.db import InterfaceError, OperationalError, close_old_connections
+from django.db.models import QuerySet
 
 import structlog
+from celery.exceptions import SoftTimeLimitExceeded
 from prometheus_client import Counter
+from tenacity import RetryCallState, Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from posthog.models.team.team import Team
 from posthog.storage.hypercache_manager import HyperCacheManagementConfig, batch_check_expiry_tracking
 
 logger = structlog.get_logger(__name__)
 
+# Verifies one team's cache: (team, db_batch_data, cache_batch_data) -> dict with "status" and "issue".
+VerifyTeamFn = Callable[[Team, dict | None, dict | None], dict]
+
 # Number of batches between progress logs (balance between log spam and visibility)
 # With 250 teams/batch and ~238K teams, we have ~950 batches. Logging every 20
 # batches gives us ~48 progress logs total.
 PROGRESS_LOG_BATCH_INTERVAL = 20
 
-# Prometheus counter for tracking fixes during scheduled verification
+# Prometheus counter for tracking fixes during scheduled verification. `writer`
+# attributes the fix to the team's primary cache writer (see
+# HyperCacheManagementConfig.get_primary_writer_fn); "python" when unattributed.
 HYPERCACHE_VERIFY_FIX_COUNTER = Counter(
     "posthog_hypercache_verify_fixes_total",
     "Cache entries fixed during scheduled verification",
-    labelnames=["cache_type", "issue_type"],
+    labelnames=["cache_type", "issue_type", "writer"],
 )
 
 # Maximum number of team IDs to store for logging
 MAX_FIXED_TEAM_IDS_TO_LOG = 10
 
+# Maximum number of per-team fix detail logs emitted at INFO per verification run.
+MAX_FIX_DETAIL_INFO_LOGS = 10
 
-@dataclass
+# A verification sweep pages through every team on one long-lived Django connection.
+# Poolers rotate and drop that connection mid-sweep, so the batch fetch retries with a
+# fresh connection rather than throwing away a partially-completed run.
+TEAM_BATCH_FETCH_MAX_ATTEMPTS = 4
+TEAM_BATCH_FETCH_BACKOFF_SECONDS = 1.0
+
+
+class TeamBatchFetchError(Exception):
+    """A team batch could not be fetched after exhausting connection retries."""
+
+
+def _fetch_team_batch(base_qs: QuerySet[Team], last_id: int, chunk_size: int) -> list[Team]:
+    """Fetch the next page of teams, reconnecting to Postgres on a dropped connection.
+
+    Django's ``ensure_connection`` only reconnects when the connection object is
+    ``None``, so a connection psycopg has already closed keeps raising until it is
+    discarded, hence the explicit ``close_old_connections()`` between attempts.
+
+    The Temporal sibling is ``posthog.temporal.common.utils.retry_on_db_connection_drop``,
+    which retries only once because activities carry an outer retry policy. This Celery
+    sweep has none, so it backs off across attempts and raises ``TeamBatchFetchError``
+    for the task to classify the wind-down.
+    """
+
+    def _reconnect_and_log(retry_state: RetryCallState) -> None:
+        error = retry_state.outcome.exception() if retry_state.outcome else None
+        logger.warning(
+            "Team batch fetch failed, reconnecting and retrying",
+            last_team_id=last_id,
+            attempt=retry_state.attempt_number,
+            error=str(error),
+        )
+        close_old_connections()
+
+    fetch_with_retry = Retrying(
+        retry=retry_if_exception_type((OperationalError, InterfaceError)),
+        stop=stop_after_attempt(TEAM_BATCH_FETCH_MAX_ATTEMPTS),
+        wait=wait_exponential(multiplier=TEAM_BATCH_FETCH_BACKOFF_SECONDS, max=10),
+        before_sleep=_reconnect_and_log,
+        reraise=True,
+    )
+
+    try:
+        return fetch_with_retry(lambda: list(base_qs.filter(id__gt=last_id)[:chunk_size]))
+    except (OperationalError, InterfaceError) as e:
+        raise TeamBatchFetchError(
+            f"Failed to fetch team batch after {TEAM_BATCH_FETCH_MAX_ATTEMPTS} attempts (last_team_id={last_id})"
+        ) from e
+
+
+@dataclass(frozen=False)
 class VerificationResult:
     """Result of verifying all teams' caches."""
 
@@ -49,6 +110,12 @@ class VerificationResult:
     skipped_for_grace_period: int = 0
     fixed_team_ids: list[int] = field(default_factory=list)
     skipped_team_ids: list[int] = field(default_factory=list)
+    # Per-run logging cap state, not a verification outcome.
+    fix_detail_info_logs_emitted: int = 0
+    # True when the sweep hit its monotonic deadline and wound down before
+    # covering every team, so the caller can record the wind-down. Per-run state,
+    # not a verification outcome.
+    wound_down_early: bool = False
 
     @property
     def total_fixed(self) -> int:
@@ -77,16 +144,21 @@ class VerificationResult:
 
 def verify_and_fix_all_teams(
     config: HyperCacheManagementConfig,
-    verify_team_fn: Callable[[Team, dict | None, dict | None], dict],
+    verify_team_fn: VerifyTeamFn,
     cache_type: str,
     chunk_size: int | None = None,
+    *,
+    stop_time: float | None = None,
 ) -> VerificationResult:
     """
-    Verify all teams' caches and auto-fix any issues.
+    Verify caches for teams in the configured scope and auto-fix any issues.
 
-    Processes teams in chunks using seek-based pagination for memory efficiency.
-    For each team, calls verify_team_fn to check cache consistency. If issues
-    are found, automatically fixes them using config.update_fn.
+    Uses ``config.get_teams_queryset()`` to determine scope — if a queryset
+    function is configured, only those teams are processed; otherwise all teams
+    are verified, and teams are processed in chunks using seek-based pagination
+    for memory efficiency. For each team,
+    calls verify_team_fn to check cache consistency. If issues are found,
+    automatically fixes them using config.update_fn.
 
     Args:
         config: HyperCache management configuration with update_fn
@@ -95,6 +167,9 @@ def verify_and_fix_all_teams(
         cache_type: Name for metrics/logging (e.g., "team_metadata", "flags")
         chunk_size: Number of teams to process per batch. Defaults to
             settings.FLAGS_CACHE_VERIFICATION_CHUNK_SIZE (the more conservative setting).
+        stop_time: Monotonic deadline (from ``time.monotonic()``). When set, the sweep
+            winds down at the first batch boundary past it, returning a partial result
+            instead of running until Celery's hard time limit SIGKILLs the worker.
 
     Returns:
         VerificationResult with stats and list of fixed team IDs
@@ -111,30 +186,11 @@ def verify_and_fix_all_teams(
     result = VerificationResult()
     last_id = 0
 
-    # Pre-compute team IDs needing full verification if optimization is configured.
-    # For flags cache, this is ~20K teams with flags vs 238K total teams.
-    # This allows skipping expensive DB loads for teams with empty caches.
-    team_ids_needing_full_verification: set[int] | None = None
-    if config.get_team_ids_needing_full_verification_fn is not None:
-        try:
-            team_ids_needing_full_verification = config.get_team_ids_needing_full_verification_fn()
-            logger.info(
-                "Loaded team IDs needing full verification",
-                cache_type=cache_type,
-                count=len(team_ids_needing_full_verification),
-            )
-        except Exception as e:
-            logger.warning(
-                "Failed to load team IDs for optimization, falling back to full verification",
-                cache_type=cache_type,
-                error=str(e),
-            )
+    base_qs = config.narrow_team_queryset(config.get_teams_queryset()).order_by("id")
 
     batch_number = 0
     while True:
-        teams = list(
-            Team.objects.filter(id__gt=last_id).select_related("organization", "project").order_by("id")[:chunk_size]
-        )
+        teams = _fetch_team_batch(base_qs, last_id, chunk_size)
 
         if not teams:
             break
@@ -142,33 +198,55 @@ def verify_and_fix_all_teams(
         batch_number += 1
         batch_start = result.total
         batch_fixes_start = result.total_fixed
+        batch_fix_failures_start = result.fix_failed
 
-        _verify_and_fix_batch(teams, config, verify_team_fn, cache_type, result, team_ids_needing_full_verification)
+        _verify_and_fix_batch(teams, config, verify_team_fn, cache_type, result)
 
         batch_verified = result.total - batch_start
         batch_fixed = result.total_fixed - batch_fixes_start
+        batch_fix_failures = result.fix_failed - batch_fix_failures_start
 
         # Log periodically to avoid log spam while still showing progress
+        log_message = None
         if batch_number % PROGRESS_LOG_BATCH_INTERVAL == 0:
-            logger.info(
-                "Verification progress",
-                cache_type=cache_type,
-                batch_number=batch_number,
-                teams_verified_total=result.total,
-                teams_fixed_total=result.total_fixed,
-                last_team_id=teams[-1].id,
-            )
+            log_message = "Verification progress"
         elif batch_fixed > 0:
-            # Always log batches that had fixes
+            log_message = "Batch completed with fixes"
+
+        if log_message:
             logger.info(
-                "Batch completed with fixes",
+                log_message,
                 cache_type=cache_type,
                 batch_number=batch_number,
                 batch_verified=batch_verified,
                 batch_fixed=batch_fixed,
+                batch_fix_failures=batch_fix_failures,
                 teams_verified_total=result.total,
                 teams_fixed_total=result.total_fixed,
+                cache_miss_fixed_total=result.cache_miss_fixed,
+                cache_mismatch_fixed_total=result.cache_mismatch_fixed,
+                expiry_missing_fixed_total=result.expiry_missing_fixed,
+                fix_failures_total=result.fix_failed,
+                last_team_id=teams[-1].id,
             )
+
+        # Wind down at a batch boundary once the deadline passes, so the run ends
+        # cleanly and records the wind-down instead of being SIGKILLed mid-batch past
+        # the hard time limit (which reports nothing). The cursor is not persisted, so
+        # the next cycle restarts from id 0 rather than resuming here: a run that winds
+        # down repeatedly leaves the same tail of high-id teams unverified until it can
+        # finish within the deadline. Only wind down when teams actually remain: a
+        # deadline that trips on the final batch has already covered every team, so it
+        # completed rather than winding down early.
+        if stop_time is not None and time.monotonic() > stop_time and _fetch_team_batch(base_qs, teams[-1].id, 1):
+            result.wound_down_early = True
+            logger.warning(
+                "Cache verification wound down early, deadline reached",
+                cache_type=cache_type,
+                teams_verified_total=result.total,
+                last_team_id=teams[-1].id,
+            )
+            break
 
         last_id = teams[-1].id
 
@@ -181,40 +259,12 @@ def verify_and_fix_all_teams(
     return result
 
 
-def _partition_teams_for_verification(
-    teams: list[Team],
-    team_ids_needing_full_verification: set[int] | None,
-    config: HyperCacheManagementConfig,
-) -> tuple[list[Team], list[Team]]:
-    """
-    Split teams into those needing full DB verification vs fast-path empty check.
-
-    Args:
-        teams: List of Team objects to partition
-        team_ids_needing_full_verification: Set of team IDs that have data requiring full verification.
-            If None, all teams use full verification.
-        config: HyperCache management configuration
-
-    Returns:
-        Tuple of (teams_for_full_check, teams_for_empty_check)
-    """
-    if team_ids_needing_full_verification is not None and config.empty_cache_value is not None:
-        teams_for_full_check = [t for t in teams if t.id in team_ids_needing_full_verification]
-        teams_for_empty_check = [t for t in teams if t.id not in team_ids_needing_full_verification]
-    else:
-        teams_for_full_check = teams
-        teams_for_empty_check = []
-
-    return teams_for_full_check, teams_for_empty_check
-
-
 def _verify_and_fix_batch(
     teams: list[Team],
     config: HyperCacheManagementConfig,
-    verify_team_fn: Callable[[Team, dict | None, dict | None], dict],
+    verify_team_fn: VerifyTeamFn,
     cache_type: str,
     result: VerificationResult,
-    team_ids_needing_full_verification: set[int] | None = None,
 ) -> None:
     """
     Verify and fix a batch of teams.
@@ -225,12 +275,12 @@ def _verify_and_fix_batch(
         verify_team_fn: Function to verify a single team (team, db_batch_data, cache_batch_data)
         cache_type: Name for metrics/logging
         result: VerificationResult to accumulate stats
-        team_ids_needing_full_verification: If provided, only load DB data for teams in this set.
-            Teams not in this set use fast-path verification against empty_cache_value.
     """
     # Batch-read cached values using MGET (single Redis round trip)
     try:
         cache_batch_data = config.hypercache.batch_get_from_cache(teams)
+    except SoftTimeLimitExceeded:
+        raise
     except Exception as e:
         logger.warning("Batch cache read failed, falling back to individual lookups", error=str(e))
         cache_batch_data = {}
@@ -244,43 +294,50 @@ def _verify_and_fix_batch(
     if config.get_team_ids_to_skip_fix_fn:
         try:
             team_ids_to_skip_fix = config.get_team_ids_to_skip_fix_fn([t.id for t in teams])
+        except SoftTimeLimitExceeded:
+            raise
         except Exception as e:
             logger.warning("Batch skip-fix check failed, proceeding without skips", error=str(e))
 
-    # Partition teams into full verification vs fast-path empty check
-    teams_for_full_check, teams_for_empty_check = _partition_teams_for_verification(
-        teams, team_ids_needing_full_verification, config
-    )
-
-    # Batch-load DB data only for teams that need full verification
+    # Batch-load DB data for all teams in the batch
     db_batch_data = None
-    if teams_for_full_check and config.hypercache.batch_load_fn:
+    if config.hypercache.batch_load_fn:
         try:
-            db_batch_data = config.hypercache.batch_load_fn(teams_for_full_check)
+            batch_load_start = time.time()
+            db_batch_data = config.hypercache.batch_load_fn(teams)
+            logger.debug(
+                "Batch DB load completed",
+                cache_type=cache_type,
+                team_count=len(teams),
+                duration_seconds=time.time() - batch_load_start,
+            )
+        except SoftTimeLimitExceeded:
+            raise
         except Exception as e:
             logger.warning("Batch load failed, falling back to individual loads", error=str(e))
 
-    # Fast-path: verify teams that should have empty caches
-    for team in teams_for_empty_check:
-        result.total += 1
-        try:
-            _verify_empty_cache_team(
-                team, config, cache_batch_data, expiry_status, cache_type, result, team_ids_to_skip_fix
-            )
-        except Exception as e:
-            result.errors += 1
-            logger.exception("Error verifying team (empty check)", team_id=team.id, error=str(e))
-
-    # Full verification for teams that have data
-    for team in teams_for_full_check:
+    for team in teams:
         result.total += 1
 
         try:
             verification = verify_team_fn(team, db_batch_data, cache_batch_data)
+        except SoftTimeLimitExceeded:
+            # The task ran out of time, not the verify call. Let it propagate so the
+            # run winds down instead of looping through the remaining teams; this
+            # team is re-verified on the next cycle.
+            raise
         except Exception as e:
             result.errors += 1
             logger.exception("Error verifying team", team_id=team.id, error=str(e))
             continue
+
+        # Ensure db_data is available for cache fixes even if the verify
+        # function didn't include it. This avoids a redundant per-team DB
+        # query inside _fix_and_record.
+        if "db_data" not in verification and db_batch_data:
+            db_data = db_batch_data.get(team.id)
+            if db_data is not None:
+                verification["db_data"] = db_data
 
         status = verification["status"]
 
@@ -297,8 +354,15 @@ def _verify_and_fix_batch(
                 issue_type = "expiry_missing"
 
         if issue_type:
-            # Check if we should skip fixing (e.g., grace period for recently updated flags)
-            if team.id in team_ids_to_skip_fix:
+            # The grace period guards against clobbering an in-flight async rebuild,
+            # which only matters when an entry EXISTS (mismatch/expiry). A full
+            # cache_miss has nothing to clobber and hard-fails no-DB-fallback readers
+            # (e.g. the Rust /flags/definitions endpoint → 503). This routine is shared
+            # by every hypercache, so the miss exemption is opt-in per config: only the
+            # flag_definitions caches set repair_miss_during_grace_period; read-through
+            # caches (flags, team_metadata) cold-load on miss and keep the skip.
+            repair_miss = issue_type == "cache_miss" and config.repair_miss_during_grace_period
+            if not repair_miss and team.id in team_ids_to_skip_fix:
                 result.skipped_for_grace_period += 1
                 if len(result.skipped_team_ids) < MAX_FIXED_TEAM_IDS_TO_LOG:
                     result.skipped_team_ids.append(team.id)
@@ -316,75 +380,8 @@ def _verify_and_fix_batch(
                 issue_type=issue_type,
                 cache_type=cache_type,
                 result=result,
-                verification=verification if status == "mismatch" else None,
-                db_data=db_batch_data.get(team.id) if db_batch_data else None,
+                verification=verification,
             )
-
-
-def _verify_empty_cache_team(
-    team: Team,
-    config: HyperCacheManagementConfig,
-    cache_batch_data: dict,
-    expiry_status: dict | None,
-    cache_type: str,
-    result: VerificationResult,
-    team_ids_to_skip_fix: set[int],
-) -> None:
-    """
-    Fast-path verification for teams expected to have empty cache values.
-
-    This avoids loading DB data for teams that should have empty caches (e.g., teams with no flags).
-    Just checks that the cached value matches empty_cache_value.
-    """
-    empty_value = config.empty_cache_value
-    if empty_value is None:
-        raise ValueError(
-            f"empty_cache_value must be configured to verify team {team.id} as empty, "
-            "but config.empty_cache_value is None"
-        )
-
-    # Get cached data from batch
-    cached_entry = cache_batch_data.get(team.id)
-    if cached_entry:
-        cached_data, source = cached_entry
-    else:
-        cached_data, source = None, "miss"
-
-    # Determine issue type (if any)
-    # Note: batch_get_from_cache only returns "redis" or "miss" sources (never "db")
-    issue_type: str | None = None
-    if source == "miss" or cached_data is None:
-        issue_type = "cache_miss"
-    elif cached_data != empty_value:
-        issue_type = "cache_mismatch"
-    else:
-        # Cache matches - check expiry tracking
-        identifier = config.hypercache.get_cache_identifier(team)
-        if expiry_status and not expiry_status.get(identifier, True):
-            issue_type = "expiry_missing"
-
-    if issue_type:
-        # Check if we should skip fixing (e.g., grace period for recently updated flags)
-        if team.id in team_ids_to_skip_fix:
-            result.skipped_for_grace_period += 1
-            if len(result.skipped_team_ids) < MAX_FIXED_TEAM_IDS_TO_LOG:
-                result.skipped_team_ids.append(team.id)
-            logger.debug(
-                "Skipping fix due to grace period",
-                team_id=team.id,
-                issue_type=issue_type,
-                cache_type=cache_type,
-            )
-            return
-
-        _fix_and_record(
-            team=team,
-            config=config,
-            issue_type=issue_type,
-            cache_type=cache_type,
-            result=result,
-            db_data=empty_value,
-        )
 
 
 def _fix_and_record(
@@ -394,8 +391,7 @@ def _fix_and_record(
     issue_type: str,
     cache_type: str,
     result: VerificationResult,
-    verification: dict | None = None,
-    db_data: dict | None = None,
+    verification: dict,
 ) -> None:
     """
     Fix a team's cache and record the result.
@@ -406,26 +402,50 @@ def _fix_and_record(
         issue_type: Type of issue (cache_miss, cache_mismatch, expiry_missing)
         cache_type: Cache type for metrics
         result: VerificationResult to update
-        verification: Optional verification result dict containing diff info
-        db_data: Pre-loaded DB data to avoid redundant query during fix
+        verification: Verification result dict containing diff info.
+            If it contains a "db_data" key, that data is written directly to
+            cache to avoid a redundant DB query.
     """
+    writer = "python"
+    if config.get_primary_writer_fn is not None:
+        try:
+            writer = config.get_primary_writer_fn(team.id)
+        except SoftTimeLimitExceeded:
+            # The task ran out of time during attribution, not an attribution
+            # failure. Let it propagate so the run winds down, matching the write
+            # path below and the other guards in this file.
+            raise
+        except Exception:
+            # Attribution must never fail the repair itself.
+            writer = "unknown"
+
     # Log what's being fixed, including diff details for mismatches
-    log_kwargs: dict = {"team_id": team.id, "issue_type": issue_type, "cache_type": cache_type}
-    if verification:
-        if "diff_fields" in verification:
-            log_kwargs["diff_fields"] = verification["diff_fields"]
-        if "diff_flags" in verification:
-            log_kwargs["diff_flags"] = verification["diff_flags"]
-    logger.info("Fixing cache entry", **log_kwargs)
+    log_kwargs: dict = {"team_id": team.id, "issue_type": issue_type, "cache_type": cache_type, "writer": writer}
+    if "diff_fields" in verification:
+        log_kwargs["diff_fields"] = verification["diff_fields"]
+    if "diff_flags" in verification:
+        log_kwargs["diff_flags"] = verification["diff_flags"]
+    if result.fix_detail_info_logs_emitted < MAX_FIX_DETAIL_INFO_LOGS:
+        logger.info("Fixing cache entry", **log_kwargs)
+        result.fix_detail_info_logs_emitted += 1
 
     try:
-        # If we have pre-loaded DB data, write it directly to cache to avoid redundant DB query
-        if db_data is not None:
-            config.hypercache.set_cache_value(team, db_data)
+        # Use preloaded db_data if available to avoid redundant DB query
+        if "db_data" in verification:
+            # The direct write bypasses update_fn's internal guards, so apply the
+            # config's write guard here too (e.g. refuse to cache an emptied
+            # group_type_mapping over populated data). A veto is neither fix nor failure.
+            if config.should_skip_write is not None and config.should_skip_write(team, verification["db_data"]):
+                return
+            config.hypercache.set_cache_value(team, verification["db_data"])
             success = True
         else:
-            # Fall back to update_fn which will load from DB
             success = config.update_fn(team)
+    except SoftTimeLimitExceeded:
+        # The task ran out of time mid-write, not a cache/storage failure. Let it
+        # propagate so the run winds down instead of logging a misleading error and
+        # continuing; this team is re-fixed on the next cycle.
+        raise
     except Exception as e:
         success = False
         logger.exception("Error fixing cache", team_id=team.id, issue_type=issue_type, error=str(e))
@@ -442,16 +462,17 @@ def _fix_and_record(
         result.fixed_team_ids.append(team.id)
 
         # Update Prometheus metric
-        HYPERCACHE_VERIFY_FIX_COUNTER.labels(cache_type=cache_type, issue_type=issue_type).inc()
+        HYPERCACHE_VERIFY_FIX_COUNTER.labels(cache_type=cache_type, issue_type=issue_type, writer=writer).inc()
     else:
         result.fix_failed += 1
 
 
 def _run_verification_for_cache(
     config: HyperCacheManagementConfig,
-    verify_team_fn: Callable[[Team, dict | None, dict | None], dict],
+    verify_team_fn: VerifyTeamFn,
     cache_type: str,
     chunk_size: int,
+    stop_time: float | None = None,
 ) -> VerificationResult:
     """
     Run verification for a single cache type and log results.
@@ -461,6 +482,8 @@ def _run_verification_for_cache(
         verify_team_fn: Function to verify a single team
         cache_type: Name for metrics/logging
         chunk_size: Number of teams to process per batch
+        stop_time: Monotonic deadline forwarded to verify_and_fix_all_teams for
+            early wind-down.
 
     Returns:
         VerificationResult with stats
@@ -473,6 +496,7 @@ def _run_verification_for_cache(
         verify_team_fn=verify_team_fn,
         cache_type=cache_type,
         chunk_size=chunk_size,
+        stop_time=stop_time,
     )
 
     duration = time.time() - start_time

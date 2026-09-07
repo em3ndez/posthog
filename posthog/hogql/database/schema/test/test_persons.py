@@ -22,7 +22,9 @@ from posthog.schema import (
     EventsNode,
     FilterLogicalOperator,
     HogQLQueryModifiers,
+    InCohortVia,
     InsightActorsQuery,
+    PersonsArgMaxVersion,
     PersonsOnEventsMode,
     TrendsQuery,
 )
@@ -33,9 +35,14 @@ from posthog.hogql.modifiers import create_default_modifiers_for_team
 from posthog.hogql.parser import parse_select
 from posthog.hogql.query import execute_hogql_query
 
+from posthog.clickhouse.client.execute import sync_execute
 from posthog.hogql_queries.actors_query_runner import ActorsQueryRunner
 from posthog.hogql_queries.insights.trends.trends_query_runner import TrendsQueryRunner
 from posthog.models.person.util import create_person
+from posthog.uuidt import UUIDT
+
+from products.cohorts.backend.models.cohort import Cohort
+from products.cohorts.backend.models.util import recalculate_cohortpeople
 
 
 @patch("posthoganalytics.feature_enabled", new=Mock(return_value=True))  # for persons-inner-where-optimization
@@ -157,6 +164,125 @@ class TestPersonOptimization(ClickhouseTestMixin, APIBaseTest):
         self.assertNotIn("in(tuple(person.id, person.version)", response.clickhouse)
 
 
+class TestPersonsV2LimitPushDown(ClickhouseTestMixin, APIBaseTest):
+    """Tests for the V2 argmax ORDER BY / LIMIT push-down into the inner subquery.
+
+    The optimization pushes ORDER BY + LIMIT into the inner deduplication
+    subquery so ClickHouse doesn't have to deduplicate every person.
+    It is only safe when there's no outer WHERE that would filter rows
+    after the inner query -- otherwise the LIMIT excludes valid rows
+    before the filter runs.
+    """
+
+    def _v2_modifiers(self) -> HogQLQueryModifiers:
+        modifiers = create_default_modifiers_for_team(self.team)
+        modifiers.personsArgMaxVersion = PersonsArgMaxVersion.V2
+        modifiers.personsOnEventsMode = PersonsOnEventsMode.DISABLED
+        return modifiers
+
+    @snapshot_clickhouse_queries
+    def test_v2_order_by_and_limit_pushed_down(self):
+        """ORDER BY + LIMIT are pushed into the inner subquery when there's no WHERE."""
+        _create_person(team_id=self.team.pk, distinct_ids=["p1"], properties={"$some_prop": "a"})
+        _create_person(team_id=self.team.pk, distinct_ids=["p2"], properties={"$some_prop": "b"})
+        flush_persons_and_events()
+
+        response = execute_hogql_query(
+            parse_select("SELECT id, properties.$some_prop FROM persons ORDER BY created_at DESC LIMIT 2"),
+            self.team,
+            modifiers=self._v2_modifiers(),
+        )
+        assert response.clickhouse is not None
+        assert "in(tuple(person.id, person.version)" in response.clickhouse
+        # LIMIT is pushed into the inner subquery
+        assert "LIMIT 3" in response.clickhouse
+        assert len(response.results) == 2
+
+    @snapshot_clickhouse_queries
+    def test_v2_cohort_where_does_not_push_limit_down(self):
+        """When there's an outer WHERE (e.g. a cohort filter), ORDER BY and LIMIT
+        must not be pushed into the inner subquery. Otherwise the inner LIMIT
+        restricts the person set before the cohort filter runs, and valid
+        cohort members get excluded."""
+        random_uuid = f"RANDOM_TEST_ID::{UUIDT()}"
+        cohort_prop_value = f"cohort_match_{random_uuid}"
+        _create_person(
+            properties={"email": "cohort_member@example.com", "cohort_marker": cohort_prop_value},
+            team=self.team,
+            distinct_ids=[f"cohort_member_{random_uuid}"],
+            is_identified=True,
+        )
+        for i in range(10):
+            _create_person(
+                properties={"email": f"user{i}@example.com", "cohort_marker": "no_match"},
+                team=self.team,
+                distinct_ids=[f"non_cohort_{i}_{random_uuid}"],
+                is_identified=True,
+            )
+        sync_execute("OPTIMIZE TABLE person FINAL")
+        cohort = Cohort.objects.create(
+            team=self.team,
+            groups=[{"properties": [{"key": "cohort_marker", "value": cohort_prop_value, "type": "person"}]}],
+        )
+        recalculate_cohortpeople(cohort, pending_version=0, initiating_user_id=None)
+
+        modifiers = self._v2_modifiers()
+        modifiers.inCohortVia = InCohortVia.LEFTJOIN_CONJOINED
+
+        response = execute_hogql_query(
+            f"SELECT id, properties.email FROM persons WHERE id IN COHORT {cohort.pk} ORDER BY created_at DESC LIMIT 3",
+            self.team,
+            modifiers=modifiers,
+            pretty=False,
+        )
+        assert response.clickhouse is not None
+        # V2 path is used but LIMIT is NOT pushed into the inner subquery
+        assert "in(tuple(person.id, person.version)" in response.clickhouse
+        # The inner GROUP BY subquery should have no LIMIT
+        assert "LIMIT 4" not in response.clickhouse
+        # The cohort member is correctly returned
+        assert len(response.results) == 1
+        assert response.results[0][1] == "cohort_member@example.com"
+
+    @parameterized.expand(
+        [
+            # (name, query, LIMIT that a wrongly pushed-down limit+offset+1 would print in the inner subquery)
+            ("aggregate", "SELECT count() FROM persons", "LIMIT 101"),
+            ("distinct", "SELECT DISTINCT is_identified FROM persons LIMIT 2", "LIMIT 3"),
+            ("window", "SELECT id, count() OVER () FROM persons LIMIT 10", "LIMIT 11"),
+            # HAVING acts as a post-dedup filter, like the WHERE case test_v2_cohort_where covers.
+            ("having", "SELECT id FROM persons HAVING is_identified = 0 LIMIT 5", "LIMIT 6"),
+        ]
+    )
+    @snapshot_clickhouse_queries
+    def test_v2_full_row_set_selects_do_not_push_limit_down(self, _name, query, pushed_down_limit):
+        response = execute_hogql_query(query, self.team, modifiers=self._v2_modifiers(), pretty=False)
+        assert response.clickhouse is not None
+        assert "in(tuple(person.id, person.version)" in response.clickhouse
+        assert pushed_down_limit not in response.clickhouse
+
+    @parameterized.expand(
+        [
+            # (name, query, pin v2 modifiers, index of the total in the result row)
+            ("count_v2", "SELECT count() FROM persons LIMIT 1", True, 0),
+            ("count_default", "SELECT count() FROM persons LIMIT 1", False, 0),
+            ("window_total_v2", "SELECT id, count() OVER () AS total FROM persons LIMIT 1", True, 1),
+        ]
+    )
+    def test_totals_over_persons_are_not_capped_by_limit(self, _name, query, pin_v2, result_index):
+        for i in range(3):
+            _create_person(team_id=self.team.pk, distinct_ids=[f"count_person_{i}"])
+        flush_persons_and_events()
+
+        response = execute_hogql_query(
+            query,
+            self.team,
+            modifiers=self._v2_modifiers() if pin_v2 else None,
+            pretty=False,
+        )
+        assert response.results[0][result_index] == 3
+
+
 class TestPersons(ClickhouseTestMixin, APIBaseTest):
     person_properties = {"$initial_referring_domain": "https://google.com"}
     poe_properties = {"$initial_referring_domain": "https://facebook.com", "$initial_utm_medium": "cpc"}
@@ -220,10 +346,13 @@ class TestPersons(ClickhouseTestMixin, APIBaseTest):
         assert response.results[0][0] == self.channel_type_virt_person_result
 
     def test_virtual_event_person_properties(self):
+        # Pin the joined mode so person.* resolves through the person table; the
+        # poe and pdi variants below cover the other resolutions explicitly.
         response = execute_hogql_query(
             parse_select("select person.$virt_initial_channel_type from events where person.id = {person_id}"),
             self.team,
             placeholders={"person_id": ast.Constant(value=self.person.uuid)},
+            modifiers=HogQLQueryModifiers(personsOnEventsMode=PersonsOnEventsMode.DISABLED),
         )
         assert len(response.results) == 1
         assert response.results[0][0] == self.channel_type_virt_person_result
@@ -400,3 +529,99 @@ class TestVirtualFieldDetection(APIBaseTest):
 
         result = _is_virtual_field_requiring_join(mock_node)  # type: ignore
         self.assertFalse(result, "Malformed AST should return False without exception")
+
+
+class TestArgMaxNonNullableSimplification(ClickhouseTestMixin, APIBaseTest):
+    """`tupleElement(argMax(tuple(X), version), 1)` is simplified to `argMax(X, version)` only when X
+    is non-nullable.
+
+    The tuple() wrap is load-bearing for nullable columns: ClickHouse `argMax(x, v)` returns the
+    closest *non-null* x, so over a nullable column it would return a stale earlier value instead of
+    the latest one when that latest value is NULL. Every correctness test below creates a person whose
+    LATEST version unsets a property and asserts the latest (NULL) value wins — which is exactly what
+    breaks if the wrap is wrongly dropped (the query would return the stale earlier value instead).
+    """
+
+    def _modifiers(self) -> HogQLQueryModifiers:
+        modifiers = create_default_modifiers_for_team(self.team)
+        modifiers.personsOnEventsMode = PersonsOnEventsMode.DISABLED
+        return modifiers
+
+    def _person_unsetting_prop_in_latest_version(self, distinct_id: str, prop: str):
+        person = _create_person(
+            team_id=self.team.pk,
+            distinct_ids=[distinct_id],
+            properties={prop: "stale_old_value", "untouched": "keep"},
+            version=1,
+            created_at=datetime(2024, 1, 1, 12),
+        )
+        # Latest version no longer carries `prop`, so its value is NULL.
+        create_person(
+            team_id=self.team.pk,
+            uuid=str(person.uuid),
+            properties={"untouched": "keep"},
+            version=2,
+            created_at=datetime(2024, 1, 1, 12),
+        )
+        flush_persons_and_events()
+        return person
+
+    @parameterized.expand(
+        [
+            # (label, property, materialize_first, expected source-read marker in the SQL)
+            ("json", "jsonprop", False, "JSONExtractRaw(person.properties"),
+            ("materialized", "matprop", True, "pmat_matprop"),
+        ]
+    )
+    @snapshot_clickhouse_queries
+    def test_nullable_property_keeps_wrap_and_latest_null_wins(self, label, prop, materialize_first, read_marker):
+        if materialize_first:
+            from ee.clickhouse.materialized_columns.analyze import materialize  # noqa: PLC0415
+
+            materialize("person", prop, is_nullable=True)
+        person = self._person_unsetting_prop_in_latest_version(f"null-{label}", prop)
+        response = execute_hogql_query(
+            parse_select(f"SELECT properties.{prop}, properties.untouched FROM persons WHERE id = {{pid}}"),
+            self.team,
+            placeholders={"pid": ast.Constant(value=person.uuid)},
+            modifiers=self._modifiers(),
+        )
+        # The latest version unset the property, so NULL must win; a dropped wrap would make argMax skip the NULL and return the stale earlier value.
+        assert response.results[0][0] is None
+        assert response.results[0][1] == "keep"
+        # The nullable read (JSON extract or materialized column) stays wrapped.
+        assert response.clickhouse is not None
+        assert read_marker in response.clickhouse
+        assert "tupleElement(argMax(tuple(" in response.clickhouse
+
+    @snapshot_clickhouse_queries
+    def test_non_nullable_columns_are_simplified(self):
+        person = self._person_unsetting_prop_in_latest_version("nonnull-cols", "jsonprop")
+        response = execute_hogql_query(
+            parse_select("SELECT id, created_at FROM persons WHERE id = {pid}"),
+            self.team,
+            placeholders={"pid": ast.Constant(value=person.uuid)},
+            modifiers=self._modifiers(),
+        )
+        assert response.clickhouse is not None
+        # is_deleted and created_at are non-nullable -> plain argMax, no tuple()/tupleElement() wrap.
+        assert "argMax(person.is_deleted, person.version)" in response.clickhouse
+        assert "tupleElement(argMax(tuple(person.is_deleted" not in response.clickhouse
+        assert "tupleElement(argMax(tuple(toTimeZone(person.created_at" not in response.clickhouse
+        assert str(person.uuid) == str(response.results[0][0])
+
+    @snapshot_clickhouse_queries
+    def test_event_person_override_person_id_is_simplified(self):
+        _create_event(event="$pageview", distinct_id="ovr", team=self.team)
+        flush_persons_and_events()
+        response = execute_hogql_query(
+            parse_select("SELECT person_id FROM events WHERE event = '$pageview'"),
+            self.team,
+        )
+        assert response.clickhouse is not None
+        # The person-overrides subquery argMaxes a non-nullable person_id -> simplified.
+        assert (
+            "argMax(person_distinct_id_overrides.person_id, person_distinct_id_overrides.version)"
+            in response.clickhouse
+        )
+        assert "tupleElement(argMax(tuple(person_distinct_id_overrides.person_id" not in response.clickhouse

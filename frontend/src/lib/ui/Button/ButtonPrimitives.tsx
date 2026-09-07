@@ -81,6 +81,12 @@ export const ButtonGroupPrimitive = forwardRef<HTMLDivElement, ButtonGroupProps>
 
     let buttonHeight = 'button-primitive--height-base'
     switch (size) {
+        case 'xxs':
+            buttonHeight = 'button-primitive--height-xxs'
+            break
+        case 'xs':
+            buttonHeight = 'button-primitive--height-xs'
+            break
         case 'sm':
             buttonHeight = 'button-primitive--height-sm'
             break
@@ -285,6 +291,11 @@ export const ButtonPrimitive = forwardRef<HTMLButtonElement, ButtonPrimitiveProp
     const effectiveSize = context?.sizeContext || size
     const effectiveVariant = forceVariant ? variant : context?.variantContext || variant
     let effectiveDisabled = disabledReasons ? Object.values(disabledReasons).some((value) => value) : disabled
+    const externalAriaDisabled = rest['aria-disabled']
+
+    // If there are disabled reasons which are true, render them, otherwise render the tooltip
+    const tooltipTitle = disabledReasons && effectiveDisabled ? renderDisabledReasons(disabledReasons) : tooltip
+    const hasTooltip = !!(tooltipTitle || tooltipDocLink)
 
     let buttonComponent: JSX.Element = React.createElement(
         'button',
@@ -303,12 +314,14 @@ export const ButtonPrimitive = forwardRef<HTMLButtonElement, ButtonPrimitiveProp
                     inert,
                     truncate,
                     className,
-                })
+                }),
+                // A disabled button swallows pointer events, so let the tooltip wrapper span receive them
+                hasTooltip && effectiveDisabled && 'pointer-events-none'
             ),
             ref,
             disabled: effectiveDisabled,
             ...rest,
-            'aria-disabled': effectiveDisabled,
+            'aria-disabled': effectiveDisabled ?? externalAriaDisabled,
             'data-active': active,
             style: {
                 '--button-height': `var(--button-icon-size-${effectiveSize})`,
@@ -317,22 +330,24 @@ export const ButtonPrimitive = forwardRef<HTMLButtonElement, ButtonPrimitiveProp
         children
     )
 
-    if (tooltip || tooltipDocLink || disabledReasons) {
+    if (hasTooltip) {
+        const tooltipChild = effectiveDisabled ? (
+            <span className="inline-flex w-fit">{buttonComponent}</span>
+        ) : (
+            buttonComponent
+        )
+
         buttonComponent = (
             <Tooltip
-                // If there are disabled reasons which are true, render them, otherwise render the tooltip
-                title={
-                    disabledReasons && Object.values(disabledReasons).some(Boolean)
-                        ? renderDisabledReasons(disabledReasons)
-                        : tooltip
-                }
+                title={tooltipTitle}
                 placement={tooltipPlacement}
                 closeDelayMs={tooltipCloseDelayMs}
                 docLink={tooltipDocLink}
                 visible={tooltipVisible}
                 interactive={tooltipInteractive}
+                openOnClick={!!effectiveDisabled}
             >
-                {buttonComponent}
+                {tooltipChild}
             </Tooltip>
         )
     }

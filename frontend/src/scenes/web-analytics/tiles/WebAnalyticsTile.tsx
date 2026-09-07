@@ -2,38 +2,58 @@ import clsx from 'clsx'
 import { BuiltLogic, LogicWrapper, useActions, useValues } from 'kea'
 import { useCallback, useMemo } from 'react'
 
-import { IconChevronDown, IconExternal, IconTrending, IconWarning } from '@posthog/icons'
+import * as starPng from '@posthog/brand/hoggies/png/star'
+import { IconChevronDown, IconExternal, IconTrending, IconUndo, IconWarning } from '@posthog/icons'
 import { LemonSegmentedButton, LemonSelect, Link, Tooltip } from '@posthog/lemon-ui'
 
+import { pngHoggie } from 'lib/brand/hoggies'
 import { getColorVar } from 'lib/colors'
 import { IntervalFilterStandalone } from 'lib/components/IntervalFilter'
 import { parseAliasToReadable } from 'lib/components/PathCleanFilters/PathCleanFilterItem'
 import { ProductIntroduction } from 'lib/components/ProductIntroduction/ProductIntroduction'
 import { PropertyIcon } from 'lib/components/PropertyIcon/PropertyIcon'
-import { StarHog } from 'lib/components/hedgehogs'
 import { FEATURE_FLAGS } from 'lib/constants'
+import { IconOpenInNew, IconTrendingDown, IconTrendingFlat } from 'lib/lemon-ui/icons'
 import { LemonButton } from 'lib/lemon-ui/LemonButton'
 import { LemonSwitch } from 'lib/lemon-ui/LemonSwitch'
 import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
-import { IconOpenInNew, IconTrendingDown, IconTrendingFlat } from 'lib/lemon-ui/icons'
 import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
-import { UnexpectedNeverError, humanFriendlyDuration, percentage, tryDecodeURIComponent } from 'lib/utils'
 import {
     COUNTRY_CODE_TO_LONG_NAME,
     LANGUAGE_CODE_TO_NAME,
     countryCodeToFlag,
     languageCodeToFlag,
-} from 'lib/utils/geography/country'
+} from 'lib/utils/country'
+import { humanFriendlyDuration } from 'lib/utils/durations'
+import { UnexpectedNeverError } from 'lib/utils/guards'
+import { percentage } from 'lib/utils/numbers'
+import { capitalizeFirstLetter } from 'lib/utils/strings'
+import { tryDecodeURIComponent } from 'lib/utils/url'
 import { teamLogic } from 'scenes/teamLogic'
 import { urls } from 'scenes/urls'
 import { userLogic } from 'scenes/userLogic'
+import { botAnalyticsLogic } from 'scenes/web-analytics/botAnalyticsLogic'
 import {
+    BREAKDOWN_NULL_DISPLAY,
+    BREAKDOWN_REFERRER_PREFIX,
+    DEVICE_DRILL_DOWN_MAP,
+    GEOGRAPHY_DRILL_DOWN_MAP,
     GeographyTab,
     ProductTab,
+    SOURCE_DRILL_DOWN_MAP,
+    SourceTab,
     TileId,
     faviconUrl,
     webStatsBreakdownToPropertyName,
 } from 'scenes/web-analytics/common'
+import {
+    buildDataTableTileDataNodeLogicProps,
+    buildInsightVizTileDataNodeLogicProps,
+    ChartTileSkeleton,
+    TableTileSkeleton,
+    WebAnalyticsTileSkeletonGate,
+    WorldMapTileSkeleton,
+} from 'scenes/web-analytics/tiles/skeletons'
 import { webAnalyticsFilterLogic } from 'scenes/web-analytics/webAnalyticsFilterLogic'
 import { webAnalyticsLogic } from 'scenes/web-analytics/webAnalyticsLogic'
 
@@ -49,11 +69,12 @@ import {
     ProductKey,
     QuerySchema,
     WebAnalyticsOrderByFields,
+    WebAnalyticsPropertyFilters,
     WebStatsBreakdown,
     WebVitalsPathBreakdownQuery,
 } from '~/queries/schema/schema-general'
 import { QueryContext, QueryContextColumnComponent, QueryContextColumnTitleComponent } from '~/queries/types'
-import { ChartDisplayType, InsightLogicProps, PropertyFilterType } from '~/types'
+import { ChartDisplayType, InsightLogicProps, PropertyFilterType, PropertyOperator } from '~/types'
 
 import { NewActionButton } from 'products/actions/frontend/components/NewActionButton'
 
@@ -92,13 +113,23 @@ const PAGE_LIKE_BREAKDOWNS = new Set([
     WebStatsBreakdown.FrustrationMetrics,
 ])
 
-const buildOpenUrl = (breakdownBy: WebStatsBreakdown, value: string, effectiveDomain: string | null): string | null => {
+const buildOpenUrl = (
+    breakdownBy: WebStatsBreakdown,
+    value: string,
+    effectiveDomain: string | null,
+    includeHost?: boolean
+): string | null => {
     if (!value || !PAGE_LIKE_BREAKDOWNS.has(breakdownBy)) {
         return null
     }
 
     // For ExitClick, the value is already a full URL
     if (breakdownBy === WebStatsBreakdown.ExitClick) {
+        return value.startsWith('http') ? value : `https://${value}`
+    }
+
+    // When includeHost is true, the value already contains host+path (e.g. example.com/about)
+    if (includeHost) {
         return value.startsWith('http') ? value : `https://${value}`
     }
 
@@ -117,18 +148,22 @@ const buildOpenUrl = (breakdownBy: WebStatsBreakdown, value: string, effectiveDo
     }
 }
 
+const HedgehogStar = pngHoggie(starPng)
+
 const PathValueWithHoverLink = ({
     children,
     breakdownBy,
     value,
+    includeHost,
 }: {
     children: React.ReactNode
     breakdownBy: WebStatsBreakdown
     value: string
+    includeHost?: boolean
 }): JSX.Element => {
     const { effectiveDomain } = useValues(webAnalyticsFilterLogic)
     const { featureFlags } = useValues(featureFlagLogic)
-    const url = buildOpenUrl(breakdownBy, value, effectiveDomain)
+    const url = buildOpenUrl(breakdownBy, value, effectiveDomain, includeHost)
 
     if (!url || !featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_OPEN_URL]) {
         return <>{children}</>
@@ -148,6 +183,39 @@ const PathValueWithHoverLink = ({
                 </Tooltip>
             </Link>
         </span>
+    )
+}
+
+// Outbound clicks come through as a `url` column (not `breakdown_value`), so they don't get the
+// PathValueWithHoverLink affordance. The value is already a full external URL.
+const UrlValueCell: QueryContextColumnComponent = ({ value }) => {
+    const { featureFlags } = useValues(featureFlagLogic)
+
+    if (typeof value !== 'string' || !value) {
+        return <>{value}</>
+    }
+
+    if (!featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_OPEN_URL]) {
+        return <>{value}</>
+    }
+
+    const url = value.startsWith('http') ? value : `https://${value}`
+
+    // The URL text itself is the click target so it stays discoverable on touch and keyboard focus,
+    // and works even when the cell's max-width clips the trailing icon. The icon is a hover-only hint.
+    return (
+        <Link
+            to={url}
+            target="_blank"
+            subtle
+            onClick={(e: React.MouseEvent) => e.stopPropagation()}
+            className="inline-flex items-center gap-1"
+        >
+            {value}
+            <Tooltip title="Open URL">
+                <IconExternal className="text-base opacity-0 transition-opacity [[data-row-key]:hover_&]:opacity-100" />
+            </Tooltip>
+        </Link>
     )
 }
 
@@ -238,14 +306,14 @@ const BreakdownValueTitle: QueryContextColumnTitleComponent = (props) => {
     if (source.kind !== NodeKind.WebStatsTableQuery) {
         return null
     }
-    const { breakdownBy } = source
+    const { breakdownBy, includeHost } = source
     switch (breakdownBy) {
         case WebStatsBreakdown.Page:
-            return <>Path</>
+            return <>{includeHost ? 'Host + path' : 'Path'}</>
         case WebStatsBreakdown.InitialPage:
-            return <>Initial Path</>
+            return <>{includeHost ? 'Host + entry path' : 'Initial Path'}</>
         case WebStatsBreakdown.ExitPage:
-            return <>End Path</>
+            return <>{includeHost ? 'Host + end path' : 'End Path'}</>
         case WebStatsBreakdown.PreviousPage:
             return <>Previous Page</>
         case WebStatsBreakdown.ExitClick:
@@ -256,6 +324,8 @@ const BreakdownValueTitle: QueryContextColumnTitleComponent = (props) => {
             return <>Channel Type</>
         case WebStatsBreakdown.InitialReferringDomain:
             return <>Referring Domain</>
+        case WebStatsBreakdown.InitialReferringURL:
+            return <>Referring URL</>
         case WebStatsBreakdown.InitialUTMSource:
             return <>UTM Source</>
         case WebStatsBreakdown.InitialUTMCampaign:
@@ -288,10 +358,30 @@ const BreakdownValueTitle: QueryContextColumnTitleComponent = (props) => {
             return <>URL</>
         case WebStatsBreakdown.InitialUTMSourceMediumCampaign:
             return <>Source / Medium / Campaign</>
+        case WebStatsBreakdown.FirstPageviewChannelType:
+            return <>Channel Type (First Pageview)</>
+        case WebStatsBreakdown.FirstPageviewReferringDomain:
+            return <>Referring Domain (First Pageview)</>
+        case WebStatsBreakdown.FirstPageviewUTMSource:
+            return <>UTM Source (First Pageview)</>
+        case WebStatsBreakdown.FirstPageviewUTMCampaign:
+            return <>UTM Campaign (First Pageview)</>
+        case WebStatsBreakdown.FirstPageviewUTMMedium:
+            return <>UTM Medium (First Pageview)</>
+        case WebStatsBreakdown.FirstPageviewUTMTerm:
+            return <>UTM Term (First Pageview)</>
+        case WebStatsBreakdown.FirstPageviewUTMContent:
+            return <>UTM Content (First Pageview)</>
+        case WebStatsBreakdown.FirstPageviewUTMSourceMediumCampaign:
+            return <>Source / Medium / Campaign (First Pageview)</>
         default:
             throw new UnexpectedNeverError(breakdownBy)
     }
 }
+
+const NotSetBreakdownLabel = (): JSX.Element => <span className="text-secondary italic">(not set)</span>
+
+const DirectBreakdownLabel = (): JSX.Element => <span className="text-secondary italic">(direct)</span>
 
 const BreakdownValueCell: QueryContextColumnComponent = (props) => {
     const { value, query } = props
@@ -301,7 +391,7 @@ const BreakdownValueCell: QueryContextColumnComponent = (props) => {
     if (source.kind !== NodeKind.WebStatsTableQuery) {
         return null
     }
-    const { breakdownBy } = source
+    const { breakdownBy, includeHost } = source
 
     switch (breakdownBy) {
         case WebStatsBreakdown.ExitPage:
@@ -314,7 +404,7 @@ const BreakdownValueCell: QueryContextColumnComponent = (props) => {
             const decoded = tryDecodeURIComponent(value)
             const displayValue = source.doPathCleaning ? parseAliasToReadable(decoded) : decoded
             return (
-                <PathValueWithHoverLink breakdownBy={breakdownBy} value={value}>
+                <PathValueWithHoverLink breakdownBy={breakdownBy} value={value} includeHost={includeHost}>
                     {displayValue}
                 </PathValueWithHoverLink>
             )
@@ -348,14 +438,15 @@ const BreakdownValueCell: QueryContextColumnComponent = (props) => {
                     </>
                 )
             }
-            break
+            return <NotSetBreakdownLabel />
         case WebStatsBreakdown.Region:
             if (Array.isArray(value)) {
                 const [countryCode, regionCode, regionName] = value
+                const regionLabel = regionName || regionCode
                 return (
                     <>
                         {countryCodeToFlag(countryCode)} {COUNTRY_CODE_TO_LONG_NAME[countryCode] || countryCode} -{' '}
-                        {regionName || regionCode}
+                        {regionLabel ? regionLabel : <NotSetBreakdownLabel />}
                     </>
                 )
             }
@@ -366,7 +457,7 @@ const BreakdownValueCell: QueryContextColumnComponent = (props) => {
                 return (
                     <>
                         {countryCodeToFlag(countryCode)} {COUNTRY_CODE_TO_LONG_NAME[countryCode] || countryCode} -{' '}
-                        {cityName}
+                        {cityName ? cityName : <NotSetBreakdownLabel />}
                     </>
                 )
             }
@@ -375,7 +466,7 @@ const BreakdownValueCell: QueryContextColumnComponent = (props) => {
             if (typeof value === 'number') {
                 return <>{toUtcOffsetFormat(value)}</>
             }
-            break
+            return <NotSetBreakdownLabel />
         case WebStatsBreakdown.Language:
             if (typeof value === 'string') {
                 const [languageCode, countryCode] = value.split('-')
@@ -390,23 +481,29 @@ const BreakdownValueCell: QueryContextColumnComponent = (props) => {
                     </>
                 )
             }
-            break
+            return <NotSetBreakdownLabel />
         case WebStatsBreakdown.DeviceType:
             if (typeof value === 'string') {
                 return <PropertyIcon.WithLabel property="$device_type" value={value} />
             }
-            break
+            return <NotSetBreakdownLabel />
         case WebStatsBreakdown.Browser:
             if (typeof value === 'string') {
                 return <PropertyIcon.WithLabel property="$browser" value={value} />
             }
-            break
+            return <NotSetBreakdownLabel />
         case WebStatsBreakdown.OS:
             if (typeof value === 'string') {
                 return <PropertyIcon.WithLabel property="$os" value={value} />
             }
-            break
+            return <NotSetBreakdownLabel />
         case WebStatsBreakdown.InitialReferringDomain:
+        case WebStatsBreakdown.FirstPageviewReferringDomain:
+            // NULL referrer is canonically "Direct" in PostHog (matches the channel-type
+            // bucketing in sessions_v2). Keep that wording to stay consistent across tiles.
+            if (value == null) {
+                return <DirectBreakdownLabel />
+            }
             if (featureFlags[FEATURE_FLAGS.SHOW_REFERRER_FAVICON]) {
                 if (typeof value === 'string') {
                     return (
@@ -424,6 +521,23 @@ const BreakdownValueCell: QueryContextColumnComponent = (props) => {
                 }
             }
             break
+        case WebStatsBreakdown.InitialUTMSourceMediumCampaign:
+        case WebStatsBreakdown.FirstPageviewUTMSourceMediumCampaign:
+            if (typeof value === 'string') {
+                return <>{value.replace(BREAKDOWN_REFERRER_PREFIX, '')}</>
+            }
+            break
+        case WebStatsBreakdown.InitialUTMSource:
+        case WebStatsBreakdown.InitialUTMMedium:
+        case WebStatsBreakdown.InitialUTMCampaign:
+        case WebStatsBreakdown.InitialUTMTerm:
+        case WebStatsBreakdown.InitialUTMContent:
+        case WebStatsBreakdown.FirstPageviewUTMSource:
+        case WebStatsBreakdown.FirstPageviewUTMMedium:
+        case WebStatsBreakdown.FirstPageviewUTMCampaign:
+        case WebStatsBreakdown.FirstPageviewUTMTerm:
+        case WebStatsBreakdown.FirstPageviewUTMContent:
+            return typeof value === 'string' ? <>{value}</> : <NotSetBreakdownLabel />
     }
 
     if (typeof value === 'string') {
@@ -470,6 +584,9 @@ const SortableCell = (
     }
 
 export const webAnalyticsDataTableQueryContext: QueryContext = {
+    // findMounted() keeps this scene-agnostic: it only acts when webAnalyticsLogic is actually mounted
+    // (i.e. inside the web analytics scene), so reusing this context in product analytics is a no-op.
+    onDisableWebAnalyticsPrecompute: () => webAnalyticsLogic.findMounted()?.actions.setUseWebAnalyticsPrecompute(false),
     columns: {
         breakdown_value: {
             renderTitle: BreakdownValueTitle,
@@ -549,15 +666,20 @@ export const webAnalyticsDataTableQueryContext: QueryContext = {
             render: VariationCell(),
             align: 'right',
         },
+        url: {
+            render: UrlValueCell,
+        },
         action_name: {
             title: 'Action',
         },
         cross_sell: {
             title: ' ',
             render: ({ record, query }: { record: any; query: DataTableNode | DataVisualizationNode }) => {
-                const dateRange = (query.source as any)?.dateRange
-                const breakdownBy = (query.source as any)?.breakdownBy
+                const source = query.source as any
+                const dateRange = source?.dateRange
+                const breakdownBy = source?.breakdownBy
                 const value = record[0] ?? ''
+                const doPathCleaning = source?.doPathCleaning
 
                 return (
                     <div className="flex flex-row items-center justify-end">
@@ -566,9 +688,12 @@ export const webAnalyticsDataTableQueryContext: QueryContext = {
                             date_to={dateRange?.date_to}
                             breakdownBy={breakdownBy}
                             value={value}
+                            properties={source?.properties}
+                            filter_test_accounts={source?.filterTestAccounts}
+                            doPathCleaning={doPathCleaning}
                         />
                         <HeatmapButton breakdownBy={breakdownBy} value={value} />
-                        <ErrorTrackingButton breakdownBy={breakdownBy} value={value} />
+                        <ErrorTrackingButton breakdownBy={breakdownBy} value={value} doPathCleaning={doPathCleaning} />
                         <CreateSurveyButton value={value} />
                     </div>
                 )
@@ -593,14 +718,38 @@ export const WebStatsTrendTile = ({
     showIntervalTile,
     insightProps,
     attachTo,
-}: QueryWithInsightProps<InsightVizNode> & { showIntervalTile?: boolean }): JSX.Element => {
-    const { togglePropertyFilter, setDateInterval } = useActions(webAnalyticsLogic)
+    headerSlot,
+    uniqueKey,
+}: QueryWithInsightProps<InsightVizNode> & {
+    showIntervalTile?: boolean
+    headerSlot?: React.ReactNode
+    uniqueKey: string
+}): JSX.Element => {
+    const { togglePropertyFilter, setDateInterval, zoomIntoPeriod, resetZoom } = useActions(webAnalyticsLogic)
     const {
         hasCountryFilter,
         dateFilter: { interval },
+        preZoomDateFilter,
     } = useValues(webAnalyticsLogic)
+    const { featureFlags } = useValues(featureFlagLogic)
+    const isDragToZoomEnabled = !!featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_DRAG_TO_ZOOM]
     const worldMapPropertyName = webStatsBreakdownToPropertyName(WebStatsBreakdown.Country)?.key
     const regionPropertyName = webStatsBreakdownToPropertyName(WebStatsBreakdown.Region)?.key
+    const showComparisonLabels = !!featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_TOOLTIP_COMPARISON_LABELS]
+
+    const isWorldMap =
+        query.source?.kind === NodeKind.TrendsQuery && query.source.trendsFilter?.display === ChartDisplayType.WorldMap
+    const insightPropsForQuery = useMemo(
+        (): InsightLogicProps => ({
+            ...insightProps,
+            query,
+        }),
+        [insightProps, query]
+    )
+    const dataNodeLogicProps = buildInsightVizTileDataNodeLogicProps({
+        query,
+        insightProps: insightPropsForQuery,
+    })
 
     const onWorldMapClick = useCallback(
         (breakdownValue: string) => {
@@ -630,20 +779,33 @@ export const WebStatsTrendTile = ({
     )
 
     const context = useMemo((): QueryContext => {
+        const compareFilter = 'compareFilter' in query.source ? query.source.compareFilter : undefined
+
         const baseContext: QueryContext = {
             ...webAnalyticsDataTableQueryContext,
             insightProps: {
-                ...insightProps,
-                query,
+                ...insightPropsForQuery,
             },
-            compareFilter: 'compareFilter' in query.source ? query.source.compareFilter : undefined,
+            compareFilter,
+            onDateRangeZoom: isDragToZoomEnabled ? zoomIntoPeriod : undefined,
+            ...(showComparisonLabels
+                ? {
+                      formatCompareLabel: (label: string, dateLabel?: string) => {
+                          const lowerLabel = label.toLowerCase()
+                          const dateSuffix = dateLabel ? ` (${dateLabel})` : ''
+                          if (lowerLabel === 'previous') {
+                              return `Previous${dateSuffix}`
+                          }
+                          if (lowerLabel === 'current') {
+                              return `Current${dateSuffix}`
+                          }
+                          return capitalizeFirstLetter(label)
+                      },
+                  }
+                : {}),
         }
 
         // World maps need custom click handler for country filtering, trend lines use default persons modal
-        const isWorldMap =
-            query.source?.kind === NodeKind.TrendsQuery &&
-            query.source.trendsFilter?.display === ChartDisplayType.WorldMap
-
         const isRegionMap =
             isWorldMap &&
             query.source?.kind === NodeKind.TrendsQuery &&
@@ -676,19 +838,49 @@ export const WebStatsTrendTile = ({
         }
 
         return baseContext
-    }, [onWorldMapClick, onRegionMapClick, insightProps, query])
+    }, [
+        onWorldMapClick,
+        onRegionMapClick,
+        zoomIntoPeriod,
+        insightPropsForQuery,
+        query,
+        showComparisonLabels,
+        isDragToZoomEnabled,
+        isWorldMap,
+    ])
 
     return (
         <div className="border rounded bg-surface-primary flex-1 flex flex-col">
-            {showIntervalTile && (
+            {headerSlot}
+            {(showIntervalTile || preZoomDateFilter) && (
                 <div className="flex flex-row items-center justify-end m-2 mr-4">
-                    <div className="flex flex-row items-center">
-                        <span className="mr-2">Group by</span>
-                        <IntervalFilterStandalone interval={interval} onIntervalChange={setDateInterval} />
+                    <div className="flex flex-row items-center gap-2">
+                        {showIntervalTile && (
+                            <>
+                                <span>Group by</span>
+                                <IntervalFilterStandalone interval={interval} onIntervalChange={setDateInterval} />
+                            </>
+                        )}
+                        {preZoomDateFilter && (
+                            <LemonButton type="secondary" size="small" icon={<IconUndo />} onClick={resetZoom}>
+                                Reset zoom
+                            </LemonButton>
+                        )}
                     </div>
                 </div>
             )}
-            <Query attachTo={attachTo} query={query} readOnly={true} context={context} />
+            <WebAnalyticsTileSkeletonGate
+                dataNodeLogicProps={dataNodeLogicProps}
+                skeleton={
+                    isWorldMap ? (
+                        <WorldMapTileSkeleton />
+                    ) : (
+                        <ChartTileSkeleton showLegendStrip={!showIntervalTile && !preZoomDateFilter} />
+                    )
+                }
+            >
+                <Query uniqueKey={uniqueKey} attachTo={attachTo} query={query} readOnly={true} context={context} />
+            </WebAnalyticsTileSkeletonGate>
         </div>
     )
 }
@@ -697,7 +889,8 @@ export const AveragePageViewVisualizationTile = ({
     query,
     insightProps,
     attachTo,
-}: QueryWithInsightProps<DataVisualizationNode>): JSX.Element => {
+    uniqueKey,
+}: QueryWithInsightProps<DataVisualizationNode> & { uniqueKey: string }): JSX.Element => {
     const { setDateInterval } = useActions(webAnalyticsLogic)
     const {
         dateFilter: { interval },
@@ -712,6 +905,7 @@ export const AveragePageViewVisualizationTile = ({
                 </div>
             </div>
             <Query
+                uniqueKey={uniqueKey}
                 attachTo={attachTo}
                 query={query}
                 readOnly={true}
@@ -726,7 +920,8 @@ export const MarketingAnalyticsTrendTile = ({
     showIntervalTile,
     insightProps,
     attachTo,
-}: QueryWithInsightProps<InsightVizNode> & { showIntervalTile?: boolean }): JSX.Element => {
+    uniqueKey,
+}: QueryWithInsightProps<InsightVizNode> & { showIntervalTile?: boolean; uniqueKey: string }): JSX.Element => {
     const { setDateInterval, setChartDisplayType, setTileColumnSelection } = useActions(marketingAnalyticsLogic)
     const { dateFilter, chartDisplayType, tileColumnSelection } = useValues(marketingAnalyticsLogic)
 
@@ -740,9 +935,10 @@ export const MarketingAnalyticsTrendTile = ({
             label: 'Reported conversion value',
         },
         { value: 'roas', label: 'Reported ROAS' },
+        { value: 'cost_per_reported_conversion', label: 'Cost per reported conversion' },
     ]
     return (
-        <div className="border rounded bg-surface-primary flex-1 flex flex-col">
+        <div className="border rounded bg-surface-primary flex-1 flex flex-col min-h-100">
             {showIntervalTile && (
                 <div className="flex flex-row items-center justify-between m-2 mr-4">
                     <LemonSelect
@@ -769,6 +965,7 @@ export const MarketingAnalyticsTrendTile = ({
                 </div>
             )}
             <Query
+                uniqueKey={uniqueKey}
                 attachTo={attachTo}
                 query={query}
                 readOnly={true}
@@ -784,42 +981,155 @@ export const WebStatsTableTile = ({
     insightProps,
     control,
     attachTo,
+    headerSlot,
+    uniqueKey,
+    enablePagination,
 }: QueryWithInsightProps<DataTableNode> & {
     breakdownBy: WebStatsBreakdown
     control?: JSX.Element
     tileId: TileId
+    headerSlot?: React.ReactNode
+    uniqueKey: string
+    /** Show the "load more" footer so long-tail breakdowns can be paginated (used by the expanded modal). */
+    enablePagination?: boolean
 }): JSX.Element => {
     const { togglePropertyFilter } = useActions(webAnalyticsLogic)
     const { productTab } = useValues(webAnalyticsLogic)
+    const { rawWebAnalyticsFilters } = useValues(webAnalyticsFilterLogic)
 
     const { key, type } = webStatsBreakdownToPropertyName(breakdownBy) || {}
 
+    const isCompoundBreakdown =
+        breakdownBy === WebStatsBreakdown.InitialUTMSourceMediumCampaign ||
+        breakdownBy === WebStatsBreakdown.Viewport ||
+        breakdownBy === WebStatsBreakdown.Timezone
+
+    const includeHost = query.source.kind === NodeKind.WebStatsTableQuery ? query.source.includeHost : false
+
+    const utmSource = webStatsBreakdownToPropertyName(WebStatsBreakdown.InitialUTMSource)!
+    const utmMedium = webStatsBreakdownToPropertyName(WebStatsBreakdown.InitialUTMMedium)!
+    const utmCampaign = webStatsBreakdownToPropertyName(WebStatsBreakdown.InitialUTMCampaign)!
+    const referringDomain = webStatsBreakdownToPropertyName(WebStatsBreakdown.InitialReferringDomain)!
+
+    const { featureFlags } = useValues(featureFlagLogic)
+
+    const getDrillDownTabChange = useCallback(
+        (
+            filterKey: string,
+            filterValue: string | number | null
+        ): { sourceTab?: string; geographyTab?: string; deviceTab?: string } | undefined => {
+            const sourceDrillDown = SOURCE_DRILL_DOWN_MAP[breakdownBy]
+            // When the referrer URL drilldown flag is off, don't navigate away from referrer domain
+            const sourceTab =
+                !featureFlags[FEATURE_FLAGS.WEB_ANALYTICS_REFERRER_URL_DRILLDOWN] &&
+                sourceDrillDown === SourceTab.REFERRING_URL
+                    ? undefined
+                    : sourceDrillDown
+            const geographyTab = GEOGRAPHY_DRILL_DOWN_MAP[breakdownBy]
+            const deviceTab = DEVICE_DRILL_DOWN_MAP[breakdownBy]
+            const drillDownTab = sourceTab || geographyTab || deviceTab
+            if (!drillDownTab || filterValue === null) {
+                return undefined
+            }
+            const isAlreadyFiltered = rawWebAnalyticsFilters.some(
+                (f) =>
+                    f.key === filterKey &&
+                    f.operator === PropertyOperator.Exact &&
+                    (Array.isArray(f.value) ? f.value.includes(filterValue) : f.value === filterValue)
+            )
+            if (isAlreadyFiltered) {
+                return undefined
+            }
+            return {
+                ...(sourceTab ? { sourceTab } : {}),
+                ...(geographyTab ? { geographyTab } : {}),
+                ...(deviceTab ? { deviceTab } : {}),
+            }
+        },
+        [breakdownBy, rawWebAnalyticsFilters, featureFlags]
+    )
+
     const onClick = useCallback(
         (breakdownValue: string | null) => {
-            if (!key || !type) {
-                return
-            }
-
             if (productTab === ProductTab.PAGE_REPORTS) {
                 lemonToast.info('Filters are not yet supported in this tile')
                 return
             }
 
-            togglePropertyFilter(type, key, breakdownValue)
+            // When includeHost is active, breakdown value contains host+path which doesn't map to a single property filter
+            if (includeHost) {
+                return
+            }
+
+            if (breakdownBy === WebStatsBreakdown.InitialUTMSourceMediumCampaign && breakdownValue) {
+                const values = breakdownValue.split(' / ')
+                const sourceValue = values[0]
+                if (sourceValue && sourceValue !== BREAKDOWN_NULL_DISPLAY) {
+                    if (sourceValue.startsWith(BREAKDOWN_REFERRER_PREFIX)) {
+                        togglePropertyFilter(
+                            referringDomain.type,
+                            referringDomain.key,
+                            sourceValue.slice(BREAKDOWN_REFERRER_PREFIX.length)
+                        )
+                    } else {
+                        togglePropertyFilter(utmSource.type, utmSource.key, sourceValue)
+                    }
+                }
+                if (values[1] && values[1] !== BREAKDOWN_NULL_DISPLAY) {
+                    togglePropertyFilter(utmMedium.type, utmMedium.key, values[1])
+                }
+                if (values[2] && values[2] !== BREAKDOWN_NULL_DISPLAY) {
+                    const drillDownTabChange = getDrillDownTabChange(utmCampaign.key, values[2])
+                    togglePropertyFilter(utmCampaign.type, utmCampaign.key, values[2], drillDownTabChange)
+                }
+                return
+            }
+
+            if (breakdownBy === WebStatsBreakdown.Viewport && breakdownValue) {
+                const [width, height] = breakdownValue.split('x')
+                if (width) {
+                    togglePropertyFilter(PropertyFilterType.Event, '$viewport_width', Number(width))
+                }
+                if (height) {
+                    togglePropertyFilter(PropertyFilterType.Event, '$viewport_height', Number(height))
+                }
+                return
+            }
+
+            if (breakdownBy === WebStatsBreakdown.Timezone && breakdownValue) {
+                // Backend displays -(offset_minutes)/60, so reverse: offset = -(display * 60)
+                const offsetMinutes = -(Number(breakdownValue) * 60)
+                togglePropertyFilter(PropertyFilterType.Event, '$timezone_offset', offsetMinutes)
+                return
+            }
+
+            if (!key || !type) {
+                return
+            }
+
+            togglePropertyFilter(type, key, breakdownValue, getDrillDownTabChange(key, breakdownValue))
         },
-        [togglePropertyFilter, type, key, productTab]
+        [
+            togglePropertyFilter,
+            type,
+            key,
+            productTab,
+            includeHost,
+            breakdownBy,
+            utmSource,
+            utmMedium,
+            utmCampaign,
+            referringDomain,
+            getDrillDownTabChange,
+        ]
     )
+
+    const canFilterRow = !includeHost && productTab !== ProductTab.PAGE_REPORTS
 
     const context = useMemo((): QueryContext => {
         const rowProps: QueryContext['rowProps'] = (record: unknown) => {
-            // `onClick` won't know how to handle the breakdown value if these don't exist,
-            // so let's prevent from `onClick` from being set up in the first place to avoid a noop click
-            if (!key || !type) {
-                return {}
-            }
-
-            // Tricky to calculate because the breakdown is a computed value rather than a DB column, make it non-filterable for now
-            if (breakdownBy === WebStatsBreakdown.Language || breakdownBy === WebStatsBreakdown.Timezone) {
+            // Compound breakdowns (UTM s/m/c, Viewport, Timezone) have dedicated handling in onClick
+            if (!key && !type && !isCompoundBreakdown) {
                 return {}
             }
 
@@ -828,7 +1138,7 @@ export const WebStatsTableTile = ({
                 return {}
             }
 
-            return { onClick: () => onClick(breakdownValue) }
+            return { onClick: () => onClick(breakdownValue), ...(canFilterRow && { title: 'Filter by this value' }) }
         }
 
         return {
@@ -836,19 +1146,28 @@ export const WebStatsTableTile = ({
             insightProps,
             rowProps,
             compareFilter: 'compareFilter' in query.source ? query.source.compareFilter : undefined,
+            showLoadNextButton: enablePagination,
         }
-    }, [onClick, insightProps, breakdownBy, key, type, query])
+    }, [onClick, insightProps, breakdownBy, key, type, isCompoundBreakdown, query, enablePagination, canFilterRow])
+
+    const numericColumns = PAGE_LIKE_BREAKDOWNS.has(breakdownBy) ? 3 : 2
+    const dataNodeLogicProps = buildDataTableTileDataNodeLogicProps({
+        query,
+        insightProps,
+        context,
+        uniqueKey,
+    })
 
     return (
         <div className="border rounded bg-surface-primary flex-1 flex flex-col">
+            {headerSlot}
             {control != null && <div className="flex flex-row items-center justify-end m-2 mr-4">{control}</div>}
-            <Query
-                uniqueKey="WebAnalytics.WebStatsTableTile"
-                attachTo={attachTo}
-                query={query}
-                readOnly={true}
-                context={context}
-            />
+            <WebAnalyticsTileSkeletonGate
+                dataNodeLogicProps={dataNodeLogicProps}
+                skeleton={<TableTileSkeleton numericColumns={numericColumns} />}
+            >
+                <Query uniqueKey={uniqueKey} attachTo={attachTo} query={query} readOnly={true} context={context} />
+            </WebAnalyticsTileSkeletonGate>
         </div>
     )
 }
@@ -872,12 +1191,24 @@ const getBreakdownValue = (record: unknown, breakdownBy: WebStatsBreakdown): str
             break
         case WebStatsBreakdown.Region:
             if (Array.isArray(breakdownValue)) {
-                return breakdownValue[1]
+                // Element 1 may be NULL when GeoIP can't resolve a subdivision; skip the
+                // click handler in that case since filtering by NULL has no useful behavior.
+                return breakdownValue[1] ?? undefined
             }
             break
         case WebStatsBreakdown.City:
             if (Array.isArray(breakdownValue)) {
-                return breakdownValue[1]
+                return breakdownValue[1] ?? undefined
+            }
+            break
+        case WebStatsBreakdown.Viewport:
+            if (Array.isArray(breakdownValue)) {
+                return `${breakdownValue[0]}x${breakdownValue[1]}`
+            }
+            break
+        case WebStatsBreakdown.Timezone:
+            if (typeof breakdownValue === 'number') {
+                return String(breakdownValue)
             }
             break
         case WebStatsBreakdown.FrustrationMetrics:
@@ -901,10 +1232,14 @@ export const WebGoalsTile = ({
     query,
     insightProps,
     attachTo,
-}: QueryWithInsightProps<DataTableNode>): JSX.Element | null => {
+    headerSlot,
+    uniqueKey,
+}: QueryWithInsightProps<DataTableNode> & {
+    headerSlot?: React.ReactNode
+    uniqueKey: string
+}): JSX.Element | null => {
     const { actions, actionsLoading } = useValues(actionsModel)
     const { updateHasSeenProductIntroFor } = useActions(userLogic)
-    const { addProductIntentForCrossSell } = useActions(teamLogic)
 
     if (actionsLoading) {
         return null
@@ -917,8 +1252,10 @@ export const WebGoalsTile = ({
                 productKey={ProductKey.ACTIONS}
                 thingName="action"
                 isEmpty={true}
-                description="Use actions to combine events that you want to have tracked together or to make detailed Autocapture events easier to reuse."
-                docsURL="https://posthog.com/docs/data/actions"
+                titleOverride="Track your conversions"
+                description="Goals show how many visitors complete the actions that matter to you. Sign-ups, purchases, demo requests. Create an action for a key conversion to see its visitors and conversion rate here."
+                docsURL="https://posthog.com/docs/web-analytics/conversion-goals"
+                hogLayout="responsive"
                 actionElementOverride={
                     <NewActionButton onSelectOption={() => updateHasSeenProductIntroFor(ProductKey.ACTIONS)} />
                 }
@@ -927,30 +1264,60 @@ export const WebGoalsTile = ({
     }
 
     return (
+        <WebGoalsTileContent
+            query={query}
+            insightProps={insightProps}
+            attachTo={attachTo}
+            headerSlot={headerSlot}
+            uniqueKey={uniqueKey}
+        />
+    )
+}
+
+const WebGoalsTileContent = ({
+    query,
+    insightProps,
+    attachTo,
+    headerSlot,
+    uniqueKey,
+}: QueryWithInsightProps<DataTableNode> & {
+    headerSlot?: React.ReactNode
+    uniqueKey: string
+}): JSX.Element => {
+    const { addProductIntentForCrossSell } = useActions(teamLogic)
+
+    const context = useMemo((): QueryContext => {
+        return { ...webAnalyticsDataTableQueryContext, insightProps }
+    }, [insightProps])
+    const dataNodeLogicProps = buildDataTableTileDataNodeLogicProps({ query, insightProps, context, uniqueKey })
+
+    return (
         <div className="border rounded bg-surface-primary flex-1">
-            <div className="flex flex-row-reverse p-2">
-                <LemonButton
-                    to={urls.actions()}
-                    onClick={() => {
-                        addProductIntentForCrossSell({
-                            from: ProductKey.WEB_ANALYTICS,
-                            to: ProductKey.ACTIONS,
-                            intent_context: ProductIntentContext.WEB_ANALYTICS_INSIGHT,
-                        })
-                    }}
-                    sideIcon={<IconOpenInNew />}
-                    type="secondary"
-                    size="small"
-                >
-                    Manage actions
-                </LemonButton>
-            </div>
-            <Query
-                attachTo={attachTo}
-                query={query}
-                readOnly={true}
-                context={{ ...webAnalyticsDataTableQueryContext, insightProps }}
-            />
+            {headerSlot ?? (
+                <div className="flex flex-row-reverse p-2">
+                    <LemonButton
+                        to={urls.actions()}
+                        onClick={() => {
+                            addProductIntentForCrossSell({
+                                from: ProductKey.WEB_ANALYTICS,
+                                to: ProductKey.ACTIONS,
+                                intent_context: ProductIntentContext.WEB_ANALYTICS_INSIGHT,
+                            })
+                        }}
+                        sideIcon={<IconOpenInNew />}
+                        type="secondary"
+                        size="small"
+                    >
+                        Manage actions
+                    </LemonButton>
+                </div>
+            )}
+            <WebAnalyticsTileSkeletonGate
+                dataNodeLogicProps={dataNodeLogicProps}
+                skeleton={<TableTileSkeleton numericColumns={4} />}
+            >
+                <Query uniqueKey={uniqueKey} attachTo={attachTo} query={query} readOnly={true} context={context} />
+            </WebAnalyticsTileSkeletonGate>
         </div>
     )
 }
@@ -959,14 +1326,25 @@ export const WebExternalClicksTile = ({
     query,
     insightProps,
     attachTo,
-}: QueryWithInsightProps<DataTableNode>): JSX.Element | null => {
+    headerSlot,
+    uniqueKey,
+}: QueryWithInsightProps<DataTableNode> & {
+    headerSlot?: React.ReactNode
+    uniqueKey: string
+}): JSX.Element | null => {
     const { productTab, shouldStripQueryParams } = useValues(webAnalyticsLogic)
     const { setShouldStripQueryParams } = useActions(webAnalyticsLogic)
 
     const isPageReportsPage = productTab === ProductTab.PAGE_REPORTS
 
+    const context = useMemo((): QueryContext => {
+        return { ...webAnalyticsDataTableQueryContext, insightProps }
+    }, [insightProps])
+    const dataNodeLogicProps = buildDataTableTileDataNodeLogicProps({ query, insightProps, context, uniqueKey })
+
     return (
         <div className="border rounded bg-surface-primary flex-1 flex flex-col">
+            {headerSlot}
             {!isPageReportsPage && (
                 <div className="flex flex-row items-center justify-end m-2 mr-4">
                     <div className="flex flex-row items-center deprecated-space-x-2">
@@ -979,12 +1357,12 @@ export const WebExternalClicksTile = ({
                     </div>
                 </div>
             )}
-            <Query
-                attachTo={attachTo}
-                query={query}
-                readOnly={true}
-                context={{ ...webAnalyticsDataTableQueryContext, insightProps }}
-            />
+            <WebAnalyticsTileSkeletonGate
+                dataNodeLogicProps={dataNodeLogicProps}
+                skeleton={<TableTileSkeleton numericColumns={2} />}
+            >
+                <Query uniqueKey={uniqueKey} attachTo={attachTo} query={query} readOnly={true} context={context} />
+            </WebAnalyticsTileSkeletonGate>
         </div>
     )
 }
@@ -993,7 +1371,8 @@ export const WebVitalsPathBreakdownTile = ({
     query,
     insightProps,
     attachTo,
-}: QueryWithInsightProps<WebVitalsPathBreakdownQuery>): JSX.Element => {
+    uniqueKey,
+}: QueryWithInsightProps<WebVitalsPathBreakdownQuery> & { uniqueKey: string }): JSX.Element => {
     const { isPathCleaningEnabled } = useValues(webAnalyticsLogic)
     const { setIsPathCleaningEnabled } = useActions(webAnalyticsLogic)
 
@@ -1016,10 +1395,112 @@ export const WebVitalsPathBreakdownTile = ({
                 )}
             </div>
             <Query
+                uniqueKey={uniqueKey}
                 attachTo={attachTo}
                 query={query}
                 readOnly
                 context={{ ...webAnalyticsDataTableQueryContext, insightProps }}
+            />
+        </div>
+    )
+}
+
+interface HogQLTableTileProps {
+    uniqueKey: string
+    attachTo?: BuiltLogic | LogicWrapper
+    query: DataTableNode
+    insightProps: InsightLogicProps
+    tileId: TileId
+    headerSlot?: React.ReactNode
+}
+
+const useSingleSelectDrilldownContext = ({
+    insightProps,
+    filters,
+    setFilters,
+    filterKey,
+    filterType,
+}: {
+    insightProps: InsightLogicProps
+    filters: WebAnalyticsPropertyFilters
+    setFilters: (filters: WebAnalyticsPropertyFilters) => void
+    filterKey: string | undefined
+    filterType: PropertyFilterType.Event | PropertyFilterType.Session
+}): QueryContext =>
+    useMemo((): QueryContext => {
+        const toggleFilter = (key: string, value: string): void => {
+            const existing = filters.find((f) => 'key' in f && f.key === key)
+            const otherFilters = filters.filter((f) => !('key' in f && f.key === key))
+            const existingValues =
+                existing && 'value' in existing
+                    ? Array.isArray(existing.value)
+                        ? existing.value
+                        : [existing.value]
+                    : []
+            if (existingValues.length === 1 && existingValues[0] === value) {
+                setFilters(otherFilters)
+                return
+            }
+            setFilters([...otherFilters, { key, value: [value], operator: PropertyOperator.Exact, type: filterType }])
+        }
+
+        return {
+            ...webAnalyticsDataTableQueryContext,
+            insightProps,
+            rowProps: (record: unknown) => {
+                const result = (record as { result?: unknown[] })?.result
+                const value = Array.isArray(result) ? (result[0] as string) : null
+                if (!value || !filterKey) {
+                    return {}
+                }
+                return {
+                    className: 'cursor-pointer',
+                    onClick: () => toggleFilter(filterKey, value),
+                }
+            },
+        }
+    }, [insightProps, filters, setFilters, filterKey, filterType])
+
+const BOT_HOGQL_TILES = new Set<TileId>([TileId.BOT_CRAWLERS, TileId.BOT_PATHS])
+
+const BotHogQLTableTile = ({ uniqueKey, attachTo, query, insightProps, tileId }: HogQLTableTileProps): JSX.Element => {
+    const { setBotAnalyticsFilters } = useActions(botAnalyticsLogic)
+    const { rawBotAnalyticsFilters } = useValues(botAnalyticsLogic)
+
+    const context = useSingleSelectDrilldownContext({
+        insightProps,
+        filters: rawBotAnalyticsFilters,
+        setFilters: setBotAnalyticsFilters,
+        filterKey: tileId === TileId.BOT_CRAWLERS ? '$virt_bot_name' : '$pathname',
+        filterType: PropertyFilterType.Event,
+    })
+    const dataNodeLogicProps = buildDataTableTileDataNodeLogicProps({ query, insightProps, context, uniqueKey })
+
+    return (
+        <div className="border rounded bg-surface-primary flex-1 flex flex-col py-2 px-1">
+            <WebAnalyticsTileSkeletonGate
+                dataNodeLogicProps={dataNodeLogicProps}
+                skeleton={<TableTileSkeleton numericColumns={2} />}
+            >
+                <Query uniqueKey={uniqueKey} attachTo={attachTo} query={query} readOnly={true} context={context} />
+            </WebAnalyticsTileSkeletonGate>
+        </div>
+    )
+}
+
+const HogQLTableTile = (props: HogQLTableTileProps): JSX.Element => {
+    if (BOT_HOGQL_TILES.has(props.tileId)) {
+        return <BotHogQLTableTile {...props} />
+    }
+    return (
+        <div className="border rounded bg-surface-primary flex-1 flex flex-col py-2 px-1">
+            {props.headerSlot}
+            <Query
+                uniqueKey={props.uniqueKey}
+                attachTo={props.attachTo}
+                query={props.query}
+                readOnly={true}
+                context={{ ...webAnalyticsDataTableQueryContext, insightProps: props.insightProps }}
             />
         </div>
     )
@@ -1033,11 +1514,16 @@ export const WebQuery = ({
     tileId,
     attachTo,
     uniqueKey,
+    headerSlot,
+    enablePagination,
 }: QueryWithInsightProps<QuerySchema> & {
     showIntervalSelect?: boolean
     control?: JSX.Element
     tileId: TileId
     uniqueKey: string
+    headerSlot?: React.ReactNode
+    /** Show the "load more" footer on breakdown tables (used by the expanded modal). */
+    enablePagination?: boolean
 }): JSX.Element => {
     const { productTab, shouldStripQueryParams: stripQueryParamsDashboard } = useValues(webAnalyticsLogic)
     const { stripQueryParams: stripQueryParamsPageReports } = useValues(pageReportsLogic)
@@ -1046,21 +1532,13 @@ export const WebQuery = ({
         // Handle Frustrating Pages tile specifically, which uses WebStatsTableQuery but is not wrapped by a WebAnalyticsTabTile
         if (query.source.breakdownBy === WebStatsBreakdown.FrustrationMetrics) {
             return (
-                <div className="border rounded bg-surface-primary flex-1 flex flex-col py-2 px-1">
-                    <Query
-                        attachTo={attachTo}
-                        query={query}
-                        key={uniqueKey}
-                        readOnly={true}
-                        context={{
-                            ...webAnalyticsDataTableQueryContext,
-                            insightProps,
-                            emptyStateHeading: '',
-                            emptyStateDetail: FrustrationMetricsEmptyState,
-                            emptyStateIcon: <></>,
-                        }}
-                    />
-                </div>
+                <FrustrationMetricsTile
+                    attachTo={attachTo}
+                    query={query}
+                    insightProps={insightProps}
+                    uniqueKey={uniqueKey}
+                    headerSlot={headerSlot}
+                />
             )
         }
 
@@ -1072,6 +1550,9 @@ export const WebQuery = ({
                 insightProps={insightProps}
                 control={control}
                 tileId={tileId}
+                headerSlot={headerSlot}
+                uniqueKey={uniqueKey}
+                enablePagination={enablePagination}
             />
         )
     }
@@ -1087,7 +1568,15 @@ export const WebQuery = ({
                 stripQueryParams: effectiveStripQueryParams,
             },
         }
-        return <WebExternalClicksTile attachTo={attachTo} query={adjustedQuery} insightProps={insightProps} />
+        return (
+            <WebExternalClicksTile
+                attachTo={attachTo}
+                query={adjustedQuery}
+                insightProps={insightProps}
+                headerSlot={headerSlot}
+                uniqueKey={uniqueKey}
+            />
+        )
     }
 
     if (query.kind === NodeKind.InsightVizNode && tileId === TileId.MARKETING) {
@@ -1097,6 +1586,7 @@ export const WebQuery = ({
                 query={query}
                 showIntervalTile={showIntervalSelect}
                 insightProps={insightProps}
+                uniqueKey={uniqueKey}
             />
         )
     } else if (query.kind === NodeKind.InsightVizNode) {
@@ -1106,12 +1596,22 @@ export const WebQuery = ({
                 query={query}
                 showIntervalTile={showIntervalSelect}
                 insightProps={insightProps}
+                headerSlot={headerSlot}
+                uniqueKey={uniqueKey}
             />
         )
     }
 
     if (query.kind === NodeKind.DataTableNode && query.source.kind === NodeKind.WebGoalsQuery) {
-        return <WebGoalsTile attachTo={attachTo} query={query} insightProps={insightProps} />
+        return (
+            <WebGoalsTile
+                attachTo={attachTo}
+                query={query}
+                insightProps={insightProps}
+                headerSlot={headerSlot}
+                uniqueKey={uniqueKey}
+            />
+        )
     }
 
     if (query.kind === NodeKind.DataTableNode && query.source.kind === NodeKind.MarketingAnalyticsTableQuery) {
@@ -1131,21 +1631,100 @@ export const WebQuery = ({
     }
 
     if (query.kind === NodeKind.WebVitalsPathBreakdownQuery) {
-        return <WebVitalsPathBreakdownTile attachTo={attachTo} query={query} insightProps={insightProps} />
+        return (
+            <WebVitalsPathBreakdownTile
+                attachTo={attachTo}
+                query={query}
+                insightProps={insightProps}
+                uniqueKey={uniqueKey}
+            />
+        )
     }
 
     if (query.kind === NodeKind.DataVisualizationNode) {
-        return <AveragePageViewVisualizationTile attachTo={attachTo} query={query} insightProps={insightProps} />
+        return (
+            <AveragePageViewVisualizationTile
+                attachTo={attachTo}
+                query={query}
+                insightProps={insightProps}
+                uniqueKey={uniqueKey}
+            />
+        )
+    }
+
+    if (query.kind === NodeKind.DataTableNode && query.source.kind === NodeKind.HogQLQuery) {
+        return (
+            <HogQLTableTile
+                uniqueKey={uniqueKey}
+                attachTo={attachTo}
+                query={query}
+                insightProps={insightProps}
+                tileId={tileId}
+                headerSlot={headerSlot}
+            />
+        )
+    }
+
+    if (!headerSlot) {
+        return (
+            <Query
+                uniqueKey={uniqueKey}
+                attachTo={attachTo}
+                query={query}
+                readOnly={true}
+                context={{ ...webAnalyticsDataTableQueryContext, insightProps }}
+            />
+        )
     }
 
     return (
-        <Query
-            uniqueKey={uniqueKey}
-            attachTo={attachTo}
-            query={query}
-            readOnly={true}
-            context={{ ...webAnalyticsDataTableQueryContext, insightProps }}
-        />
+        <div className="border rounded bg-surface-primary flex-1 flex flex-col">
+            {headerSlot}
+            <Query
+                uniqueKey={uniqueKey}
+                attachTo={attachTo}
+                query={query}
+                readOnly={true}
+                context={{ ...webAnalyticsDataTableQueryContext, insightProps }}
+            />
+        </div>
+    )
+}
+
+const FrustrationMetricsTile = ({
+    query,
+    insightProps,
+    attachTo,
+    uniqueKey,
+    headerSlot,
+}: {
+    query: DataTableNode
+    insightProps: InsightLogicProps
+    attachTo?: BuiltLogic | LogicWrapper
+    uniqueKey: string
+    headerSlot?: React.ReactNode
+}): JSX.Element => {
+    const context = useMemo((): QueryContext => {
+        return {
+            ...webAnalyticsDataTableQueryContext,
+            insightProps,
+            emptyStateHeading: '',
+            emptyStateDetail: FrustrationMetricsEmptyState,
+            emptyStateIcon: <></>,
+        }
+    }, [insightProps])
+    const dataNodeLogicProps = buildDataTableTileDataNodeLogicProps({ query, insightProps, context })
+
+    return (
+        <div className="border rounded bg-surface-primary flex-1 flex flex-col py-2 px-1">
+            {headerSlot}
+            <WebAnalyticsTileSkeletonGate
+                dataNodeLogicProps={dataNodeLogicProps}
+                skeleton={<TableTileSkeleton numericColumns={3} />}
+            >
+                <Query attachTo={attachTo} query={query} key={uniqueKey} readOnly={true} context={context} />
+            </WebAnalyticsTileSkeletonGate>
+        </div>
     )
 }
 
@@ -1155,7 +1734,7 @@ const FrustrationMetricsEmptyState = (
             <div className="flex items-center gap-8 w-full justify-center">
                 <div>
                     <div className="w-40 lg:w-50 mx-auto mb-4 hidden md:block">
-                        <StarHog />
+                        <HedgehogStar />
                     </div>
                     <p>No frustrating pages found! Keep up the great work!</p>
                 </div>

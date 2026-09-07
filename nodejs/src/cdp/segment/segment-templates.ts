@@ -2,7 +2,7 @@ import { DestinationDefinition, destinations } from '@segment/action-destination
 
 import { HogFunctionFilterEvent, HogFunctionInputSchemaType, HogFunctionTemplate } from '~/cdp/types'
 
-import { EXTEND_OBJECT_KEY } from '../services/hog-executor.service'
+import { EXTEND_OBJECT_KEY } from '../services/hog-inputs.service'
 
 export type SegmentDestination = {
     template: HogFunctionTemplate
@@ -253,7 +253,7 @@ const translateInputs = (defaultVal: any, multiple: boolean = false) => {
         return defaultVal
     }
     if (['boolean'].includes(typeof defaultVal)) {
-        return defaultVal ? 'true' : 'false'
+        return defaultVal
     }
     if (typeof defaultVal === 'object') {
         if (defaultVal && '@path' in defaultVal) {
@@ -351,7 +351,7 @@ const getFieldType = (field: any) => {
         return 'dictionary'
     }
 
-    if (['number', 'integer', 'datetime', 'password', 'boolean'].includes(field.type)) {
+    if (['number', 'integer', 'datetime', 'password'].includes(field.type)) {
         return 'string'
     }
 
@@ -420,6 +420,7 @@ const getIconUrl = (id: string, slug: string | undefined) => {
         'segment-actions-saleswings': 'saleswingsapp.com',
         'segment-actions-schematic': 'schematichq.com',
         'segment-actions-canny': 'canny.io',
+        'segment-actions-koala-cloud': 'getkoala.com',
     }
 
     if (!slug && !(id in icon_overrides)) {
@@ -559,6 +560,16 @@ export const SEGMENT_DESTINATIONS = Object.entries(destinations)
                                 default: preset.partnerAction,
                                 description: 'The partner action to use',
                                 required: true,
+                                secret: false,
+                            },
+                            {
+                                key: 'internal_omit_empty_values',
+                                label: 'Omit empty values',
+                                type: 'boolean',
+                                default: false,
+                                description:
+                                    'Leave out any field that ends up empty (null or an empty string) instead of sending it. Use this when a property is only set on some events and you do not want the destination to overwrite what it already has.',
+                                required: false,
                                 secret: false,
                             },
                         ],

@@ -1,5 +1,9 @@
 use std::{sync::Arc, time::Duration};
 
+/// Metric name for the counter incremented each time a new physical database connection
+/// is established. Labeled with `pool` when `PoolConfig::pool_name` is set.
+pub const DB_CONNECTION_CREATED_COUNTER: &str = "db_connection_created_total";
+
 use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::{
@@ -8,6 +12,13 @@ use sqlx::{
     Error as SqlxError, Postgres,
 };
 use thiserror::Error;
+
+pub mod writer_guard;
+
+pub use writer_guard::{
+    install_writer_guard, WriterGuard, WriterGuardConfig, DB_WRITER_GUARD_CAPPED_COUNTER,
+    DB_WRITER_PROBE_COUNTER,
+};
 
 #[derive(Error, Debug)]
 pub enum CustomDatabaseError {
@@ -49,6 +60,10 @@ pub struct PoolConfig {
     /// PostgreSQL statement_timeout to set on each connection (in milliseconds)
     /// Set to None to use the database default
     pub statement_timeout_ms: Option<u64>,
+    /// Optional pool name used to label the `db_connection_created_total` counter.
+    /// When set, each new connection triggers a counter increment labeled with this name,
+    /// enabling visibility into connection churn per pool.
+    pub pool_name: Option<String>,
 }
 
 impl Default for PoolConfig {
@@ -62,6 +77,7 @@ impl Default for PoolConfig {
             idle_timeout: Some(Duration::from_secs(300)), // Close idle connections after 5 minutes
             test_before_acquire: true,                    // Test connection health before use
             statement_timeout_ms: None,                   // Use database default
+            pool_name: None,
         }
     }
 }
@@ -105,21 +121,38 @@ pub fn get_pool_with_config(url: &str, config: PoolConfig) -> Result<PgPool, sql
         .min_connections(config.min_connections)
         .max_connections(config.max_connections)
         .acquire_timeout(config.acquire_timeout)
-        .test_before_acquire(config.test_before_acquire);
+        .test_before_acquire(config.test_before_acquire)
+        // Disable sqlx's default 30-min max_lifetime. Without this explicit None,
+        // connections created together (e.g. during pod scale-up) all expire at the
+        // same instant, causing a thundering herd of TLS reconnects that saturates
+        // the database. test_before_acquire covers a severed socket, but not a server
+        // that stopped accepting writes: a pool that must reach a writer needs
+        // `writer_guard` as well, since nothing here will ever recycle a demoted reader.
+        .max_lifetime(None);
 
     if let Some(idle_timeout) = config.idle_timeout {
         options = options.idle_timeout(idle_timeout);
     }
 
-    // If statement_timeout is configured, set it via after_connect hook
-    if let Some(timeout_ms) = config.statement_timeout_ms {
+    let pool_name = config.pool_name;
+    let statement_timeout_ms = config.statement_timeout_ms;
+
+    if pool_name.is_some() || statement_timeout_ms.is_some() {
         options = options.after_connect(move |conn, _meta| {
+            let pool_name = pool_name.clone();
             Box::pin(async move {
-                // Note: SET statement_timeout does not support parameterized queries ($1),
-                // so we use format!(). This is safe because timeout_ms is typed as u64.
-                sqlx::query(&format!("SET statement_timeout = {timeout_ms}"))
-                    .execute(&mut *conn)
-                    .await?;
+                if let Some(timeout_ms) = statement_timeout_ms {
+                    // Note: SET statement_timeout does not support parameterized queries ($1),
+                    // so we use format!(). This is safe because timeout_ms is typed as u64.
+                    sqlx::query(&format!("SET statement_timeout = {timeout_ms}"))
+                        .execute(&mut *conn)
+                        .await?;
+                }
+
+                if let Some(name) = pool_name {
+                    metrics::counter!(DB_CONNECTION_CREATED_COUNTER, "pool" => name).increment(1);
+                }
+
                 Ok(())
             })
         });
@@ -239,12 +272,56 @@ pub fn extract_timeout_type(error: &SqlxError) -> Option<&'static str> {
     }
 }
 
+/// Determines if a sqlx::Error is SQLSTATE 25006: the server refused a write because the
+/// session is read-only. On Aurora this is what a demoted writer returns, so retrying the same
+/// connection cannot help.
+pub fn is_read_only_error(error: &SqlxError) -> bool {
+    let SqlxError::Database(db) = error else {
+        return false;
+    };
+    db.code().as_deref() == Some("25006")
+}
+
+/// Coarse, bounded label for a failed query. Raw SQLSTATE has too many values to label a
+/// counter with.
+pub fn error_class(error: &SqlxError) -> &'static str {
+    // Pool-level cases first: `is_timeout_error` counts `PoolTimedOut`, but a saturated pool
+    // and a slow statement need different responses.
+    match error {
+        SqlxError::PoolTimedOut => return "pool_timeout",
+        SqlxError::PoolClosed => return "pool_closed",
+        _ => {}
+    }
+    if is_read_only_error(error) {
+        return "read_only";
+    }
+    if is_timeout_error(error) {
+        return "timeout";
+    }
+    if is_foreign_key_constraint_error(error) {
+        return "fk_violation";
+    }
+    match error {
+        SqlxError::Database(db) => match db.code().as_deref() {
+            Some("40P01") => "deadlock",
+            Some("40001") => "serialization",
+            Some("53300") => "too_many_connections",
+            Some("57P01" | "57P02" | "57P03") => "server_shutdown",
+            _ => "database",
+        },
+        SqlxError::Io(_) => "io",
+        SqlxError::Tls(_) => "tls",
+        _ => "other",
+    }
+}
+
 /// Determines if a sqlx::Error represents a transient failure that should be retried
 pub fn is_transient_error(error: &SqlxError) -> bool {
     match error {
         // Connection/pool issues: usually transient.
+        // Note: PoolTimedOut is deliberately excluded — pool exhaustion is systemic,
+        // not transient. Retrying amplifies load on an already-overloaded pool.
         SqlxError::Io(_)
-        | SqlxError::PoolTimedOut
         | SqlxError::PoolClosed
         // TLS/handshake can be transient (network/cert rollover).
         | SqlxError::Tls(_) => true,
@@ -304,9 +381,9 @@ mod tests {
 
     #[test]
     fn test_is_transient_error_connection_errors() {
-        // Test that database connection errors trigger retries
+        // PoolTimedOut is NOT transient — pool exhaustion is systemic, retrying amplifies load
         let pool_timeout_error = SqlxError::PoolTimedOut;
-        assert!(is_transient_error(&pool_timeout_error));
+        assert!(!is_transient_error(&pool_timeout_error));
 
         let pool_closed_error = SqlxError::PoolClosed;
         assert!(is_transient_error(&pool_closed_error));
@@ -822,5 +899,26 @@ mod tests {
             extract_timeout_type(&SqlxError::ColumnNotFound("test".to_string())),
             None
         );
+    }
+
+    #[test]
+    fn error_class_separates_a_failover_from_ordinary_write_failures() {
+        assert_eq!(error_class(&SqlxError::PoolTimedOut), "pool_timeout");
+        assert_eq!(error_class(&SqlxError::PoolClosed), "pool_closed");
+        assert_eq!(
+            error_class(&SqlxError::Io(std::io::Error::other("x"))),
+            "io"
+        );
+        assert_eq!(error_class(&SqlxError::RowNotFound), "other");
+    }
+
+    #[test]
+    fn is_read_only_error_ignores_non_database_errors() {
+        assert!(!is_read_only_error(&SqlxError::PoolTimedOut));
+        // Only the SQLSTATE counts; matching message text would let any error impersonate a
+        // failover.
+        assert!(!is_read_only_error(&SqlxError::Protocol(
+            "cannot execute INSERT in a read-only transaction".to_string()
+        )));
     }
 }

@@ -13,15 +13,23 @@ on:
             - livestream/**
 
 concurrency:
-    group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+    group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
     cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+    # npm's audit blocks the pnpm bootstrap. See .github/actions/pnpm-install for why.
+    NPM_CONFIG_AUDIT: 'false'
+    NPM_CONFIG_FUND: 'false'
 
 jobs:
     # Job to decide if we should run backend ci
-    # See https://github.com/dorny/paths-filter#conditional-execution for more details
+    # See .github/actions/paths-filter/README.md for filter semantics
     changes:
         runs-on: ubuntu-24.04
         timeout-minutes: 5
+        # Skipped on trunk-merge/** heads: merge-queue PRs are ephemeral and every
+        # constituent PR already ran this in full.
+        if: ${{ !startsWith(github.head_ref, 'trunk-merge/') }}
         name: Determine need to run Hog checks
         permissions:
             contents: read
@@ -32,12 +40,22 @@ jobs:
         steps:
             # For pull requests it's not necessary to checkout the code, but we
             # also want this to run on master so we need to checkout
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+              with:
+                  sparse-checkout: .github/actions/paths-filter
+                  sparse-checkout-cone-mode: false
 
-            - uses: dorny/paths-filter@de90cc6fb38fc0963ad72b210f1f284cd68cea36 # v3.0.2
+            - uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+              id: app-token
+              if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+              with:
+                  client-id: ${{ vars.GH_APP_POSTHOG_PATHS_FILTER_APP_ID }}
+                  private-key: ${{ secrets.GH_APP_POSTHOG_PATHS_FILTER_PRIVATE_KEY }}
+            - uses: ./.github/actions/paths-filter
               id: filter
               if: github.event_name != 'push' # Run all tests on master push
               with:
+                  token: ${{ steps.app-token.outputs.token || github.token }}
                   filters: |
                       hog:
                         # Avoid running tests for irrelevant changes
@@ -56,23 +74,39 @@ jobs:
         name: Hog tests
         runs-on: ubuntu-24.04
         if: needs.changes.outputs.hog == 'true'
+        outputs:
+            committed-version: ${{ steps.check-package-version.outputs.committed-version }}
+            published-version: ${{ steps.check-package-version.outputs.published-version }}
+            is-new-version: ${{ steps.check-package-version.outputs.is-new-version }}
 
         steps:
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
               with:
                   fetch-depth: 1
 
+            - name: Mint setup-action GitHub token
+              id: setup-gh-token
+              if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+              continue-on-error: true
+              uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+              with:
+                  client-id: ${{ vars.GH_APP_POSTHOG_SETUP_ACTIONS_APP_ID }}
+                  private-key: ${{ secrets.GH_APP_POSTHOG_SETUP_ACTIONS_PRIVATE_KEY }}
+                  skip-token-revoke: true
+
             - name: Set up Python
-              uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+              uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
               with:
                   python-version-file: 'pyproject.toml'
+                  token: ${{ steps.setup-gh-token.outputs.token || github.token }}
 
             - name: Install uv
               id: setup-uv
-              uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7.3.0
+              uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
               with:
-                  version: '0.10.2' # pinned: unpinned setup-uv calls GH API on every job, exhausts rate limit
+                  version: '0.11.28' # pinned: unpinned setup-uv calls GH API on every job, exhausts rate limit
                   enable-cache: true
+                  cache-dependency-glob: uv.lock
                   save-cache: ${{ github.ref == 'refs/heads/master' }}
 
             - name: Install SAML (python3-saml) dependencies
@@ -85,25 +119,21 @@ jobs:
               run: |
                   UV_PROJECT_ENVIRONMENT=$pythonLocation uv sync --frozen --dev
 
-            - name: Install pnpm
-              uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061 # v4.2.0
-
-            - name: Fix node-gyp permissions
-              run: chmod +x ~/setup-pnpm/node_modules/.pnpm/pnpm@*/node_modules/pnpm/dist/node_modules/node-gyp/gyp/gyp_main.py
-
-            - name: Set up Node.js
-              uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
+            - name: Install pnpm dependencies
+              uses: ./.github/actions/pnpm-install
               with:
-                  node-version: 18
-                  cache: 'pnpm'
+                  install-command: pnpm --filter=@posthog/hogvm install --frozen-lockfile
+                  token: ${{ steps.setup-gh-token.outputs.token || github.token }}
 
             - name: Check if ANTLR definitions are up to date
               run: |
                   cd ..
-                  sudo apt-get update && sudo apt-get install default-jre
                   mkdir antlr
                   cd antlr
-                  curl -o antlr.jar https://www.antlr.org/download/antlr-$ANTLR_VERSION-complete.jar
+                  # Short budget: the `||` mirror is the real fallback for a host that is down.
+                  fetch=(curl --fail --location --retry 3 --retry-all-errors --retry-max-time 30 --connect-timeout 10)
+                  "${fetch[@]}" https://www.antlr.org/download/antlr-${ANTLR_VERSION}-complete.jar --output antlr.jar \
+                      || "${fetch[@]}" https://repo.maven.apache.org/maven2/org/antlr/antlr4/${ANTLR_VERSION}/antlr4-${ANTLR_VERSION}-complete.jar --output antlr.jar
                   export PWD=`pwd`
                   echo '#!/bin/bash' > antlr
                   echo "java -jar $PWD/antlr.jar \$*" >> antlr
@@ -145,50 +175,50 @@ jobs:
               env:
                   TEST: 1
 
-    check-package-version:
-        name: Check HogVM TypeScript package version and detect an update
-        needs: hog-tests
-        if: needs.hog-tests.result == 'success' && needs.changes.outputs.hog == 'true'
-        runs-on: ubuntu-24.04
-        outputs:
-            committed-version: ${{ steps.check-package-version.outputs.committed-version }}
-            published-version: ${{ steps.check-package-version.outputs.published-version }}
-            is-new-version: ${{ steps.check-package-version.outputs.is-new-version }}
-        steps:
-            - name: Checkout the repository
-              uses: actions/checkout@v6
             - name: Check package version and detect an update
               id: check-package-version
-              uses: PostHog/check-package-version@138438a8fed9213fa112f841b1c89f9bd68f5cca # v2.1.0
+              uses: PostHog/check-package-version@f540540cb12d45ec3c58d42dbf1d60070ed2d268 # v2.1.1
               with:
                   path: common/hogvm/typescript
 
     release-hogvm:
         name: Release new HogVM TypeScript version
         runs-on: ubuntu-24.04
-        needs: check-package-version
-        if: needs.changes.outputs.hog == 'true' && needs.check-package-version.outputs.is-new-version == 'true'
+        timeout-minutes: 5
+        needs: hog-tests
+        if: needs.hog-tests.outputs.is-new-version == 'true'
         permissions:
             contents: read
             id-token: write
         env:
-            COMMITTED_VERSION: ${{ needs.check-package-version.outputs.committed-version }}
-            PUBLISHED_VERSION: ${{ needs.check-package-version.outputs.published-version }}
+            COMMITTED_VERSION: ${{ needs.hog-tests.outputs.committed-version }}
+            PUBLISHED_VERSION: ${{ needs.hog-tests.outputs.published-version }}
         steps:
             - name: Checkout the repository
-              uses: actions/checkout@v6
+              uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
               with:
                   fetch-depth: 1
+            - name: Mint setup-action GitHub token
+              id: setup-gh-token
+              if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+              continue-on-error: true
+              uses: actions/create-github-app-token@1b10c78c7865c340bc4f6099eb2f838309f1e8c3 # v3.1.1
+              with:
+                  client-id: ${{ vars.GH_APP_POSTHOG_SETUP_ACTIONS_APP_ID }}
+                  private-key: ${{ secrets.GH_APP_POSTHOG_SETUP_ACTIONS_PRIVATE_KEY }}
+                  skip-token-revoke: true
             - name: Set up Python
-              uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+              uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
               with:
                   python-version-file: 'pyproject.toml'
+                  token: ${{ steps.setup-gh-token.outputs.token || github.token }}
             - name: Install uv
               id: setup-uv-hogql-python
-              uses: astral-sh/setup-uv@eac588ad8def6316056a12d4907a9d4d84ff7a3b # v7.3.0
+              uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
               with:
-                  version: '0.10.2' # pinned: unpinned setup-uv calls GH API on every job, exhausts rate limit
+                  version: '0.11.28' # pinned: unpinned setup-uv calls GH API on every job, exhausts rate limit
                   enable-cache: true
+                  cache-dependency-glob: uv.lock
                   save-cache: ${{ github.ref == 'refs/heads/master' }}
             - name: Install SAML (python3-saml) dependencies
               if: steps.setup-uv-hogql-python.outputs.cache-hit != 'true'
@@ -199,15 +229,15 @@ jobs:
               run: |
                   UV_PROJECT_ENVIRONMENT=$pythonLocation uv sync --frozen --dev
             - name: Install pnpm
-              uses: pnpm/action-setup@41ff72655975bd51cab0327fa583b6e92b6d3061 # v4.2.0
+              uses: pnpm/action-setup@0e279bb959325dab635dd2c09392533439d90093 # v6.0.8
             - name: Fix node-gyp permissions
-              run: chmod +x ~/setup-pnpm/node_modules/.pnpm/pnpm@*/node_modules/pnpm/dist/node_modules/node-gyp/gyp/gyp_main.py
-            - name: Set up Node 24
-              uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
+              run: find ~/setup-pnpm -name gyp_main.py -exec chmod +x {} +
+            - name: Set up Node.js
+              uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
               with:
-                  node-version: 24
-                  cache: 'pnpm'
+                  node-version-file: .nvmrc
                   registry-url: https://registry.npmjs.org
+                  token: ${{ steps.setup-gh-token.outputs.token || github.token }}
             - name: Install package.json dependencies
               run: pnpm --filter=@posthog/hogvm install --frozen-lockfile
             - name: Publish the package in the npm registry

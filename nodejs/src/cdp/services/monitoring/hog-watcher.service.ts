@@ -1,11 +1,12 @@
 import { Counter } from 'prom-client'
 
-import { RedisV2, getRedisPipelineResults } from '~/common/redis/redis-v2'
-import { LazyLoader } from '~/utils/lazy-loader'
-import { logger } from '~/utils/logger'
-import { captureTeamEvent } from '~/utils/posthog'
+import { RedisClientPipeline, RedisV2, getRedisPipelineResults } from '~/common/redis/redis-v2'
+import { KeyedRateLimiterService } from '~/common/services/keyed-rate-limiter.service'
+import { LazyLoader } from '~/common/utils/lazy-loader'
+import { logger } from '~/common/utils/logger'
+import { captureTeamEvent } from '~/common/utils/posthog'
+import { TeamManager } from '~/common/utils/team-manager'
 
-import { Hub } from '../../../types'
 import {
     CyclotronJobInvocation,
     CyclotronJobInvocationHogFunction,
@@ -14,25 +15,23 @@ import {
     HogFunctionType,
 } from '../../types'
 
-export type HogWatcherServiceHub = Pick<
-    Hub,
-    | 'teamManager'
-    | 'CDP_WATCHER_HOG_COST_TIMING_LOWER_MS'
-    | 'CDP_WATCHER_HOG_COST_TIMING_UPPER_MS'
-    | 'CDP_WATCHER_HOG_COST_TIMING'
-    | 'CDP_WATCHER_ASYNC_COST_TIMING_LOWER_MS'
-    | 'CDP_WATCHER_ASYNC_COST_TIMING_UPPER_MS'
-    | 'CDP_WATCHER_ASYNC_COST_TIMING'
-    | 'CDP_WATCHER_SEND_EVENTS'
-    | 'CDP_WATCHER_BUCKET_SIZE'
-    | 'CDP_WATCHER_REFILL_RATE'
-    | 'CDP_WATCHER_TTL'
-    | 'CDP_WATCHER_AUTOMATICALLY_DISABLE_FUNCTIONS'
-    | 'CDP_WATCHER_THRESHOLD_DEGRADED'
-    | 'CDP_WATCHER_STATE_LOCK_TTL'
-    | 'CDP_WATCHER_OBSERVE_RESULTS_BUFFER_TIME_MS'
-    | 'CDP_WATCHER_OBSERVE_RESULTS_BUFFER_MAX_RESULTS'
->
+export interface HogWatcherConfig {
+    hogCostTimingLowerMs: number
+    hogCostTimingUpperMs: number
+    hogCostTiming: number
+    asyncCostTimingLowerMs: number
+    asyncCostTimingUpperMs: number
+    asyncCostTiming: number
+    sendEvents: boolean
+    bucketSize: number
+    refillRate: number
+    ttl: number
+    automaticallyDisableFunctions: boolean
+    thresholdDegraded: number
+    stateLockTtl: number
+    observeResultsBufferTimeMs: number
+    observeResultsBufferMaxResults: number
+}
 
 export const BASE_REDIS_KEY = process.env.NODE_ENV == 'test' ? '@posthog-test/hog-watcher-2' : '@posthog/hog-watcher-2'
 const REDIS_KEY_TOKENS = `${BASE_REDIS_KEY}/tokens`
@@ -52,6 +51,39 @@ export enum HogWatcherState {
 export type HogWatcherFunctionState = {
     tokens: number
     state: HogWatcherState
+}
+
+/**
+ * Compares a watcher read across Redis and Valkey on `state` alone, for `dualRead`.
+ *
+ * `tokens` is refilled from the wall clock at read time (see `getPersistedStates`), so the two
+ * stores disagree on it whenever their reads land on different seconds. Comparing it would leave
+ * the mismatch metric permanently saturated, and that metric is the signal we need to trust
+ * before moving watcher reads to Valkey. `state` is what decides whether an invocation runs.
+ */
+export function sameWatcherState(
+    primary: HogWatcherFunctionState | null,
+    secondary: HogWatcherFunctionState | null
+): boolean {
+    return primary?.state === secondary?.state
+}
+
+/** `sameWatcherState` over a keyed batch — the id set has to agree as well as each state. */
+export function sameWatcherStates(
+    primary: Record<string, HogWatcherFunctionState>,
+    secondary: Record<string, HogWatcherFunctionState>
+): boolean {
+    const ids = Object.keys(primary ?? {})
+    return (
+        ids.length === Object.keys(secondary ?? {}).length &&
+        ids.every((id) => primary[id]?.state === secondary[id]?.state)
+    )
+}
+
+type FunctionCostEntry = {
+    hogFunction?: HogFunctionType
+    functionId: string
+    cost: number
 }
 
 const hogFunctionStateChange = new Counter({
@@ -94,23 +126,41 @@ export class HogWatcherService {
         results: CyclotronJobInvocationResult[]
         promise: Promise<void>
         timeout: NodeJS.Timeout
-        complete: () => void
+        resolve: () => void
+        reject: (error: unknown) => void
     } | null = null
 
+    private redisReader: RedisV2
+    private rateLimiter: KeyedRateLimiterService
+
     constructor(
-        private hub: HogWatcherServiceHub,
-        private redis: RedisV2
+        private teamManager: TeamManager,
+        private config: HogWatcherConfig,
+        private redis: RedisV2,
+        redisReader?: RedisV2
     ) {
+        this.redisReader = redisReader ?? redis
+        // Token-bucket rate limiter — `name: 'hog-watcher-2'` produces the same
+        // Redis key prefix this service has used historically (matches BASE_REDIS_KEY).
+        this.rateLimiter = new KeyedRateLimiterService(
+            {
+                name: 'hog-watcher-2',
+                bucketSize: this.config.bucketSize,
+                refillRate: this.config.refillRate,
+                ttlSeconds: this.config.ttl,
+            },
+            this.redis
+        )
         this.costsMapping = {
             hog: {
-                lowerBound: this.hub.CDP_WATCHER_HOG_COST_TIMING_LOWER_MS,
-                upperBound: this.hub.CDP_WATCHER_HOG_COST_TIMING_UPPER_MS,
-                cost: this.hub.CDP_WATCHER_HOG_COST_TIMING,
+                lowerBound: this.config.hogCostTimingLowerMs,
+                upperBound: this.config.hogCostTimingUpperMs,
+                cost: this.config.hogCostTiming,
             },
             async_function: {
-                lowerBound: this.hub.CDP_WATCHER_ASYNC_COST_TIMING_LOWER_MS,
-                upperBound: this.hub.CDP_WATCHER_ASYNC_COST_TIMING_UPPER_MS,
-                cost: this.hub.CDP_WATCHER_ASYNC_COST_TIMING,
+                lowerBound: this.config.asyncCostTimingLowerMs,
+                upperBound: this.config.asyncCostTimingUpperMs,
+                cost: this.config.asyncCostTiming,
             },
         }
 
@@ -139,7 +189,7 @@ export class HogWatcherService {
         state: HogWatcherState
         previousState: HogWatcherState
     }) {
-        const team = await this.hub.teamManager.getTeam(hogFunction.team_id)
+        const team = await this.teamManager.getTeam(hogFunction.team_id)
 
         logger.info('[HogWatcherService] onStateChange', {
             hogFunctionId: hogFunction.id,
@@ -148,7 +198,7 @@ export class HogWatcherService {
             previousState,
         })
 
-        if (team && this.hub.CDP_WATCHER_SEND_EVENTS) {
+        if (team && this.config.sendEvents) {
             captureTeamEvent(team, 'hog_function_state_change', {
                 hog_function_id: hogFunction.id,
                 hog_function_type: hogFunction.type,
@@ -160,26 +210,13 @@ export class HogWatcherService {
         }
     }
 
-    private rateLimitArgs(id: HogFunctionType['id'], cost: number) {
-        const nowSeconds = Math.round(Date.now() / 1000)
-
-        return [
-            `${REDIS_KEY_TOKENS}/${id}`,
-            nowSeconds,
-            cost,
-            this.hub.CDP_WATCHER_BUCKET_SIZE,
-            this.hub.CDP_WATCHER_REFILL_RATE,
-            this.hub.CDP_WATCHER_TTL,
-        ] as const
-    }
-
     public calculateNewState(tokens: number): HogWatcherState {
-        const rating = tokens / this.hub.CDP_WATCHER_BUCKET_SIZE
+        const rating = tokens / this.config.bucketSize
 
-        if (rating < 0 && this.hub.CDP_WATCHER_AUTOMATICALLY_DISABLE_FUNCTIONS) {
+        if (rating < 0 && this.config.automaticallyDisableFunctions) {
             return HogWatcherState.disabled
         }
-        if (rating <= this.hub.CDP_WATCHER_THRESHOLD_DEGRADED) {
+        if (rating <= this.config.thresholdDegraded) {
             return HogWatcherState.degraded
         }
 
@@ -187,31 +224,55 @@ export class HogWatcherService {
     }
 
     /**
-     * Get the persisted states of a list of hog functions
+     * Get the persisted states of a list of hog functions.
+     *
+     * Uses plain hget calls instead of the evalsha Lua script.
+     * The Lua script with cost=0 was doing 2 hget + 2 hset + 1 expire
+     * per call — all writes unnecessary for a read-only check.
+     * Replacing with 2 hget calls eliminates ~60% of internal Redis
+     * operations per read and makes this method safe to route to
+     * read replicas in the future.
      */
     public async getPersistedStates(
         ids: HogFunctionType['id'][]
     ): Promise<Record<HogFunctionType['id'], HogWatcherFunctionState>> {
         const idsSet = new Set(ids)
+        const nowSeconds = Math.round(Date.now() / 1000)
 
-        const res = await this.redis.usePipeline({ name: 'getStates' }, (pipeline) => {
+        const buildGetStatesPipeline = (pipeline: RedisClientPipeline) => {
             for (const id of idsSet) {
-                pipeline.checkRateLimitV2(...this.rateLimitArgs(id, 0))
+                pipeline.hmget(`${REDIS_KEY_TOKENS}/${id}`, 'pool', 'ts')
                 pipeline.get(`${REDIS_KEY_STATE}/${id}`)
             }
-        })
+        }
+
+        let res
+        try {
+            res = await this.redisReader.usePipeline({ name: 'getStates' }, buildGetStatesPipeline)
+        } catch (err) {
+            logger.warn('🔀', '[HogWatcher] reader getStates failed, falling back to writer', { err })
+            res = await this.redis.usePipeline({ name: 'getStates' }, buildGetStatesPipeline)
+        }
 
         return Array.from(idsSet).reduce(
             (acc, id, index) => {
                 const resIndex = index * 2
-                // V2 returns [tokensBefore, tokensAfter], we use tokensAfter
-                const tokenResult = res ? res[resIndex][1] : undefined
-                const tokens = tokenResult?.[1] ?? this.hub.CDP_WATCHER_BUCKET_SIZE
-                const state = res ? res[resIndex + 1][1] : undefined
+                const [pool, ts] = res?.[resIndex]?.[1] ?? [null, null]
+                const stateVal = res?.[resIndex + 1]?.[1]
+
+                // Same refill calculation as the Lua token bucket script
+                let tokens: number
+                if (pool === null || pool === undefined) {
+                    tokens = this.config.bucketSize
+                } else {
+                    const timeDiff = ts ? Math.max(nowSeconds - Number(ts), 0) : 0
+                    const owedTokens = timeDiff * this.config.refillRate
+                    tokens = Math.min(Number(pool) + owedTokens, this.config.bucketSize)
+                }
 
                 acc[id] = {
-                    state: state ? Number(state) : HogWatcherState.healthy,
-                    tokens: tokens,
+                    state: stateVal ? Number(stateVal) : HogWatcherState.healthy,
+                    tokens,
                 }
 
                 return acc
@@ -265,19 +326,27 @@ export class HogWatcherService {
     }
 
     public async getAllFunctionStates(): Promise<Record<HogFunctionType['id'], HogWatcherFunctionState>> {
-        // Scan all state keys in Redis
-        const stateKeys = await this.redis.useClient({ name: 'scanStates' }, async (client) => {
-            const keys: string[] = []
-            let cursor = '0'
+        const scan = (pool: RedisV2): Promise<string[] | null> =>
+            pool.useClient({ name: 'scanStates' }, async (client) => {
+                const keys: string[] = []
+                let cursor = '0'
 
-            do {
-                const [newCursor, batch] = await client.scan(cursor, 'MATCH', `${REDIS_KEY_STATE}/*`, 'COUNT', 500)
-                cursor = newCursor
-                keys.push(...batch)
-            } while (cursor !== '0')
+                do {
+                    const [newCursor, batch] = await client.scan(cursor, 'MATCH', `${REDIS_KEY_STATE}/*`, 'COUNT', 500)
+                    cursor = newCursor
+                    keys.push(...batch)
+                } while (cursor !== '0')
 
-            return keys
-        })
+                return keys
+            })
+
+        let stateKeys: string[] | null
+        try {
+            stateKeys = await scan(this.redisReader)
+        } catch (err) {
+            logger.warn('🔀', '[HogWatcher] reader scanStates failed, falling back to writer', { err })
+            stateKeys = await scan(this.redis)
+        }
 
         if (!stateKeys || stateKeys.length === 0) {
             return {}
@@ -300,8 +369,6 @@ export class HogWatcherService {
         changes: [HogFunctionType, HogWatcherState][],
         forceReset: boolean = false
     ): Promise<void> {
-        logger.info('[HogWatcherService] Performing state changes', { changes, forceReset })
-
         const res = await this.redis.usePipeline({ name: 'forceStateChange' }, (pipeline) => {
             for (const [hogFunction, state] of changes) {
                 hogFunctionStateChange.inc({
@@ -312,15 +379,15 @@ export class HogWatcherService {
                 const id = hogFunction.id
                 const newScore =
                     state === HogWatcherState.healthy
-                        ? this.hub.CDP_WATCHER_BUCKET_SIZE
+                        ? this.config.bucketSize
                         : state === HogWatcherState.degraded
-                          ? this.hub.CDP_WATCHER_BUCKET_SIZE * this.hub.CDP_WATCHER_THRESHOLD_DEGRADED
+                          ? this.config.bucketSize * this.config.thresholdDegraded
                           : 0
 
                 const nowSeconds = Math.round(Date.now() / 1000)
 
                 pipeline.getset(`${REDIS_KEY_STATE}/${id}`, state) // Set the state
-                pipeline.setex(`${REDIS_KEY_STATE_LOCK}/${id}`, this.hub.CDP_WATCHER_STATE_LOCK_TTL, '1') // Set the lock
+                pipeline.setex(`${REDIS_KEY_STATE_LOCK}/${id}`, this.config.stateLockTtl, '1') // Set the lock
                 if (forceReset) {
                     pipeline.hset(`${REDIS_KEY_TOKENS}/${id}`, 'pool', newScore)
                     pipeline.hset(`${REDIS_KEY_TOKENS}/${id}`, 'ts', nowSeconds)
@@ -354,14 +421,7 @@ export class HogWatcherService {
     }
 
     public async observeResults(results: CyclotronJobInvocationResult[]): Promise<void> {
-        const functionCosts: Record<
-            CyclotronJobInvocation['functionId'],
-            {
-                hogFunction?: HogFunctionType
-                functionId: CyclotronJobInvocation['functionId']
-                cost: number
-            }
-        > = {}
+        const functionCosts: Record<CyclotronJobInvocation['functionId'], FunctionCostEntry> = {}
 
         results.forEach((result) => {
             if (!isHogFunctionResult(result)) {
@@ -390,32 +450,96 @@ export class HogWatcherService {
             functionCosts[result.invocation.functionId] = functionCost
         })
 
-        // We apply the costs and return the existing states so we can calculate those that need a state change
-        const res = await this.redis.usePipeline({ name: 'updateRateLimits' }, (pipeline) => {
-            for (const functionCost of Object.values(functionCosts)) {
-                pipeline.get(`${REDIS_KEY_STATE}/${functionCost.functionId}`)
-                pipeline.get(`${REDIS_KEY_STATE_LOCK}/${functionCost.functionId}`)
-                pipeline.checkRateLimitV2(...this.rateLimitArgs(functionCost.functionId, functionCost.cost))
-            }
-        })
+        await this.applyCostsAndTransitionStates(Object.values(functionCosts))
+    }
 
-        if (!res) {
+    /**
+     * Per-(function, Kafka message) cost reporting for log transformations.
+     *
+     * The events path allocates one CyclotronJobInvocationResult per event; at log-record
+     * volumes that is prohibitive, so the logs transformer reports a single aggregated VM
+     * duration per function per message instead. Cost is derived from that aggregate via the
+     * same piecewise-linear curve (bounds come from this instance's config, so a logs-tuned
+     * HogWatcher charges on a logs-appropriate scale). Everything downstream — token bucket,
+     * state reads, transition rules — is shared with observeResults.
+     */
+    public async observeAggregatedResults(
+        observations: { hogFunction: HogFunctionType; totalDurationMs: number }[]
+    ): Promise<void> {
+        const functionCosts: Record<string, FunctionCostEntry> = {}
+        const costConfig = this.costsMapping.hog
+        if (!costConfig) {
+            return
+        }
+
+        for (const { hogFunction, totalDurationMs } of observations) {
+            const functionCost = functionCosts[hogFunction.id] ?? {
+                functionId: hogFunction.id,
+                cost: 0,
+                hogFunction,
+            }
+            const ratio =
+                Math.max(totalDurationMs - costConfig.lowerBound, 0) / (costConfig.upperBound - costConfig.lowerBound)
+            functionCost.cost += Math.round(costConfig.cost * ratio)
+            functionCosts[hogFunction.id] = functionCost
+        }
+
+        await this.applyCostsAndTransitionStates(Object.values(functionCosts))
+    }
+
+    private async applyCostsAndTransitionStates(functionCostEntries: FunctionCostEntry[]): Promise<void> {
+        if (functionCostEntries.length === 0) {
+            return
+        }
+
+        // Split reads (state/lock) to the reader and writes (token bucket) to the writer.
+        // These can run concurrently since the reads don't depend on the write results.
+        const stateKeys = functionCostEntries.map((fc) => `${REDIS_KEY_STATE}/${fc.functionId}`)
+        const lockKeys = functionCostEntries.map((fc) => `${REDIS_KEY_STATE_LOCK}/${fc.functionId}`)
+
+        const readStates = async (pool: RedisV2) => {
+            // Single-key pipeline commands avoid CROSSSLOT errors when function IDs map to different cluster slots.
+            const results = await pool.usePipeline({ name: 'readStatesForObserve' }, (pipeline) => {
+                stateKeys.forEach((key) => pipeline.get(key))
+                lockKeys.forEach((key) => pipeline.get(key))
+            })
+            if (!results) {
+                return null
+            }
+            const commandError = results.find(([error]) => error)?.[0]
+            if (commandError) {
+                throw commandError
+            }
+            return {
+                states: stateKeys.map((_, index) => results[index]?.[1]),
+                locks: lockKeys.map((_, index) => results[stateKeys.length + index]?.[1]),
+            }
+        }
+
+        const requests = functionCostEntries.map((fc) => ({ id: fc.functionId, cost: fc.cost }))
+        const [stateRes, rateLimitRes] = await Promise.all([
+            readStates(this.redisReader).catch((err) => {
+                logger.warn('🔀', '[HogWatcher] reader readStatesForObserve failed, falling back to writer', { err })
+                return readStates(this.redis)
+            }),
+            this.rateLimiter.rateLimitGrouped(requests),
+        ])
+
+        if (!stateRes) {
             return
         }
 
         const changes: [HogFunctionType, HogWatcherState][] = []
 
         // Calculate all those that have changed state
-        Object.values(functionCosts).map((functionCost, index) => {
-            const [stateResult, lockResult, tokenResult] = getRedisPipelineResults(res, index, 3)
-
-            const currentState: HogWatcherState = Number(stateResult[1] ?? HogWatcherState.healthy)
-            // V2 returns [tokensBefore, tokensAfter], we use tokensAfter
-            const tokens = Number(tokenResult[1]?.[1] ?? this.hub.CDP_WATCHER_BUCKET_SIZE)
+        functionCostEntries.map((functionCost, index) => {
+            const limit = rateLimitRes[index]?.[1]
+            const currentState: HogWatcherState = Number(stateRes.states[index] ?? HogWatcherState.healthy)
+            const tokens = Number(limit?.tokens ?? this.config.bucketSize)
             const newState = this.calculateNewState(tokens)
 
             if (currentState !== newState) {
-                if (lockResult[1]) {
+                if (stateRes.locks[index]) {
                     // We don't want to change the state of a function that is being locked (i.e. recently changed state)
                     return
                 }
@@ -441,39 +565,43 @@ export class HogWatcherService {
         // We need to make sure that we only process the results once
         if (!this.queuedResults) {
             let resolvePromise: () => void
-            const promise = new Promise<void>((resolve) => {
+            let rejectPromise: (error: unknown) => void
+            const promise = new Promise<void>((resolve, reject) => {
                 resolvePromise = resolve
+                rejectPromise = reject
             })
 
             this.queuedResults = {
                 results: [],
                 promise,
-                complete: resolvePromise!,
-                timeout: setTimeout(
-                    () => this.flushBufferedResults(),
-                    this.hub.CDP_WATCHER_OBSERVE_RESULTS_BUFFER_TIME_MS
-                ),
+                resolve: resolvePromise!,
+                reject: rejectPromise!,
+                timeout: setTimeout(() => void this.flushBufferedResults(), this.config.observeResultsBufferTimeMs),
             }
         }
 
         this.queuedResults.results.push(result)
+        const bufferedPromise = this.queuedResults.promise
 
-        if (this.queuedResults.results.length >= this.hub.CDP_WATCHER_OBSERVE_RESULTS_BUFFER_MAX_RESULTS) {
-            await this.flushBufferedResults()
-        } else {
-            await this.queuedResults.promise
+        if (this.queuedResults.results.length >= this.config.observeResultsBufferMaxResults) {
+            void this.flushBufferedResults()
         }
+        await bufferedPromise
     }
 
-    private async flushBufferedResults() {
+    private async flushBufferedResults(): Promise<void> {
         if (!this.queuedResults) {
             return
         }
 
-        const { results, timeout, complete } = this.queuedResults
+        const { results, timeout, resolve, reject } = this.queuedResults
         clearTimeout(timeout)
         this.queuedResults = null
-        await this.observeResults(results)
-        complete()
+        try {
+            await this.observeResults(results)
+            resolve()
+        } catch (error) {
+            reject(error)
+        }
     }
 }

@@ -2,35 +2,128 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use common_cache::{CacheConfig, NegativeCache, ReadThroughCache, ReadThroughCacheWithMetrics};
 use common_database::get_pool;
 use common_hypercache::{HyperCacheConfig, HyperCacheReader};
 use common_redis::MockRedisClient;
 use feature_flags::team::team_models::Team;
 use feature_flags::utils::test_utils::team_token_hypercache_key;
+use governor::clock;
+use lifecycle::Manager;
 use limiters::redis::QUOTA_LIMITER_CACHE_KEY;
 use reqwest::header::CONTENT_TYPE;
 use tokio::net::TcpListener;
-use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
+use feature_flags::cohorts::membership::NoOpCohortMembershipProvider;
 use feature_flags::config::Config;
-use feature_flags::server::serve;
+use feature_flags::rayon_dispatcher::RayonDispatcher;
+use feature_flags::server::{register_components, serve_with_rate_limiter_clock};
 
 pub struct ServerHandle {
     pub addr: SocketAddr,
-    shutdown: Arc<Notify>,
+    shutdown: CancellationToken,
+}
+
+impl ServerHandle {
+    /// Cancel the shutdown token. Drop also does this; use only for explicit
+    /// early shutdown.
+    #[allow(dead_code)]
+    pub fn shutdown_now(&self) {
+        self.shutdown.cancel();
+    }
+}
+
+fn build_test_manager(token: CancellationToken) -> Manager {
+    Manager::builder("feature-flags-test")
+        .with_trap_signals(false)
+        .with_prestop_check(false)
+        .with_shutdown_token(token)
+        .with_global_shutdown_timeout(Duration::from_secs(10))
+        .build()
 }
 
 impl ServerHandle {
     pub async fn for_config(config: Config) -> ServerHandle {
+        Self::for_config_with_s3(config, None).await
+    }
+
+    /// Like `for_config`, but injects an S3 client for the flags-with-cohorts reader.
+    /// Pass a dummy that returns NotFound to make a cache miss classify as CacheMiss
+    /// (the flags Rust test job has no object store, so real S3 reads error out).
+    #[allow(dead_code)]
+    pub async fn for_config_with_s3(
+        config: Config,
+        flags_with_cohorts_s3: Option<Arc<dyn common_hypercache::S3Client + Send + Sync>>,
+    ) -> ServerHandle {
+        Self::for_config_with_s3_and_rate_limiter_clock(
+            config,
+            flags_with_cohorts_s3,
+            clock::DefaultClock::default(),
+        )
+        .await
+    }
+
+    #[allow(dead_code)]
+    pub async fn for_config_with_rate_limiter_clock<C>(
+        config: Config,
+        rate_limiter_clock: C,
+    ) -> ServerHandle
+    where
+        C: clock::Clock + Clone + Send + Sync + 'static,
+    {
+        Self::for_config_with_s3_and_rate_limiter_clock(config, None, rate_limiter_clock).await
+    }
+
+    async fn for_config_with_s3_and_rate_limiter_clock<C>(
+        config: Config,
+        flags_with_cohorts_s3: Option<Arc<dyn common_hypercache::S3Client + Send + Sync>>,
+        rate_limiter_clock: C,
+    ) -> ServerHandle
+    where
+        C: clock::Clock + Clone + Send + Sync + 'static,
+    {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let notify = Arc::new(Notify::new());
-        let shutdown = notify.clone();
+        let shutdown = CancellationToken::new();
+        let mut manager = build_test_manager(shutdown.clone());
+        let handles = register_components(&mut manager);
+        let monitor_guard = manager.monitor_background();
 
+        let rayon_dispatcher = RayonDispatcher::new(2, None);
         tokio::spawn(async move {
-            serve(config, listener, async move { notify.notified().await }).await
+            serve_with_rate_limiter_clock(
+                config,
+                listener,
+                rayon_dispatcher,
+                handles,
+                flags_with_cohorts_s3,
+                rate_limiter_clock,
+            )
+            .await;
+            // Drain the lifecycle monitor after serve returns so the supervisor
+            // thread exits cleanly. Any error is logged — a failing shutdown
+            // shouldn't fail the test unless the test explicitly asserts on it.
+            if let Err(e) = monitor_guard.wait().await {
+                tracing::warn!("test lifecycle monitor reported: {e}");
+            }
         });
         ServerHandle { addr, shutdown }
+    }
+
+    /// Poll the server's readiness endpoint until it responds successfully.
+    /// Panics if the server doesn't become ready within 5 seconds.
+    #[allow(dead_code)]
+    pub async fn wait_until_ready(&self) {
+        let client = reqwest::Client::new();
+        let url = format!("http://{}/_readiness", self.addr);
+        for _ in 0..100 {
+            match client.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => return,
+                _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
+            }
+        }
+        panic!("Server failed to become ready within 5 seconds");
     }
 
     #[allow(dead_code)]
@@ -58,8 +151,20 @@ impl ServerHandle {
     ) -> ServerHandle {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let notify = Arc::new(Notify::new());
-        let shutdown = notify.clone();
+        let shutdown = CancellationToken::new();
+        let mut manager = build_test_manager(shutdown.clone());
+        // `monitor_background()` is intentionally not called in this path:
+        // ReadinessHandler reads the token directly and `trap_signals=false`
+        // means no supervisor is required. `manager` is dropped at the end of
+        // this function — before the spawned task runs — which closes the
+        // receiver for the supervision channel. That's safe here because
+        // shutdown is driven by the `CancellationToken` (via
+        // `handles.http.shutdown_signal()`), not by the manager loop, and the
+        // lifecycle crate intentionally ignores send errors from
+        // `work_completed()` and handle drops. If that ever changes (e.g. a
+        // channel-full panic, or handles relying on a manager ACK), this test
+        // harness will need to keep `manager` alive for the spawn's lifetime.
+        let handles = register_components(&mut manager);
 
         // Create a mock client that handles both quota limit checks and token verification
         let mut mock_client = MockRedisClient::new()
@@ -191,30 +296,21 @@ impl ServerHandle {
                 ),
             );
 
-            let health = health::HealthRegistry::new("liveness");
-            let simple_loop = health
-                .register("simple_loop".to_string(), Duration::from_secs(30))
-                .await;
-            tokio::spawn(liveness_loop(simple_loop));
+            let feature_flags_billing_limiter = feature_flags::billing::FeatureFlagsLimiter::new(
+                Duration::from_secs(5),
+                redis_reader_client.clone(),
+                QUOTA_LIMITER_CACHE_KEY.to_string(),
+                None,
+            )
+            .unwrap();
 
-            let feature_flags_billing_limiter =
-                feature_flags::billing_limiters::FeatureFlagsLimiter::new(
-                    Duration::from_secs(5),
-                    redis_reader_client.clone(),
-                    QUOTA_LIMITER_CACHE_KEY.to_string(),
-                    None,
-                )
-                .unwrap();
-
-            let session_replay_billing_limiter =
-                feature_flags::billing_limiters::SessionReplayLimiter::new(
-                    Duration::from_secs(5),
-                    redis_reader_client.clone(),
-                    QUOTA_LIMITER_CACHE_KEY.to_string(),
-                    None,
-                )
-                .unwrap();
-
+            let session_replay_billing_limiter = feature_flags::billing::SessionReplayLimiter::new(
+                Duration::from_secs(5),
+                redis_reader_client.clone(),
+                QUOTA_LIMITER_CACHE_KEY.to_string(),
+                None,
+            )
+            .unwrap();
             let cookieless_manager = Arc::new(common_cookieless::CookielessManager::new(
                 config.get_cookieless_config(),
                 redis_reader_client.clone(),
@@ -226,6 +322,7 @@ impl ServerHandle {
                 non_persons_writer: non_persons_writer.clone(),
                 persons_reader: persons_reader.clone(),
                 persons_writer: persons_writer.clone(),
+                behavioral_cohorts_reader: None,
                 test_before_acquire: *config.test_before_acquire,
             });
 
@@ -308,30 +405,75 @@ impl ServerHandle {
                     }
                 };
 
+            let group_type_cache = Arc::new(
+                feature_flags::flags::flag_group_type_mapping::GroupTypeCacheManager::new(
+                    persons_reader.clone(),
+                    Some(config.group_type_cache_max_entries),
+                    Some(config.group_type_cache_ttl_seconds),
+                ),
+            );
+
+            let flag_definitions_cache = Arc::new(
+                feature_flags::flags::flag_definitions_cache::FlagDefinitionsCache::disabled(),
+            );
+
+            let billing_aggregator = feature_flags::billing::BillingAggregator::start(
+                redis_writer_client.clone(),
+                config.get_billing_aggregator_config(),
+            );
+            let shutdown_for_test = billing_aggregator.clone();
+
             let app = feature_flags::router::router(
                 redis_writer_client.clone(), // Use writer client for both reads and writes in tests
                 None,                        // No dedicated flags Redis in tests
                 database_pools,
                 cohort_cache,
+                group_type_cache,
                 geoip_service,
-                health,
+                handles.readiness,
+                handles.liveness,
                 feature_flags_billing_limiter,
                 session_replay_billing_limiter,
                 cookieless_manager,
                 flags_hypercache_reader,
+                flag_definitions_cache,
                 flags_with_cohorts_hypercache_reader,
                 team_hypercache_reader,
                 config_hypercache_reader,
+                RayonDispatcher::new(2, None),
+                NegativeCache::new(10_000, 300),
+                Arc::new(ReadThroughCacheWithMetrics::new(
+                    Arc::new(ReadThroughCache::new(
+                        redis_writer_client.clone(),
+                        redis_writer_client.clone(),
+                        CacheConfig::with_ttl(
+                            feature_flags::api::auth::TOKEN_CACHE_PREFIX,
+                            config.auth_token_cache_ttl_seconds,
+                        ),
+                        None,
+                    )),
+                    "auth",
+                    "token",
+                    &[],
+                )),
+                Arc::new(NoOpCohortMembershipProvider),
+                billing_aggregator,
                 config,
             );
 
-            axum::serve(
+            // Mirror `server::serve`: capture the serve result, then await the
+            // aggregator shutdown *unconditionally* before propagating any
+            // serve error. Otherwise a `.unwrap()` on a serve failure would
+            // panic the spawned task and leak the flusher into the next test.
+            let serve_result = axum::serve(
                 listener,
                 app.into_make_service_with_connect_info::<SocketAddr>(),
             )
-            .with_graceful_shutdown(async move { notify.notified().await })
-            .await
-            .unwrap()
+            .with_graceful_shutdown(handles.http.shutdown_signal())
+            .await;
+            shutdown_for_test.shutdown().await;
+            serve_result.unwrap();
+            handles.http.work_completed();
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -386,14 +528,57 @@ impl ServerHandle {
 
 impl Drop for ServerHandle {
     fn drop(&mut self) {
-        self.shutdown.notify_one()
+        self.shutdown.cancel();
     }
 }
 
+/// Poll for a billing counter across every bucket field in `first_bucket..=last_bucket`,
+/// returning the first value found. Panics on timeout. Use for the positive ("the write
+/// should land") case in billing aggregator tests — for the negative case, sleep one flush
+/// window and check. The server captures the bucket inside `record()` while it handles the
+/// request, so a request that straddles a 2-minute bucket boundary lands the increment in
+/// either the bucket seen before or after the roundtrip. Pass both ends of the range to poll
+/// for the counter without racing the boundary.
 #[allow(dead_code)]
-async fn liveness_loop(handle: health::HealthHandle) {
-    loop {
-        handle.report_healthy().await;
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+pub async fn poll_for_billing_counter_across_buckets(
+    client: &Arc<dyn common_redis::Client + Send + Sync>,
+    key: &str,
+    first_bucket: u64,
+    last_bucket: u64,
+) -> String {
+    for _ in 0..40 {
+        for bucket in first_bucket..=last_bucket {
+            if let Ok(v) = client.hget(key.to_string(), bucket.to_string()).await {
+                return v;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    panic!(
+        "billing counter at {key} did not appear within 1s for buckets {first_bucket}..={last_bucket}"
+    );
+}
+
+/// Poll until `last_used_at` is set for the given project secret API key, or panic after ~4s.
+#[allow(dead_code)]
+pub async fn poll_for_psak_last_used_at(
+    context: &feature_flags::utils::test_utils::TestContext,
+    key_id: &str,
+    message: &str,
+) {
+    let mut conn = context.get_non_persons_connection().await.unwrap();
+    for _ in 0..80 {
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM posthog_projectsecretapikey WHERE id = $1 AND last_used_at IS NOT NULL",
+        )
+        .bind(key_id)
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        if count.0 > 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("{message}");
 }

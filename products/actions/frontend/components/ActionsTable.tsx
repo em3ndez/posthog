@@ -1,28 +1,28 @@
 import { useActions, useValues } from 'kea'
 
-import { IconCheckCircle, IconPin, IconPinFilled } from '@posthog/icons'
-import { LemonInput, LemonSegmentedButton } from '@posthog/lemon-ui'
+import { IconPin, IconPinFilled } from '@posthog/icons'
+import { LemonInput } from '@posthog/lemon-ui'
 
-import api from 'lib/api'
 import { AccessControlAction } from 'lib/components/AccessControlAction'
+import { MemberSelectMultiplePopover } from 'lib/components/MemberSelectMultiplePopover'
 import { ObjectTags } from 'lib/components/ObjectTags/ObjectTags'
-import { ProductIntroduction } from 'lib/components/ProductIntroduction/ProductIntroduction'
+import { TagSelect } from 'lib/components/TagSelect'
 import ViewRecordingsPlaylistButton from 'lib/components/ViewRecordingButton/ViewRecordingsPlaylistButton'
+import { FEATURE_FLAGS } from 'lib/constants'
 import { LemonButton } from 'lib/lemon-ui/LemonButton'
 import { More } from 'lib/lemon-ui/LemonButton/More'
 import { LemonDivider } from 'lib/lemon-ui/LemonDivider'
+import { LemonSkeleton } from 'lib/lemon-ui/LemonSkeleton'
 import { LemonTable } from 'lib/lemon-ui/LemonTable'
-import { LemonTableLink } from 'lib/lemon-ui/LemonTable/LemonTableLink'
 import { createdAtColumn, createdByColumn } from 'lib/lemon-ui/LemonTable/columnUtils'
+import { LemonTableLink } from 'lib/lemon-ui/LemonTable/LemonTableLink'
+import { Sorting } from 'lib/lemon-ui/LemonTable/sorting'
 import { LemonTableColumn, LemonTableColumns } from 'lib/lemon-ui/LemonTable/types'
-import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
-import { stripHTTP } from 'lib/utils'
-import { deleteWithUndo } from 'lib/utils/deleteWithUndo'
+import { Tooltip } from 'lib/lemon-ui/Tooltip'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
 import { teamLogic } from 'scenes/teamLogic'
 import { urls } from 'scenes/urls'
-import { userLogic } from 'scenes/userLogic'
 
-import { actionsModel } from '~/models/actionsModel'
 import { InsightVizNode, NodeKind, ProductIntentContext, ProductKey } from '~/queries/schema/schema-general'
 import {
     AccessControlLevel,
@@ -32,18 +32,20 @@ import {
     FilterLogicalOperator,
 } from '~/types'
 
-import { actionsLogic } from '../logics/actionsLogic'
-import { SCREEN_NAME_MATCHING_LABEL, type ScreenNameMatching, isScreenNameFilter } from '../utils/screenName'
-import { NewActionButton } from './NewActionButton'
+import { ACTIONS_PER_PAGE, actionsLogic } from '../logics/actionsLogic'
+import { ActionStepConditions, ActionStepSummary } from '../utils/actionStepDescription'
+import { deleteActionWithWarning } from '../utils/deleteAction'
 
 export function ActionsTable(): JSX.Element {
-    const { currentTeam } = useValues(teamLogic)
-    const { actionsLoading } = useValues(actionsModel({ params: 'include_count=1' }))
-    const { loadActions, pinAction, unpinAction } = useActions(actionsModel)
+    const { actionsList, actionCount, actionsResponseLoading, page, filters, searchTerm } = useValues(actionsLogic)
+    const { setSearchTerm, setFilters, setPage, pinAction, unpinAction, loadActions } = useActions(actionsLogic)
     const { addProductIntentForCrossSell } = useActions(teamLogic)
-    const { filterType, searchTerm, actionsFiltered, shouldShowEmptyState } = useValues(actionsLogic)
-    const { setFilterType, setSearchTerm } = useActions(actionsLogic)
-    const { updateHasSeenProductIntroFor } = useActions(userLogic)
+    const { featureFlags } = useValues(featureFlagLogic)
+    const referenceCountEnabled = !!featureFlags[FEATURE_FLAGS.ACTION_REFERENCE_COUNT]
+
+    const sorting: Sorting | null = filters.ordering
+        ? { columnKey: filters.ordering.replace(/^-/, ''), order: filters.ordering.startsWith('-') ? -1 : 1 }
+        : null
 
     const tryInInsightsUrl = (action: ActionType): string => {
         const query: InsightVizNode = {
@@ -69,9 +71,7 @@ export function ActionsTable(): JSX.Element {
             width: 0,
             title: 'Pinned',
             dataIndex: 'pinned_at',
-            sorter: (a: ActionType, b: ActionType) =>
-                (b.pinned_at ? new Date(b.pinned_at).getTime() : 0) -
-                (a.pinned_at ? new Date(a.pinned_at).getTime() : 0),
+            sorter: true,
             render: function Render(pinned, action) {
                 return (
                     <LemonButton
@@ -87,7 +87,7 @@ export function ActionsTable(): JSX.Element {
             title: 'Name',
             dataIndex: 'name',
             width: '25%',
-            sorter: (a: ActionType, b: ActionType) => (a.name || '').localeCompare(b.name || ''),
+            sorter: true,
             render: function RenderName(_, action: ActionType, index: number): JSX.Element {
                 return (
                     <LemonTableLink
@@ -103,71 +103,18 @@ export function ActionsTable(): JSX.Element {
             title: 'Type',
             key: 'type',
             render: function RenderType(_, action: ActionType): JSX.Element {
+                if (!action.steps?.length) {
+                    return <i>Empty – set this action up</i>
+                }
                 return (
                     <span>
-                        {action.steps?.length ? (
-                            action.steps.map((step, index) => (
-                                <div key={index}>
-                                    {(() => {
-                                        let url = stripHTTP(step.url || '')
-                                        url = url.slice(0, 40) + (url.length > 40 ? '...' : '')
-                                        switch (step.event) {
-                                            case '$autocapture':
-                                                return 'Autocapture'
-                                            case '$pageview':
-                                                switch (step.url_matching) {
-                                                    case 'regex':
-                                                        return (
-                                                            <>
-                                                                Page view URL matches regex <strong>{url}</strong>
-                                                            </>
-                                                        )
-                                                    case 'exact':
-                                                        return (
-                                                            <>
-                                                                Page view URL matches exactly <strong>{url}</strong>
-                                                            </>
-                                                        )
-                                                    default:
-                                                        return (
-                                                            <>
-                                                                Page view URL contains <strong>{url}</strong>
-                                                            </>
-                                                        )
-                                                }
-                                            case '$screen': {
-                                                const screenFilter = step.properties?.find(isScreenNameFilter)
-                                                if (screenFilter && 'value' in screenFilter && screenFilter.value) {
-                                                    const operator =
-                                                        'operator' in screenFilter
-                                                            ? (screenFilter.operator as ScreenNameMatching)
-                                                            : 'icontains'
-                                                    return (
-                                                        <>
-                                                            Screen name {SCREEN_NAME_MATCHING_LABEL[operator]}{' '}
-                                                            <strong>{String(screenFilter.value)}</strong>
-                                                        </>
-                                                    )
-                                                }
-                                                return 'Screen'
-                                            }
-                                            case '':
-                                            case null:
-                                            case undefined:
-                                                return 'Any event'
-                                            default:
-                                                return (
-                                                    <>
-                                                        Event: <strong>{step.event}</strong>
-                                                    </>
-                                                )
-                                        }
-                                    })()}
+                        {action.steps.map((step, index) => (
+                            <Tooltip key={index} title={<ActionStepConditions step={step} />} placement="right">
+                                <div className="w-fit">
+                                    <ActionStepSummary step={step} />
                                 </div>
-                            ))
-                        ) : (
-                            <i>Empty – set this action up</i>
-                        )}
+                            </Tooltip>
+                        ))}
                     </span>
                 )
             },
@@ -181,20 +128,31 @@ export function ActionsTable(): JSX.Element {
                 return <ObjectTags tags={tags} staticOnly />
             },
         } as LemonTableColumn<ActionType, keyof ActionType | undefined>,
-        createdByColumn() as LemonTableColumn<ActionType, keyof ActionType | undefined>,
-        createdAtColumn() as LemonTableColumn<ActionType, keyof ActionType | undefined>,
-        ...(currentTeam?.slack_incoming_webhook
+        ...(referenceCountEnabled
             ? [
                   {
-                      title: 'Webhook',
-                      dataIndex: 'post_to_slack',
-                      sorter: (a: ActionType, b: ActionType) => Number(a.post_to_slack) - Number(b.post_to_slack),
-                      render: function RenderActions(post_to_slack): JSX.Element | null {
-                          return post_to_slack ? <IconCheckCircle /> : null
+                      title: 'Used by',
+                      dataIndex: 'reference_count',
+                      render: function RenderReferenceCount(_, action: ActionType) {
+                          const count = action.reference_count
+                          if (count === undefined) {
+                              return actionsResponseLoading ? (
+                                  <LemonSkeleton className="w-12 h-4" />
+                              ) : (
+                                  <span className="text-secondary">—</span>
+                              )
+                          }
+                          return (
+                              <span className="text-secondary">
+                                  {count > 0 ? `${count} ${count === 1 ? 'reference' : 'references'}` : 'None'}
+                              </span>
+                          )
                       },
                   } as LemonTableColumn<ActionType, keyof ActionType | undefined>,
               ]
             : []),
+        { ...createdByColumn(), sorter: true } as LemonTableColumn<ActionType, keyof ActionType | undefined>,
+        { ...createdAtColumn(), sorter: true } as LemonTableColumn<ActionType, keyof ActionType | undefined>,
         {
             width: 0,
             render: function RenderActions(_, action) {
@@ -255,13 +213,7 @@ export function ActionsTable(): JSX.Element {
                                     <LemonButton
                                         status="danger"
                                         onClick={() => {
-                                            deleteWithUndo({
-                                                endpoint: api.actions.determineDeleteEndpoint(),
-                                                object: action,
-                                                callback: loadActions,
-                                            }).catch((e: any) => {
-                                                lemonToast.error(`Error deleting action: ${e.detail}`)
-                                            })
+                                            void deleteActionWithWarning(action, loadActions)
                                         }}
                                         fullWidth
                                     >
@@ -278,52 +230,46 @@ export function ActionsTable(): JSX.Element {
 
     return (
         <div data-attr="manage-events-table">
-            <ProductIntroduction
-                productName="Actions"
-                productKey={ProductKey.ACTIONS}
-                thingName="action"
-                isEmpty={shouldShowEmptyState}
-                description="Use actions to combine events that you want to have tracked together or to make detailed Autocapture events easier to reuse."
-                docsURL="https://posthog.com/docs/data/actions"
-                actionElementOverride={
-                    <NewActionButton onSelectOption={() => updateHasSeenProductIntroFor(ProductKey.ACTIONS)} />
-                }
-            />
-            {(shouldShowEmptyState && filterType === 'me') || !shouldShowEmptyState ? (
-                <div className="flex items-center justify-between gap-2 mb-4">
-                    <LemonInput
-                        type="search"
-                        placeholder="Search for actions"
-                        onChange={setSearchTerm}
-                        value={searchTerm}
-                    />
-                    <LemonSegmentedButton
-                        value={filterType}
-                        onChange={setFilterType}
-                        options={[
-                            { value: 'all', label: 'All actions' },
-                            { value: 'me', label: 'My actions' },
-                        ]}
+            <div className="flex items-center justify-between gap-2 flex-wrap mb-4">
+                <LemonInput
+                    type="search"
+                    placeholder="Search for actions"
+                    onChange={setSearchTerm}
+                    value={searchTerm}
+                />
+                <div className="flex items-center gap-2 flex-wrap">
+                    <span>Filter to:</span>
+                    <TagSelect defaultLabel="Any tags" value={filters.tags} onChange={(tags) => setFilters({ tags })} />
+                    <MemberSelectMultiplePopover
+                        value={filters.createdBy}
+                        onChange={(ids) => setFilters({ createdBy: ids })}
                     />
                 </div>
-            ) : null}
-            {(!shouldShowEmptyState || filterType === 'me') && (
-                <>
-                    <LemonTable
-                        columns={columns}
-                        loading={actionsLoading}
-                        rowKey="id"
-                        pagination={{ pageSize: 100 }}
-                        data-attr="actions-table"
-                        dataSource={actionsFiltered}
-                        defaultSorting={{
-                            columnKey: 'created_by',
-                            order: -1,
-                        }}
-                        emptyState="No results. Create a new action?"
-                    />
-                </>
-            )}
+            </div>
+            <LemonTable
+                columns={columns}
+                loading={actionsResponseLoading}
+                rowKey="id"
+                data-attr="actions-table"
+                dataSource={actionsList}
+                sorting={sorting}
+                onSort={(newSorting) =>
+                    setFilters({
+                        ordering: newSorting
+                            ? `${newSorting.order === -1 ? '-' : ''}${newSorting.columnKey}`
+                            : '-created_by',
+                    })
+                }
+                pagination={{
+                    controlled: true,
+                    currentPage: page,
+                    entryCount: actionCount,
+                    pageSize: ACTIONS_PER_PAGE,
+                    onForward: page * ACTIONS_PER_PAGE < actionCount ? () => setPage(page + 1) : undefined,
+                    onBackward: page > 1 ? () => setPage(page - 1) : undefined,
+                }}
+                emptyState="No results. Create a new action?"
+            />
         </div>
     )
 }

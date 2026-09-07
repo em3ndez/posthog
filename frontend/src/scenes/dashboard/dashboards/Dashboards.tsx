@@ -3,18 +3,20 @@ import { useActions, useValues } from 'kea'
 import { LemonButton } from '@posthog/lemon-ui'
 
 import { AccessControlAction } from 'lib/components/AccessControlAction'
-import { AppShortcut } from 'lib/components/AppShortcuts/AppShortcut'
-import { keyBinds } from 'lib/components/AppShortcuts/shortcuts'
+import { Shortcut } from 'lib/components/Shortcuts/Shortcut'
+import { keyBinds } from 'lib/components/Shortcuts/shortcuts'
 import { LemonTab, LemonTabs } from 'lib/lemon-ui/LemonTabs'
+import { DashboardsTab, dashboardsLogic } from 'scenes/dashboard/dashboards/dashboardsLogic'
+import { DashboardTemplateModal } from 'scenes/dashboard/dashboards/templates/DashboardTemplateModal'
+import { DashboardTemplatesTable } from 'scenes/dashboard/dashboards/templates/DashboardTemplatesTable'
+import { DashboardTemplateEditor } from 'scenes/dashboard/DashboardTemplateEditor'
 import { DeleteDashboardModal } from 'scenes/dashboard/DeleteDashboardModal'
 import { DuplicateDashboardModal } from 'scenes/dashboard/DuplicateDashboardModal'
-import { NewDashboardModal } from 'scenes/dashboard/NewDashboardModal'
-import { DashboardsTableContainer } from 'scenes/dashboard/dashboards/DashboardsTable'
-import { DashboardsTab, dashboardsLogic } from 'scenes/dashboard/dashboards/dashboardsLogic'
-import { DashboardTemplatesTable } from 'scenes/dashboard/dashboards/templates/DashboardTemplatesTable'
 import { newDashboardLogic } from 'scenes/dashboard/newDashboardLogic'
-import { Scene, SceneExport } from 'scenes/sceneTypes'
+import { NewDashboardModal } from 'scenes/dashboard/NewDashboardModal'
 import { sceneConfigurations } from 'scenes/scenes'
+import { Scene, SceneExport } from 'scenes/sceneTypes'
+import { teamLogic } from 'scenes/teamLogic'
 
 import { SceneContent } from '~/layout/scenes/components/SceneContent'
 import { SceneTitleSection } from '~/layout/scenes/components/SceneTitleSection'
@@ -22,12 +24,17 @@ import { dashboardsModel } from '~/models/dashboardsModel'
 import { ProductKey } from '~/queries/schema/schema-general'
 import { AccessControlLevel, AccessControlResourceType } from '~/types'
 
-import { DashboardTemplateChooser } from '../DashboardTemplateChooser'
+import { dashboardsEmptyState } from 'products/dashboards/frontend/emptyState/dashboardsEmptyState'
+import { DashboardSavedViews } from 'products/dashboards/frontend/saved-views/DashboardSavedViews'
+import { dashboardSavedViewsLogic } from 'products/dashboards/frontend/saved-views/dashboardSavedViewsLogic'
+
+import { DashboardsTableContainer } from './DashboardsTable'
 
 export const scene: SceneExport = {
     component: Dashboards,
     logic: dashboardsLogic,
     productKey: ProductKey.PRODUCT_ANALYTICS,
+    emptyState: dashboardsEmptyState,
 }
 
 export function Dashboards(): JSX.Element {
@@ -35,14 +42,15 @@ export function Dashboards(): JSX.Element {
     const { setCurrentTab } = useActions(dashboardsLogic)
     const { dashboards, currentTab, isFiltering } = useValues(dashboardsLogic)
     const { showNewDashboardModal } = useActions(newDashboardLogic)
-
+    const { currentTeamId } = useValues(teamLogic)
+    const { dashboardSavedViewsEnabled } = useValues(dashboardSavedViewsLogic({ teamId: currentTeamId }))
     const enabledTabs: LemonTab<DashboardsTab>[] = [
         {
             key: DashboardsTab.All,
             label: 'All dashboards',
         },
         { key: DashboardsTab.Yours, label: 'My dashboards' },
-        { key: DashboardsTab.Pinned, label: 'Pinned' },
+        ...(dashboardSavedViewsEnabled ? [] : [{ key: DashboardsTab.Pinned, label: 'Pinned' }]),
         {
             key: DashboardsTab.Templates,
             label: 'Templates',
@@ -54,6 +62,8 @@ export function Dashboards(): JSX.Element {
             <NewDashboardModal />
             <DuplicateDashboardModal />
             <DeleteDashboardModal />
+            <DashboardTemplateEditor />
+            <DashboardTemplateModal />
 
             <SceneTitleSection
                 name={sceneConfigurations[Scene.Dashboards].name}
@@ -67,7 +77,7 @@ export function Dashboards(): JSX.Element {
                             resourceType={AccessControlResourceType.Dashboard}
                             minAccessLevel={AccessControlLevel.Editor}
                         >
-                            <AppShortcut
+                            <Shortcut
                                 name="NewDashboard"
                                 keybind={[keyBinds.new]}
                                 intent="New dashboard"
@@ -82,16 +92,20 @@ export function Dashboards(): JSX.Element {
                                 >
                                     New dashboard
                                 </LemonButton>
-                            </AppShortcut>
+                            </Shortcut>
                         </AccessControlAction>
                     </>
                 }
             />
             <LemonTabs
+                onChange={(newKey) => {
+                    setCurrentTab(newKey)
+                }}
                 activeKey={currentTab}
-                onChange={(newKey) => setCurrentTab(newKey)}
                 tabs={enabledTabs}
                 sceneInset
+                rightSlot={<DashboardSavedViews />}
+                rightSlotClassName="!static !justify-start !bg-transparent"
             />
 
             <div>
@@ -99,12 +113,7 @@ export function Dashboards(): JSX.Element {
                     <DashboardTemplatesTable />
                 ) : dashboardsLoading || dashboards.length > 0 || isFiltering ? (
                     <DashboardsTableContainer />
-                ) : (
-                    <div className="mt-4">
-                        <p>Create your first dashboard:</p>
-                        <DashboardTemplateChooser />
-                    </div>
-                )}
+                ) : null}
             </div>
         </SceneContent>
     )

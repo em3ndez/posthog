@@ -1,16 +1,15 @@
 name: Updated PR
 
+# Reusable workflow, called by pr-housekeeping.yml on PR open/edit/push.
+
 on:
-    pull_request:
-        types:
-            - opened
-            - edited
-            - synchronize
+    workflow_call:
 
 jobs:
     lint-pr:
         name: Validate PR title against Conventional Commits
         runs-on: ubuntu-24.04
+        timeout-minutes: 5
         permissions:
             contents: read
             pull-requests: read

@@ -5,8 +5,9 @@ use tracing::info;
 
 use crate::{
     api::{self, releases::ReleaseBuilder, symbol_sets::SymbolSetUpload},
-    dsym::{find_dsym_bundles, DsymFile, PlistInfo},
-    utils::git::get_git_info,
+    dsym::{find_dsym_bundles, DsymFile},
+    sourcemaps::args::{pack_version, ReleaseArgs, UploadConflictArgs},
+    utils::{git::get_git_info, xcode::PlistInfo},
 };
 
 #[derive(clap::Args, Clone)]
@@ -16,36 +17,50 @@ pub struct Args {
     #[arg(short, long)]
     pub directory: PathBuf,
 
-    /// The bundle identifier (e.g., com.example.app).
-    /// If not provided, will be extracted from dSYM Info.plist.
-    #[arg(long)]
-    pub project: Option<String>,
+    #[clap(flatten)]
+    pub release: ReleaseArgs,
 
-    /// The marketing version (e.g., 1.2.3, CFBundleShortVersionString).
-    /// If not provided, will be extracted from dSYM Info.plist.
-    #[arg(long)]
-    pub version: Option<String>,
-
-    /// The build number (e.g., 42, CFBundleVersion).
-    /// If not provided, will be extracted from dSYM Info.plist.
-    #[arg(long)]
-    pub build: Option<String>,
+    #[clap(flatten)]
+    pub conflict: UploadConflictArgs,
 
     /// The main dSYM file name (e.g., MyApp.app.dSYM).
     /// Used to extract version info from the correct dSYM when multiple are present.
     /// This is typically $DWARF_DSYM_FILE_NAME in Xcode build phases.
     #[arg(long)]
     pub main_dsym: Option<String>,
+
+    /// Include source code files in the dSYM upload.
+    /// When enabled, source files referenced by DWARF debug info are bundled into the upload,
+    /// allowing PostHog to display source code context around crash locations.
+    /// Implies --force unless --skip-on-conflict is set. [default: false]
+    #[arg(long, default_value_t = false)]
+    pub include_source: bool,
+
+    /// Deprecated: the symbol sets always bind to the release the build creates. The flag stays
+    /// accepted so a released posthog-ios upload-symbols.sh that still passes it does not fail
+    /// the Xcode build with a parse error.
+    #[arg(long, default_value_t = false, hide = true)]
+    pub no_release_bind: bool,
 }
 
 pub fn upload(args: &Args) -> Result<()> {
     let Args {
         directory,
-        project,
-        version,
-        build,
+        release,
+        conflict,
         main_dsym,
+        include_source,
+        no_release_bind,
     } = args;
+
+    if *no_release_bind {
+        tracing::warn!(
+            "--no-release-bind is deprecated and does nothing. The symbol sets are uploaded bound \
+             to the release this build creates. Remove the flag."
+        );
+    }
+
+    let release_args = release.resolve_info_plist()?;
 
     let directory = directory.canonicalize().map_err(|e| {
         anyhow!(
@@ -113,32 +128,32 @@ pub fn upload(args: &Args) -> Result<()> {
         }
     });
 
-    // Determine project, version, build - CLI args take precedence over plist
-    let resolved_project = project.clone().or_else(|| {
+    // Determine release name, version, and build - CLI args take precedence over plist
+    let resolved_release_name = release_args.name.clone().or_else(|| {
         plist_info
             .as_ref()
             .and_then(|p| p.bundle_identifier.clone())
     });
-    let resolved_version = version
+    let resolved_release_version = release_args
+        .version
         .clone()
         .or_else(|| plist_info.as_ref().and_then(|p| p.short_version.clone()));
-    let resolved_build = build
+    let resolved_build = release_args
+        .build
         .clone()
         .or_else(|| plist_info.as_ref().and_then(|p| p.bundle_version.clone()));
 
-    // Build full version string: "version+build" or just "version" or just "build"
-    let full_version = match (&resolved_version, &resolved_build) {
-        (Some(v), Some(b)) => Some(format!("{v}+{b}")),
-        (Some(v), None) => Some(v.clone()),
-        (None, Some(b)) => Some(b.clone()),
-        (None, None) => None,
-    };
-
-    if let Some(ref proj) = resolved_project {
-        info!("Project: {}", proj);
+    if let Some(ref name) = resolved_release_name {
+        info!("Release name: {}", name);
     }
-    if let Some(ref ver) = full_version {
-        info!("Version: {}", ver);
+    if let Some(ref ver) = resolved_release_version {
+        info!("Release version: {}", ver);
+    }
+
+    let full_version = pack_version(&resolved_release_version, &resolved_build);
+
+    if let Some(ref build) = resolved_build {
+        info!("Build: {}", build);
     }
 
     // Set up release info
@@ -154,19 +169,21 @@ pub fn upload(args: &Args) -> Result<()> {
         let _ = release_builder.with_metadata("dsym_info", info);
     }
 
-    if let Some(ref project) = resolved_project {
-        release_builder.with_name(project);
+    if let Some(ref release_name) = resolved_release_name {
+        release_builder.with_name(release_name);
     }
     if let Some(ref version) = full_version {
         release_builder.with_version(version);
     }
 
-    let release = release_builder
+    let created_release = release_builder
         .can_create()
         .then(|| release_builder.fetch_or_create())
         .transpose()?;
 
-    let release_id = release.map(|r| r.id.to_string());
+    let release_id = created_release.map(|r| r.id.to_string());
+
+    let chunk_release_id = release_id.clone();
 
     // Process each dSYM
     let mut uploads: Vec<SymbolSetUpload> = Vec::new();
@@ -174,15 +191,15 @@ pub fn upload(args: &Args) -> Result<()> {
     for dsym_path in dsym_paths {
         info!("Processing dSYM: {}", dsym_path.display());
 
-        match DsymFile::new(&dsym_path) {
+        match DsymFile::new(&dsym_path, *include_source) {
             Ok(mut dsym_file) => {
-                dsym_file.release_id = release_id.clone();
+                dsym_file.release_id = chunk_release_id.clone();
                 info!(
                     "  UUIDs: {} ({})",
-                    dsym_file.uuids.join(", "),
-                    dsym_file.uuids.len()
+                    dsym_file.uuids().join(", "),
+                    dsym_file.uuids().len()
                 );
-                info!("  Size: {} bytes", dsym_file.data.len());
+                info!("  Total size: {} bytes", dsym_file.total_size());
 
                 uploads.extend(dsym_file.into_uploads());
             }
@@ -198,8 +215,60 @@ pub fn upload(args: &Args) -> Result<()> {
     }
 
     info!("Uploading {} dSYM(s)...", uploads.len());
-    api::symbol_sets::upload_with_retry(uploads, 10, true)?;
+    // --include-source implies force unless the user explicitly asked to keep
+    // existing symbol sets with --skip-on-conflict.
+    let effective_force = conflict.force || (*include_source && !conflict.skip_on_conflict);
+    let (_summary, upload_result) = api::symbol_sets::upload_with_retry(
+        uploads,
+        10,
+        release_args.skip_release_on_fail,
+        effective_force,
+        conflict.skip_on_conflict,
+    );
+    upload_result?;
     info!("dSYM upload complete");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+
+    #[derive(Parser)]
+    struct DsymCli {
+        #[command(subcommand)]
+        command: crate::dsym::DsymSubcommand,
+    }
+
+    fn parse(extra: &[&str]) -> Args {
+        let mut argv = vec!["dsym", "upload", "--directory", "dsyms"];
+        argv.extend_from_slice(extra);
+        let crate::dsym::DsymSubcommand::Upload(args) = DsymCli::parse_from(argv).command;
+        args
+    }
+
+    #[test]
+    fn accepts_the_deprecated_no_release_bind_flag() {
+        // Released posthog-ios upload-symbols.sh passes `--no-release-bind` when
+        // POSTHOG_NO_RELEASE_BIND=1. Rejecting the flag would fail the Xcode build phase with a
+        // parse error on CLI upgrade.
+        assert!(parse(&["--no-release-bind"]).no_release_bind);
+        assert!(!parse(&[]).no_release_bind);
+    }
+
+    #[test]
+    fn deprecated_no_release_bind_is_hidden() {
+        let cmd = DsymCli::command();
+        let upload = cmd
+            .find_subcommand("upload")
+            .expect("expected the upload subcommand");
+        let arg = upload
+            .get_arguments()
+            .find(|a| a.get_id() == "no_release_bind")
+            .expect("expected the no_release_bind argument");
+
+        assert!(arg.is_hide_set());
+    }
 }

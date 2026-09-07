@@ -3,22 +3,19 @@ import { useActions, useValues } from 'kea'
 import { IconPencil } from '@posthog/icons'
 import { LemonSelect, Link } from '@posthog/lemon-ui'
 
-import { AppShortcut } from 'lib/components/AppShortcuts/AppShortcut'
-import { keyBinds } from 'lib/components/AppShortcuts/shortcuts'
 import { TextContent } from 'lib/components/Cards/TextCard/TextCard'
-import { ProductIntroduction } from 'lib/components/ProductIntroduction/ProductIntroduction'
+import { Shortcut } from 'lib/components/Shortcuts/Shortcut'
+import { keyBinds } from 'lib/components/Shortcuts/shortcuts'
 import { TZLabel } from 'lib/components/TZLabel'
-import { MicrophoneHog } from 'lib/components/hedgehogs'
 import { LemonButton } from 'lib/lemon-ui/LemonButton'
 import { LemonTable, LemonTableColumn, LemonTableColumns } from 'lib/lemon-ui/LemonTable'
 import { createdAtColumn } from 'lib/lemon-ui/LemonTable/columnUtils'
 import { LemonTag } from 'lib/lemon-ui/LemonTag/LemonTag'
 import { ProfilePicture } from 'lib/lemon-ui/ProfilePicture'
 import { Tooltip } from 'lib/lemon-ui/Tooltip'
-import { cn } from 'lib/utils/css-classes'
 import { organizationLogic } from 'scenes/organizationLogic'
-import { Scene, SceneExport } from 'scenes/sceneTypes'
 import { sceneConfigurations } from 'scenes/scenes'
+import { Scene, SceneExport } from 'scenes/sceneTypes'
 import { teamLogic } from 'scenes/teamLogic'
 import { urls } from 'scenes/urls'
 
@@ -28,6 +25,8 @@ import { annotationsModel } from '~/models/annotationsModel'
 import { ProductKey } from '~/queries/schema/schema-general'
 import { AnnotationScope, AnnotationType, InsightShortId } from '~/types'
 
+import { annotationsEmptyState } from 'products/annotations/frontend/emptyState/annotationsEmptyState'
+
 import { AnnotationModal } from './AnnotationModal'
 import { annotationModalLogic, annotationScopeToLevel, annotationScopeToName } from './annotationModalLogic'
 import { annotationScopesMenuOptions, annotationsLogic } from './annotationsLogic'
@@ -36,6 +35,7 @@ export const scene: SceneExport = {
     component: Annotations,
     logic: annotationsLogic,
     productKey: ProductKey.ANNOTATIONS,
+    emptyState: annotationsEmptyState,
 }
 
 export function Annotations(): JSX.Element {
@@ -45,7 +45,7 @@ export function Annotations(): JSX.Element {
 
     const { openModalToCreateAnnotation } = useActions(annotationModalLogic)
 
-    const { filteredAnnotations, shouldShowEmptyState, annotationsLoading, scope } = useValues(annotationsLogic)
+    const { filteredAnnotations, annotationsLoading, scope } = useValues(annotationsLogic)
     const { setScope } = useActions(annotationsLogic)
 
     const { loadingNext, next } = useValues(annotationsModel)
@@ -55,29 +55,28 @@ export function Annotations(): JSX.Element {
         {
             title: 'Annotation',
             key: 'annotation',
-            width: '30%',
             render: function RenderAnnotation(_, annotation: AnnotationType): JSX.Element {
-                let renderedContent = <>{annotation.content ?? ''}</>
-                if ((annotation.content || '').trim().length > 30) {
-                    renderedContent = (
-                        <Tooltip
-                            title={
-                                <TextContent
-                                    text={annotation.content ?? ''}
-                                    data-attr="annotation-scene-comment-title-rendered-content"
-                                />
-                            }
-                        >
-                            {(annotation.content ?? '').slice(0, 27) + '...'}
-                        </Tooltip>
-                    )
-                }
                 return (
-                    <div className="font-semibold">
-                        <Link subtle to={urls.annotation(annotation.id)}>
-                            {renderedContent}
-                        </Link>
-                    </div>
+                    <Tooltip
+                        title={
+                            <TextContent
+                                text={annotation.content ?? ''}
+                                data-attr="annotation-scene-comment-title-rendered-content"
+                            />
+                        }
+                    >
+                        <div className="flex items-center gap-1.5">
+                            {annotation.emoji && (
+                                <span className="text-base leading-none shrink-0">{annotation.emoji}</span>
+                            )}
+                            {/* line-clamp-2 must stay on its own element — combining it with flex breaks the clamp */}
+                            <div className="font-semibold line-clamp-2 min-w-0">
+                                <Link subtle to={urls.annotation(annotation.id)}>
+                                    {annotation.content ?? ''}
+                                </Link>
+                            </div>
+                        </div>
+                    </Tooltip>
                 )
             },
         },
@@ -163,7 +162,7 @@ export function Annotations(): JSX.Element {
                     type: sceneConfigurations[Scene.Annotations].iconType || 'default_icon_type',
                 }}
                 actions={
-                    <AppShortcut
+                    <Shortcut
                         name="NewAnnotation"
                         keybind={[keyBinds.new]}
                         intent="New annotation"
@@ -172,13 +171,14 @@ export function Annotations(): JSX.Element {
                     >
                         <LemonButton
                             type="primary"
+                            data-attr="create-annotation"
                             onClick={() => openModalToCreateAnnotation()}
                             size="small"
                             tooltip="New annotation"
                         >
                             New annotation
                         </LemonButton>
-                    </AppShortcut>
+                    </Shortcut>
                 }
             />
             <div className="flex flex-row items-center gap-2 justify-end">
@@ -186,47 +186,31 @@ export function Annotations(): JSX.Element {
                 <LemonSelect options={annotationScopesMenuOptions()} value={scope} onSelect={setScope} />
             </div>
             <div data-attr="annotations-content">
-                <div className={cn('mt-4 mb-0 empty:hidden')}>
-                    <ProductIntroduction
-                        productName="Annotations"
-                        productKey={ProductKey.ANNOTATIONS}
-                        thingName="annotation"
-                        description="Annotations allow you to mark when certain changes happened so you can easily see how they impacted your metrics."
-                        docsURL="https://posthog.com/docs/data/annotations"
-                        action={() => openModalToCreateAnnotation()}
-                        isEmpty={shouldShowEmptyState}
-                        customHog={MicrophoneHog}
-                    />
-                </div>
-                {!shouldShowEmptyState && (
-                    <>
-                        <LemonTable
-                            data-attr="annotations-table"
-                            rowKey="id"
-                            dataSource={filteredAnnotations}
-                            columns={columns}
-                            defaultSorting={{
-                                columnKey: 'date_marker',
-                                order: -1,
+                <LemonTable
+                    data-attr="annotations-table"
+                    rowKey="id"
+                    dataSource={filteredAnnotations}
+                    columns={columns}
+                    defaultSorting={{
+                        columnKey: 'date_marker',
+                        order: -1,
+                    }}
+                    noSortingCancellation
+                    loading={annotationsLoading}
+                    emptyState="No annotations yet"
+                />
+                {next && (
+                    <div className="flex justify-center mt-6">
+                        <LemonButton
+                            type="primary"
+                            loading={loadingNext}
+                            onClick={(): void => {
+                                loadAnnotationsNext()
                             }}
-                            noSortingCancellation
-                            loading={annotationsLoading}
-                            emptyState="No annotations yet"
-                        />
-                        {next && (
-                            <div className="flex justify-center mt-6">
-                                <LemonButton
-                                    type="primary"
-                                    loading={loadingNext}
-                                    onClick={(): void => {
-                                        loadAnnotationsNext()
-                                    }}
-                                >
-                                    Load more annotations
-                                </LemonButton>
-                            </div>
-                        )}
-                    </>
+                        >
+                            Load more annotations
+                        </LemonButton>
+                    </div>
                 )}
             </div>
             <AnnotationModal />

@@ -1,4 +1,4 @@
-import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/OnboardingDocsContentWrapper'
+import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/shared/OnboardingDocsContentWrapper'
 
 import { getPythonSteps as getPythonStepsPA } from '../product-analytics/python'
 import { StepDefinition } from '../steps'
@@ -38,16 +38,16 @@ export const getPythonSteps = (ctx: OnboardingComponentsContext): StepDefinition
                             file: 'Python',
                             code: dedent`
                                 from posthog import Posthog
-                                posthog = Posthog("<ph_project_api_key>", enable_exception_autocapture=True, ...)
+                                posthog = Posthog("<ph_project_token>", enable_exception_autocapture=True, ...)
                             `,
                         },
                     ]}
                 />
                 <Markdown>
                     {dedent`
-                        We recommend setting up and using [contexts](/docs/libraries/python#contexts) so that exceptions automatically include distinct IDs, session IDs, and other properties you can set up with tags.
+                        We recommend setting up and using [contexts](https://posthog.com/docs/libraries/python#contexts) so that exceptions automatically include distinct IDs, session IDs, and other properties you can set up with tags.
 
-                        You can also enable [code variables capture](/docs/error-tracking/code-variables/python) to automatically capture the state of local variables when exceptions occur, giving you a debugger-like view of your application.
+                        You can also enable [code variables capture](https://posthog.com/docs/error-tracking/code-variables/python) to automatically capture the state of local variables when exceptions occur, giving you a debugger-like view of your application.
                     `}
                 </Markdown>
             </>
@@ -77,7 +77,7 @@ export const getPythonSteps = (ctx: OnboardingComponentsContext): StepDefinition
                 />
                 <Markdown>
                     {dedent`
-                        You can find a full example of all of this in our [Python (and Flask) error tracking tutorial](/tutorials/python-error-tracking).
+                        You can find a full example of all of this in our [Python (and Flask) error tracking tutorial](https://posthog.com/tutorials/python-error-tracking).
                     `}
                 </Markdown>
             </>
@@ -119,7 +119,7 @@ export const getPythonSteps = (ctx: OnboardingComponentsContext): StepDefinition
                         <Tab.Panel>
                             <Markdown>
                                 {dedent`
-                                    The Python SDK provides a Django middleware that automatically wraps all requests with a [context](/docs/libraries/python#contexts). Add the middleware to your Django settings:
+                                    The Python SDK provides a Django middleware that automatically wraps all requests with a [context](https://posthog.com/docs/libraries/python#contexts). Add the middleware to your Django settings:
                                 `}
                             </Markdown>
                             <CodeBlock
@@ -139,7 +139,7 @@ export const getPythonSteps = (ctx: OnboardingComponentsContext): StepDefinition
                             />
                             <Markdown>
                                 {dedent`
-                                    By default, the middleware captures exceptions and sends them to PostHog. Disable with \`POSTHOG_MW_CAPTURE_EXCEPTIONS = False\`. Use \`POSTHOG_MW_EXTRA_TAGS\`, \`POSTHOG_MW_REQUEST_FILTER\`, and \`POSTHOG_MW_TAG_MAP\` to customize. See the [Django integration docs](/docs/libraries/django) for full configuration.
+                                    By default, the middleware captures exceptions and sends them to PostHog. Disable with \`POSTHOG_MW_CAPTURE_EXCEPTIONS = False\`. Use \`POSTHOG_MW_EXTRA_TAGS\`, \`POSTHOG_MW_REQUEST_FILTER\`, and \`POSTHOG_MW_TAG_MAP\` to customize. See the [Django integration docs](https://posthog.com/docs/libraries/django) for full configuration.
                                 `}
                             </Markdown>
                         </Tab.Panel>
@@ -152,7 +152,7 @@ export const getPythonSteps = (ctx: OnboardingComponentsContext): StepDefinition
                                         code: dedent`
                                             from flask import Flask, jsonify
                                             from posthog import Posthog
-                                            posthog = Posthog('<ph_project_api_key>', host='https://us.i.posthog.com')
+                                            posthog = Posthog('<ph_project_token>', host='https://us.i.posthog.com')
                                             @app.errorhandler(Exception)
                                             def handle_exception(e):
                                                 event_id = posthog.capture_exception(e)
@@ -173,7 +173,7 @@ export const getPythonSteps = (ctx: OnboardingComponentsContext): StepDefinition
                                         code: dedent`
                                             from fastapi.responses import JSONResponse
                                             from posthog import Posthog
-                                            posthog = Posthog('<ph_project_api_key>', host='https://us.i.posthog.com')
+                                            posthog = Posthog('<ph_project_token>', host='https://us.i.posthog.com')
                                             @app.exception_handler(Exception)
                                             async def http_exception_handler(request, exc):
                                                 posthog.capture_exception(exc)
@@ -189,14 +189,7 @@ export const getPythonSteps = (ctx: OnboardingComponentsContext): StepDefinition
         ),
     }
 
-    return [
-        ...installSteps,
-        verifyInitStep,
-        exceptionAutocaptureStep,
-        manualCaptureStep,
-        verifyStep,
-        frameworkStep,
-    ]
+    return [...installSteps, verifyInitStep, exceptionAutocaptureStep, manualCaptureStep, verifyStep, frameworkStep]
 }
 
 export const PythonInstallation = createInstallation(getPythonSteps)

@@ -1,4 +1,4 @@
-import { DiffEditor } from '@monaco-editor/react'
+import { Suspense } from 'react'
 
 import {
     ActivityLogItem,
@@ -8,52 +8,37 @@ import {
 } from 'lib/components/ActivityLog/humanizeActivity'
 import { LemonDropdown } from 'lib/lemon-ui/LemonDropdown'
 import { Link } from 'lib/lemon-ui/Link'
-import { initHogLanguage } from 'lib/monaco/languages/hog'
+import { Spinner } from 'lib/lemon-ui/Spinner'
+import { isObject } from 'lib/utils/guards'
+import { lazyWithRetry } from 'lib/utils/retryImport'
 import { urls } from 'scenes/urls'
 
 import { HogFunctionTypeType } from '~/types'
 
 import { humanizeHogFunctionType } from '../hog-function-utils'
+import type { DiffProps } from './Diff'
+
+const STAGED_CHANGES = 'changed the staged changes'
 
 const nameOrLinkToHogFunction = (id?: string | null, name?: string | null): string | JSX.Element => {
     const displayName = name?.trim() ? name : 'Untitled hog function'
     return id ? <Link to={urls.hogFunction(id)}>{displayName}</Link> : displayName
 }
 
-export interface DiffProps {
-    before: string
-    after: string
-    language?: string
-}
+const LazyDiff = lazyWithRetry(() => import('./Diff').then((m) => ({ default: m.Diff })))
 
-export function Diff({ before, after, language }: DiffProps): JSX.Element {
+/** Lazy so the activity describer registry (imported app-wide) doesn't pull monaco into its chunk. */
+export function Diff(props: DiffProps): JSX.Element {
     return (
-        <DiffEditor
-            height="300px"
-            original={before}
-            modified={after}
-            language={language ?? 'json'}
-            onMount={(_, monaco) => {
-                if (language === 'hog') {
-                    initHogLanguage(monaco)
-                }
-            }}
-            options={{
-                lineNumbers: 'off',
-                minimap: { enabled: false },
-                folding: false,
-                wordWrap: 'on',
-                renderLineHighlight: 'none',
-                scrollbar: { vertical: 'auto', horizontal: 'hidden' },
-                overviewRulerBorder: false,
-                hideCursorInOverviewRuler: true,
-                overviewRulerLanes: 0,
-                tabFocusMode: true,
-                enableSplitViewResizing: false,
-                renderSideBySide: false,
-                readOnly: true,
-            }}
-        />
+        <Suspense
+            fallback={
+                <div className="min-h-[300px]">
+                    <Spinner />
+                </div>
+            }
+        >
+            <LazyDiff {...props} />
+        </Suspense>
     )
 }
 
@@ -120,6 +105,24 @@ export function hogFunctionActivityDescriber(logItem: ActivityLogItem, asNotific
         }
     }
 
+    const draftActivities: Record<string, string> = {
+        draft_updated: 'staged changes for review on',
+        published: 'published the staged changes to',
+        draft_discarded: 'discarded the staged changes on',
+        revision_restored: 'staged an earlier version for review on',
+    }
+    if (logItem.activity in draftActivities) {
+        return {
+            description: (
+                <>
+                    <strong className="ph-no-capture">{userNameForLogItem(logItem)}</strong>{' '}
+                    {draftActivities[logItem.activity]} the {objectNoun}:{' '}
+                    {nameOrLinkToHogFunction(logItem?.item_id, logItem?.detail.name)}
+                </>
+            ),
+        }
+    }
+
     if (logItem.activity == 'updated') {
         const changes: { inline: string | JSX.Element; inlist: string | JSX.Element }[] = []
         for (const change of logItem.detail.changes ?? []) {
@@ -131,19 +134,40 @@ export function hogFunctionActivityDescriber(logItem: ActivityLogItem, asNotific
                     })
                     break
                 }
+                // Both are masked server-side, so there is nothing to diff — say the staged config
+                // changed and let the reader open it in the builder. A staged edit usually touches
+                // both fields, so collapse them into one entry.
+                case 'draft':
+                case 'draft_encrypted_inputs': {
+                    if (!changes.some((c) => c.inlist === STAGED_CHANGES)) {
+                        changes.push({ inline: `${STAGED_CHANGES} on`, inlist: STAGED_CHANGES })
+                    }
+                    break
+                }
                 case 'inputs': {
-                    const changedFields: JSX.Element[] = []
-                    Object.entries(change.after ?? {}).forEach(([key, value]) => {
-                        const before = JSON.stringify(change.before?.[key]?.value)
-                        const after = JSON.stringify(value?.value)
-                        if (before !== after) {
-                            changedFields.push(
-                                <DiffLink before={before} after={after}>
-                                    {key}
-                                </DiffLink>
-                            )
-                        }
-                    })
+                    const beforeValues = isObject(change.before)
+                        ? (change.before as Record<string, { value?: unknown }>)
+                        : {}
+                    const afterValues = isObject(change.after)
+                        ? (change.after as Record<string, { value?: unknown }>)
+                        : {}
+
+                    const changedFields = Object.entries(afterValues)
+                        .map(([key, value]) => {
+                            const before = JSON.stringify(beforeValues[key]?.value)
+                            const after = JSON.stringify(value?.value)
+
+                            if (before !== after) {
+                                return (
+                                    <DiffLink key={key} before={before} after={after}>
+                                        {key}
+                                    </DiffLink>
+                                )
+                            }
+                            return null
+                        })
+                        .filter((x): x is JSX.Element => !!x)
+
                     const changedSpans: JSX.Element[] = []
                     for (let index = 0; index < changedFields.length; index++) {
                         if (index !== 0 && index === changedFields.length - 1) {
@@ -153,6 +177,7 @@ export function hogFunctionActivityDescriber(logItem: ActivityLogItem, asNotific
                         }
                         changedSpans.push(changedFields[index])
                     }
+
                     const inputOrInputs = changedFields.length === 1 ? 'input' : 'inputs'
                     changes.push({
                         inline: (

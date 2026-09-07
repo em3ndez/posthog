@@ -70,6 +70,15 @@ impl UserAgentInfo {
 
     /// Parse a PostHog SDK User-Agent (after stripping "posthog-" prefix).
     fn parse_posthog_sdk(rest: &str) -> Self {
+        if let Some(legacy_ruby_version) = Self::legacy_ruby_version(rest) {
+            return Self {
+                sdk_name: Some("posthog-ruby"),
+                sdk_version: Some(legacy_ruby_version.to_string()),
+                is_browser: false,
+                runtime: RuntimeType::Server,
+            };
+        }
+
         // Pattern: <sdk-name>/<version> [optional extra info]
         let Some(slash_idx) = rest.find('/') else {
             return Self::unknown();
@@ -91,13 +100,20 @@ impl UserAgentInfo {
         let (sdk_name, runtime) = match name {
             // Server-side SDKs
             "python" => ("posthog-python", RuntimeType::Server),
+            "python-mcp" => ("posthog-python-mcp", RuntimeType::Server),
             "ruby" => ("posthog-ruby", RuntimeType::Server),
+            "rails" => ("posthog-rails", RuntimeType::Server),
             "php" => ("posthog-php", RuntimeType::Server),
             "java" => ("posthog-java", RuntimeType::Server),
             "go" => ("posthog-go", RuntimeType::Server),
             "node" => ("posthog-node", RuntimeType::Server),
+            "node-mcp" => ("posthog-node-mcp", RuntimeType::Server),
+            "edge" => ("posthog-edge", RuntimeType::Server),
+            "convex" => ("posthog-convex", RuntimeType::Server),
             "dotnet" => ("posthog-dotnet", RuntimeType::Server),
+            "aspnetcore" => ("posthog-aspnetcore", RuntimeType::Server),
             "elixir" => ("posthog-elixir", RuntimeType::Server),
+            "rs" => ("posthog-rs", RuntimeType::Server),
             // Deprecated: posthog-server users are migrating to posthog-java
             "server" => ("posthog-server", RuntimeType::Server),
             // Client-side SDKs (mobile and browser)
@@ -106,6 +122,8 @@ impl UserAgentInfo {
             "ios" => ("posthog-ios", RuntimeType::Client),
             "react-native" => ("posthog-react-native", RuntimeType::Client),
             "flutter" => ("posthog-flutter", RuntimeType::Client),
+            "kmp" => ("posthog-kmp", RuntimeType::Client),
+            "unity" => ("posthog-unity", RuntimeType::Client),
             // Unknown SDK - don't set sdk_name for unrecognized SDKs
             _ => return Self::unknown(),
         };
@@ -115,6 +133,17 @@ impl UserAgentInfo {
             sdk_version: Some(version.to_string()),
             is_browser: false,
             runtime,
+        }
+    }
+
+    fn legacy_ruby_version(rest: &str) -> Option<&str> {
+        let version = rest.strip_prefix("ruby")?;
+        let first = version.chars().next()?;
+
+        if first.is_ascii_digit() {
+            Some(version.split_whitespace().next().unwrap_or(version))
+        } else {
+            None
         }
     }
 
@@ -198,7 +227,49 @@ mod tests {
         RuntimeType::Server
     )]
     #[case(
+        "posthog-node-mcp/0.7.0",
+        Some("posthog-node-mcp"),
+        Some("0.7.0"),
+        RuntimeType::Server
+    )]
+    #[case(
+        "posthog-edge/1.2.3",
+        Some("posthog-edge"),
+        Some("1.2.3"),
+        RuntimeType::Server
+    )]
+    #[case(
+        "posthog-convex/0.2.0",
+        Some("posthog-convex"),
+        Some("0.2.0"),
+        RuntimeType::Server
+    )]
+    #[case(
+        "posthog-python-mcp/0.1.0",
+        Some("posthog-python-mcp"),
+        Some("0.1.0"),
+        RuntimeType::Server
+    )]
+    #[case(
         "posthog-ruby/2.0.0",
+        Some("posthog-ruby"),
+        Some("2.0.0"),
+        RuntimeType::Server
+    )]
+    #[case(
+        "posthog-rails/3.18.0",
+        Some("posthog-rails"),
+        Some("3.18.0"),
+        RuntimeType::Server
+    )]
+    #[case(
+        "posthog-ruby2.0.0",
+        Some("posthog-ruby"),
+        Some("2.0.0"),
+        RuntimeType::Server
+    )]
+    #[case(
+        "posthog-ruby2.0.0 (Linux)",
         Some("posthog-ruby"),
         Some("2.0.0"),
         RuntimeType::Server
@@ -228,9 +299,21 @@ mod tests {
         RuntimeType::Server
     )]
     #[case(
+        "posthog-aspnetcore/1.0.0",
+        Some("posthog-aspnetcore"),
+        Some("1.0.0"),
+        RuntimeType::Server
+    )]
+    #[case(
         "posthog-elixir/0.2.0",
         Some("posthog-elixir"),
         Some("0.2.0"),
+        RuntimeType::Server
+    )]
+    #[case(
+        "posthog-rs/0.10.0",
+        Some("posthog-rs"),
+        Some("0.10.0"),
         RuntimeType::Server
     )]
     #[case(
@@ -273,6 +356,18 @@ mod tests {
         "posthog-flutter/4.0.0",
         Some("posthog-flutter"),
         Some("4.0.0"),
+        RuntimeType::Client
+    )]
+    #[case(
+        "posthog-kmp/0.6.0",
+        Some("posthog-kmp"),
+        Some("0.6.0"),
+        RuntimeType::Client
+    )]
+    #[case(
+        "posthog-unity/4.5.0",
+        Some("posthog-unity"),
+        Some("4.5.0"),
         RuntimeType::Client
     )]
     #[case(
@@ -319,6 +414,8 @@ mod tests {
 
     #[rstest]
     #[case("posthog-python", None, None)] // No slash
+    #[case("posthog-ruby", None, None)] // Legacy Ruby format still needs a version
+    #[case("posthog-rubybeta", None, None)] // Legacy Ruby version must start with a digit
     #[case("posthog-python/", None, None)] // Empty version
     #[case("posthog-/1.0.0", None, None)] // Empty SDK name
     #[case("", None, None)] // Empty string
@@ -347,14 +444,24 @@ mod tests {
     #[case(Some("posthog-ios/3.0.0"), "posthog-ios")]
     #[case(Some("posthog-react-native/2.5.0"), "posthog-react-native")]
     #[case(Some("posthog-flutter/4.0.0"), "posthog-flutter")]
+    #[case(Some("posthog-kmp/0.6.0"), "posthog-kmp")]
+    #[case(Some("posthog-unity/4.5.0"), "posthog-unity")]
     #[case(Some("posthog-python/1.4.0"), "posthog-python")]
+    #[case(Some("posthog-python-mcp/0.1.0"), "posthog-python-mcp")]
     #[case(Some("posthog-ruby/2.0.0"), "posthog-ruby")]
+    #[case(Some("posthog-rails/3.18.0"), "posthog-rails")]
+    #[case(Some("posthog-ruby2.0.0"), "posthog-ruby")]
     #[case(Some("posthog-php/3.0.0"), "posthog-php")]
     #[case(Some("posthog-java/1.0.0"), "posthog-java")]
     #[case(Some("posthog-go/0.1.0"), "posthog-go")]
     #[case(Some("posthog-node/2.2.0"), "posthog-node")]
+    #[case(Some("posthog-node-mcp/0.7.0"), "posthog-node-mcp")]
+    #[case(Some("posthog-edge/2.2.0"), "posthog-edge")]
+    #[case(Some("posthog-convex/0.2.0"), "posthog-convex")]
     #[case(Some("posthog-dotnet/1.0.0"), "posthog-dotnet")]
+    #[case(Some("posthog-aspnetcore/1.0.0"), "posthog-aspnetcore")]
     #[case(Some("posthog-elixir/0.2.0"), "posthog-elixir")]
+    #[case(Some("posthog-rs/0.10.0"), "posthog-rs")]
     #[case(Some("posthog-server/1.0.0"), "posthog-server")]
     #[case(
         Some("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"),
@@ -380,7 +487,17 @@ mod tests {
     #[rstest]
     #[case("posthog-python/3.0.0", Some("posthog-python"))]
     #[case("posthog-node/1.2.3", Some("posthog-node"))]
+    #[case("posthog-node-mcp/0.7.0", Some("posthog-node-mcp"))]
+    #[case("posthog-edge/1.2.3", Some("posthog-edge"))]
+    #[case("posthog-convex/0.2.0", Some("posthog-convex"))]
+    #[case("posthog-python-mcp/0.1.0", Some("posthog-python-mcp"))]
+    #[case("posthog-ruby2.0.0", Some("posthog-ruby"))]
+    #[case("posthog-rails/3.18.0", Some("posthog-rails"))]
+    #[case("posthog-aspnetcore/1.0.0", Some("posthog-aspnetcore"))]
+    #[case("posthog-rs/0.10.0", Some("posthog-rs"))]
     #[case("posthog-android/3.0.0", Some("posthog-android"))]
+    #[case("posthog-kmp/0.6.0", Some("posthog-kmp"))]
+    #[case("posthog-unity/4.5.0", Some("posthog-unity"))]
     #[case("posthog-server/1.0.0", Some("posthog-server"))]
     #[case("Mozilla/5.0 (Windows NT 10.0; Win64; x64)", Some("web"))]
     #[case("Chrome/120.0.0.0 Safari/537.36", Some("web"))]

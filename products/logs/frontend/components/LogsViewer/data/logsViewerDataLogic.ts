@@ -1,34 +1,87 @@
 import colors from 'ansi-colors'
-import { actions, afterMount, connect, events, kea, key, listeners, path, props, reducers, selectors } from 'kea'
+import { deepEqual as equal } from 'fast-equals'
+import {
+    MakeLogicType,
+    actions,
+    afterMount,
+    connect,
+    events,
+    kea,
+    key,
+    listeners,
+    path,
+    props,
+    reducers,
+    selectors,
+} from 'kea'
 import { loaders } from 'kea-loaders'
+import { subscriptions } from 'kea-subscriptions'
 import posthog from 'posthog-js'
 
 import { lemonToast } from '@posthog/lemon-ui'
 
 import api from 'lib/api'
-import { dataColorVars } from 'lib/colors'
 import { SetupTaskId, globalSetupLogic } from 'lib/components/ProductSetup'
 import { dayjs } from 'lib/dayjs'
-import { humanFriendlyDetailedTime } from 'lib/utils'
+import {
+    NEW_QUERY_STARTED_ERROR_MESSAGE,
+    UNMOUNTING_ERROR_MESSAGE,
+    isUserInitiatedError,
+} from 'lib/utils/kea-logic-builders'
 import { teamLogic } from 'scenes/teamLogic'
 
-import { LogMessage, LogsQuery, LogsSparklineBreakdownBy } from '~/queries/schema/schema-general'
+import { LogMessage, LogsQuery, ProductIntentContext, ProductKey } from '~/queries/schema/schema-general'
 import { integer } from '~/queries/schema/type-utils'
-import { JsonType, PropertyGroupFilter } from '~/types'
+import { JsonType, PropertyGroupFilter, UniversalFiltersGroup, UniversalFiltersGroupValue } from '~/types'
 
-import { logsViewerFiltersLogic } from 'products/logs/frontend/components/LogsViewer/Filters/logsViewerFiltersLogic'
 import { logsViewerConfigLogic } from 'products/logs/frontend/components/LogsViewer/config/logsViewerConfigLogic'
 import { LogsViewerFilters } from 'products/logs/frontend/components/LogsViewer/config/types'
+import {
+    logsViewerFiltersLogic,
+    unsetColumnQueryFields,
+} from 'products/logs/frontend/components/LogsViewer/Filters/logsViewerFiltersLogic'
+import { OTHER_BREAKDOWN_LABEL, OTHER_BREAKDOWN_VALUE } from 'products/logs/frontend/sparklineOtherBreakdown'
 
+import type { ProductIntentProperties } from '../../../../../../frontend/src/lib/utils/product-intents'
+import type { DateRange } from '../../../../../../frontend/src/queries/schema/schema-general'
 // TODO: Move to ./types.ts
 import { ParsedLogMessage } from '../../../types'
-import type { logsViewerDataLogicType } from './logsViewerDataLogicType'
+import type { LogsOrderBy } from '../../../types'
+import type { LogsColumnConfig } from '../config/columns'
 
 const DEFAULT_LIVE_TAIL_POLL_INTERVAL_MS = 1000
 const DEFAULT_LOGS_PAGE_SIZE: number = 250
 export const DEFAULT_INITIAL_LOGS_LIMIT = null as number | null
-const NEW_QUERY_STARTED_ERROR_MESSAGE = 'new query started' as const
+
+// Parse cache keyed on log object identity — leak-free by construction (entries die with their
+// logs) and shared across logic instances. Parsing is pure per object, so cached entries are
+// always correct as long as log objects are never mutated in place after creation (they aren't:
+// `logs` is only ever replaced wholesale via `setLogs`). The same immutability contract is why
+// live-tail prepends can keep existing log references untouched so their parsed rows stay
+// reference-stable, and why newLogUuids is tracked as a separate set rather than a flag on each
+// log — avoiding a clone of every existing log object per poll tick.
+const parsedLogCache = new WeakMap<LogMessage, ParsedLogMessage>()
 const DEFAULT_LIVE_TAIL_POLL_INTERVAL_MAX_MS = 5000
+
+function classifyQueryError(error: unknown): { error_type: string; status_code: number | null } {
+    const errorStr = String(error).toLowerCase()
+    const statusCode =
+        typeof error === 'object' && error !== null && 'status' in error ? (error.status as number) : null
+
+    if (statusCode === 504 || errorStr.includes('timed out') || errorStr.includes('timeout')) {
+        return { error_type: 'timeout', status_code: statusCode }
+    }
+    if (errorStr.includes('memory limit') || errorStr.includes('out of memory')) {
+        return { error_type: 'out_of_memory', status_code: statusCode }
+    }
+    if (statusCode === 429) {
+        return { error_type: 'rate_limited', status_code: statusCode }
+    }
+    if (statusCode !== null && statusCode >= 500) {
+        return { error_type: 'server_error', status_code: statusCode }
+    }
+    return { error_type: 'unknown', status_code: statusCode }
+}
 
 const stringifyLogAttributes = (attributes: Record<string, any>): Record<string, string> => {
     const result: Record<string, string> = {}
@@ -44,6 +97,376 @@ export interface LogsViewerDataLogicProps {
     autoLoad?: boolean
 }
 
+/** Returns true if the filterGroup change should be skipped (no real change or new empty filter added). */
+export function shouldSkipFilterGroupChange(
+    filterGroup: UniversalFiltersGroup,
+    oldFilterGroup: UniversalFiltersGroup | undefined
+): boolean {
+    if (!oldFilterGroup || equal(filterGroup, oldFilterGroup)) {
+        return true
+    }
+    const oldCount = (oldFilterGroup.values?.[0] as UniversalFiltersGroup | undefined)?.values?.length ?? 0
+    const newCount = (filterGroup.values?.[0] as UniversalFiltersGroup | undefined)?.values?.length ?? 0
+    if (newCount <= oldCount) {
+        return false
+    }
+    const hasIncompleteValue = (filterValue: UniversalFiltersGroupValue): boolean => {
+        if (!filterValue || typeof filterValue !== 'object') {
+            return false
+        }
+        if ('type' in filterValue && 'values' in filterValue) {
+            const groupValues = (filterValue as UniversalFiltersGroup).values ?? []
+            return groupValues.some((child) => hasIncompleteValue(child))
+        }
+        if ('id' in filterValue) {
+            return (filterValue as { id: unknown }).id == null
+        }
+        if ('value' in filterValue) {
+            const val = (filterValue as { value: unknown }).value
+            return val == null || (Array.isArray(val) && val.length === 0)
+        }
+        return false
+    }
+    const rootGroup = filterGroup.values?.[0] as UniversalFiltersGroup | undefined
+    const lastFilter = rootGroup?.values?.[rootGroup.values.length - 1]
+    return lastFilter ? hasIncompleteValue(lastFilter) : false
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface logsViewerDataLogicValues {
+    customColumns: string[] | undefined // logsViewerConfigLogic
+    orderBy: LogsOrderBy // logsViewerConfigLogic
+    filterGroup: UniversalFiltersGroup // logsViewerFiltersLogic
+    filters: LogsViewerFilters // logsViewerFiltersLogic
+    personId: string | undefined // logsViewerFiltersLogic
+    queryFilterGroup: UniversalFiltersGroup // logsViewerFiltersLogic
+    sessionId: string | undefined // logsViewerFiltersLogic
+    utcDateRange: {
+        date_from: string | null | undefined
+        date_to: string | null | undefined
+        explicitDate: boolean | null | undefined
+    } // logsViewerFiltersLogic
+    customColumnAliases: Record<string, string> | null
+    hasMoreLogsToLoad: boolean
+    hasRunQuery: boolean
+    initialLogsLimit: number | null
+    liveLogsCheckpoint: string | null
+    liveTailAbortController: AbortController | null
+    liveTailDisabledReason: string | undefined
+    liveTailExpired: boolean
+    liveTailPollInterval: number
+    liveTailRunning: boolean
+    logs: LogMessage[]
+    logsAbortController: AbortController | null
+    logsLoading: boolean
+    logsRemainingToLoad: number
+    maxExportableLogs: number
+    newLogUuids: Set<string>
+    nextCursor: string | null
+    parsedLogs: ParsedLogMessage[]
+    sparkline: any[]
+    sparklineAbortController: AbortController | null
+    sparklineData: {
+        data: {
+            color: string | undefined
+            name: string
+            values: number[]
+        }[]
+        dates: string[]
+    }
+    sparklineIncompleteBarIndices: number[]
+    sparklineLoading: boolean
+    totalLogsMatchingFilters: number
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface logsViewerDataLogicActions {
+    addColumn: (column: LogsColumnConfig) => {
+        column: LogsColumnConfig
+    } // logsViewerConfigLogic
+    removeColumn: (id: string) => {
+        id: string
+    } // logsViewerConfigLogic
+    setColumns: (columns: LogsColumnConfig[]) => {
+        columns: LogsColumnConfig[]
+    } // logsViewerConfigLogic
+    setOrderBy: (
+        orderBy: LogsOrderBy,
+        source?: 'header' | 'toolbar' | undefined
+    ) => {
+        orderBy: LogsOrderBy
+        source: 'header' | 'toolbar'
+    } // logsViewerConfigLogic
+    bumpFacetRefresh: () => {
+        value: true
+    } // logsViewerFiltersLogic
+    setDateRange: (dateRange: DateRange) => {
+        dateRange: DateRange
+    } // logsViewerFiltersLogic
+    setFilterGroup: (
+        filterGroup: UniversalFiltersGroup,
+        openFilterOnInsert?: boolean | undefined
+    ) => {
+        filterGroup: UniversalFiltersGroup
+        openFilterOnInsert: boolean
+    } // logsViewerFiltersLogic
+    setFilters: (
+        filters: Partial<LogsViewerFilters>,
+        pushToHistory?: boolean | undefined
+    ) => {
+        filters: Partial<LogsViewerFilters>
+        pushToHistory: boolean
+    } // logsViewerFiltersLogic
+    setSearchTerm: (searchTerm: string | undefined) => {
+        searchTerm: string | undefined
+    } // logsViewerFiltersLogic
+    addProductIntent: (properties: ProductIntentProperties) => ProductIntentProperties // teamLogic
+    addLogsToSparkline: (logs: LogMessage[]) => LogMessage[]
+    cancelInProgressLiveTail: (liveTailAbortController: AbortController | null) => {
+        liveTailAbortController: AbortController | null
+    }
+    cancelInProgressLogs: (logsAbortController: AbortController | null) => {
+        logsAbortController: AbortController | null
+    }
+    cancelInProgressSparkline: (sparklineAbortController: AbortController | null) => {
+        sparklineAbortController: AbortController | null
+    }
+    clearLogs: () => {
+        value: true
+    }
+    clearLogsFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    clearLogsSuccess: (
+        logs: never[],
+        payload?: {
+            value: true
+        }
+    ) => {
+        logs: never[]
+        payload?: {
+            value: true
+        }
+    }
+    expireLiveTail: () => boolean
+    fetchLogs: () => any
+    fetchLogsFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    fetchLogsSuccess: (
+        logs: LogMessage[],
+        payload?: any
+    ) => {
+        logs: LogMessage[]
+        payload?: any
+    }
+    fetchNextLogsPage: (limit?: number) => {
+        limit: number | undefined
+    }
+    fetchNextLogsPageFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    fetchNextLogsPageSuccess: (
+        logs: LogMessage[],
+        payload?: {
+            limit: number | undefined
+        }
+    ) => {
+        logs: LogMessage[]
+        payload?: {
+            limit: number | undefined
+        }
+    }
+    fetchSparkline: () => any
+    fetchSparklineFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    fetchSparklineSuccess: (
+        sparkline: any[],
+        payload?: any
+    ) => {
+        sparkline: any[]
+        payload?: any
+    }
+    handleQueryChange: (
+        filterType: string,
+        extraProps?: Record<string, unknown>
+    ) => {
+        extraProps: Record<string, unknown> | undefined
+        filterType: string
+    }
+    pollForNewLogs: () => {
+        value: true
+    }
+    refreshQuery: () => {
+        value: true
+    }
+    runQuery: (debounce?: integer) => {
+        debounce: number | undefined
+    }
+    setCustomColumnAliases: (customColumnAliases: Record<string, string> | null) => {
+        customColumnAliases: Record<string, string> | null
+    }
+    setHasMoreLogsToLoad: (hasMoreLogsToLoad: boolean) => {
+        hasMoreLogsToLoad: boolean
+    }
+    setInitialLogsLimit: (initialLogsLimit: number | null) => {
+        initialLogsLimit: number | null
+    }
+    setLiveLogsCheckpoint: (liveLogsCheckpoint: string | null) => {
+        liveLogsCheckpoint: string | null
+    }
+    setLiveTailAbortController: (liveTailAbortController: AbortController | null) => {
+        liveTailAbortController: AbortController | null
+    }
+    setLiveTailExpired: (liveTailExpired: boolean) => {
+        liveTailExpired: boolean
+    }
+    setLiveTailInterval: (interval: number) => {
+        interval: number
+    }
+    setLiveTailRunning: (enabled: boolean) => {
+        enabled: boolean
+    }
+    setLogs: (logs: LogMessage[]) => {
+        logs: LogMessage[]
+    }
+    setLogsAbortController: (logsAbortController: AbortController | null) => {
+        logsAbortController: AbortController | null
+    }
+    setLogsFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    setLogsSuccess: (
+        logs: LogMessage[],
+        payload?: {
+            logs: LogMessage[]
+        }
+    ) => {
+        logs: LogMessage[]
+        payload?: {
+            logs: LogMessage[]
+        }
+    }
+    setMaxExportableLogs: (maxExportableLogs: number) => {
+        maxExportableLogs: number
+    }
+    setNewLogUuids: (newLogUuids: string[]) => {
+        newLogUuids: string[]
+    }
+    setNextCursor: (nextCursor: string | null) => {
+        nextCursor: string | null
+    }
+    setSparkline: (sparkline: any[] | null) => {
+        sparkline: any[] | null
+    }
+    setSparklineAbortController: (sparklineAbortController: AbortController | null) => {
+        sparklineAbortController: AbortController | null
+    }
+    setSparklineFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    setSparklineSuccess: (
+        sparkline: any[],
+        payload?: {
+            sparkline: any[] | null
+        }
+    ) => {
+        sparkline: any[]
+        payload?: {
+            sparkline: any[] | null
+        }
+    }
+    truncateLogs: (limit: number) => {
+        limit: number
+    }
+    truncateLogsFailure: (
+        error: string,
+        errorObject?: any
+    ) => {
+        error: string
+        errorObject?: any
+    }
+    truncateLogsSuccess: (
+        logs: LogMessage[],
+        payload?: {
+            limit: number
+        }
+    ) => {
+        logs: LogMessage[]
+        payload?: {
+            limit: number
+        }
+    }
+}
+
+// Generated by kea-typegen. Update if you're an agent, ignore if you're human.
+export interface logsViewerDataLogicMeta {
+    key: string
+    __keaTypeGenInternalSelectorTypes: {
+        liveTailDisabledReason: (
+            orderBy: LogsOrderBy,
+            filters: LogsViewerFilters,
+            logsLoading: boolean,
+            liveTailExpired: boolean
+        ) => string | undefined
+        parsedLogs: (logs: LogMessage[]) => ParsedLogMessage[]
+        sparklineData: (sparkline: any[]) => {
+            data: {
+                color: string | undefined
+                name: string
+                values: number[]
+            }[]
+            dates: string[]
+        }
+        sparklineIncompleteBarIndices: (
+            sparklineData: {
+                data: {
+                    color: string | undefined
+                    name: string
+                    values: number[]
+                }[]
+                dates: string[]
+            },
+            liveLogsCheckpoint: string | null,
+            sparklineLoading: boolean
+        ) => number[]
+        totalLogsMatchingFilters: (sparkline: any[]) => number
+        logsRemainingToLoad: (totalLogsMatchingFilters: number, logs: LogMessage[]) => number
+    }
+}
+
+export type logsViewerDataLogicType = MakeLogicType<
+    logsViewerDataLogicValues,
+    logsViewerDataLogicActions,
+    LogsViewerDataLogicProps,
+    logsViewerDataLogicMeta
+>
+
 export const logsViewerDataLogic = kea<logsViewerDataLogicType>([
     props({ id: 'default', autoLoad: true } as LogsViewerDataLogicProps),
     path(['products', 'logs', 'frontend', 'components', 'LogsViewer', 'data', 'logsViewerDataLogic']),
@@ -53,20 +476,25 @@ export const logsViewerDataLogic = kea<logsViewerDataLogicType>([
             teamLogic,
             ['addProductIntent'],
             logsViewerFiltersLogic({ id }),
-            ['setDateRange', 'setFilterGroup', 'setFilters', 'setSearchTerm', 'setSeverityLevels', 'setServiceNames'],
+            ['setDateRange', 'setFilterGroup', 'setFilters', 'setSearchTerm', 'bumpFacetRefresh'],
             logsViewerConfigLogic({ id }),
-            ['setSparklineBreakdownBy'],
+            ['setOrderBy', 'setColumns', 'addColumn', 'removeColumn'],
         ],
         values: [
             logsViewerFiltersLogic({ id }),
-            ['filters', 'utcDateRange'],
+            ['filters', 'utcDateRange', 'filterGroup', 'queryFilterGroup', 'personId', 'sessionId'],
             logsViewerConfigLogic({ id }),
-            ['sparklineBreakdownBy', 'orderBy'],
+            ['orderBy', 'customColumns'],
         ],
     })),
 
     actions({
+        handleQueryChange: (filterType: string, extraProps?: Record<string, unknown>) => ({
+            filterType,
+            extraProps,
+        }),
         runQuery: (debounce?: integer) => ({ debounce }),
+        refreshQuery: true,
         fetchNextLogsPage: (limit?: number) => ({ limit }),
         truncateLogs: (limit: number) => ({ limit }),
         clearLogs: true,
@@ -85,7 +513,8 @@ export const logsViewerDataLogic = kea<logsViewerDataLogicType>([
         setLiveTailRunning: (enabled: boolean) => ({ enabled }),
         setLiveTailInterval: (interval: number) => ({ interval }),
         setLogs: (logs: LogMessage[]) => ({ logs }),
-        setSparkline: (sparkline: any[]) => ({ sparkline }),
+        setNewLogUuids: (newLogUuids: string[]) => ({ newLogUuids }),
+        setSparkline: (sparkline: any[] | null) => ({ sparkline }),
         setNextCursor: (nextCursor: string | null) => ({ nextCursor }),
         expireLiveTail: () => true,
         setLiveTailExpired: (liveTailExpired: boolean) => ({ liveTailExpired }),
@@ -93,9 +522,23 @@ export const logsViewerDataLogic = kea<logsViewerDataLogicType>([
         setInitialLogsLimit: (initialLogsLimit: number | null) => ({ initialLogsLimit }),
         pollForNewLogs: true,
         setMaxExportableLogs: (maxExportableLogs: number) => ({ maxExportableLogs }),
+        // Aliases for the requested customColumns, keyed by the expression that produced them —
+        // rows carry their custom values under these keys (see response `columns`). Keying by
+        // expression (not position) keeps the mapping valid when columns are reordered without a re-fetch.
+        setCustomColumnAliases: (customColumnAliases: Record<string, string> | null) => ({ customColumnAliases }),
     }),
 
     reducers({
+        // UUIDs of the last live-tail batch, for the one-shot row highlight (see parsedLogCache comment above).
+        newLogUuids: [
+            new Set<string>(),
+            {
+                setNewLogUuids: (_, { newLogUuids }) => new Set(newLogUuids),
+                // A fresh query result set has no "just arrived" rows.
+                fetchLogsSuccess: () => new Set<string>(),
+                clearLogs: () => new Set<string>(),
+            },
+        ],
         initialLogsLimit: [
             DEFAULT_INITIAL_LOGS_LIMIT as number | null,
             {
@@ -108,6 +551,9 @@ export const logsViewerDataLogic = kea<logsViewerDataLogicType>([
             { persist: false },
             {
                 setLiveLogsCheckpoint: (_, { liveLogsCheckpoint }) => liveLogsCheckpoint,
+                // Drop the stale checkpoint when a new query starts so the still-loading region
+                // can't flash against the previous query's data before the fresh one lands.
+                clearLogs: () => null,
             },
         ],
         liveTailExpired: [
@@ -195,9 +641,16 @@ export const logsViewerDataLogic = kea<logsViewerDataLogicType>([
                 setMaxExportableLogs: (_, { maxExportableLogs }) => maxExportableLogs,
             },
         ],
+        customColumnAliases: [
+            null as Record<string, string> | null,
+            {
+                setCustomColumnAliases: (_, { customColumnAliases }) => customColumnAliases,
+                clearLogs: () => null,
+            },
+        ],
     }),
 
-    loaders(({ values, actions }) => ({
+    loaders(({ values, actions, cache }) => ({
         logs: [
             [] as LogMessage[],
             {
@@ -208,22 +661,51 @@ export const logsViewerDataLogic = kea<logsViewerDataLogicType>([
                     const signal = logsController.signal
                     actions.cancelInProgressLogs(logsController)
 
+                    // Capture before the await: a draft applied mid-flight would otherwise pair this
+                    // response's aliases against the newer expressions rather than the ones actually sent.
+                    const sentCustomColumns = values.customColumns
+                    const sentExpressions = sentCustomColumns ?? []
+
                     const response = await api.logs.query({
                         query: {
                             limit: values.initialLogsLimit ?? DEFAULT_LOGS_PAGE_SIZE,
                             orderBy: values.orderBy,
                             dateRange: values.utcDateRange,
                             searchTerm: values.filters.searchTerm,
-                            filterGroup: values.filters.filterGroup as PropertyGroupFilter,
-                            severityLevels: values.filters.severityLevels,
-                            serviceNames: values.filters.serviceNames,
+                            filterGroup: values.queryFilterGroup as PropertyGroupFilter,
+                            ...unsetColumnQueryFields(),
+                            personId: values.personId,
+                            sessionId: values.sessionId,
+                            customColumns: sentCustomColumns,
                         },
                         signal,
                     })
                     actions.setLogsAbortController(null)
+                    // A 2xx response with an empty body legitimately resolves to null (see
+                    // getJSONFromSuccessResponse in lib/api.ts) — treat it as a failure instead of
+                    // crashing on the first property access below.
+                    if (!response) {
+                        throw new Error('Logs query returned an empty response')
+                    }
                     actions.setHasMoreLogsToLoad(!!response.hasMore)
                     actions.setNextCursor(response.nextCursor ?? null)
                     actions.setMaxExportableLogs(response.maxExportableLogs)
+                    // Server echoes aliases in request order, so pair each with the expression that
+                    // produced it. Keying by expression survives column reorders that don't re-fetch.
+                    const aliasByExpression =
+                        response.columns && response.columns.length > 0
+                            ? Object.fromEntries(
+                                  response.columns.map((alias, index) => [sentExpressions[index], alias])
+                              )
+                            : null
+                    actions.setCustomColumnAliases(aliasByExpression)
+                    cache.lastSentCustomColumns = JSON.stringify(sentCustomColumns ?? null)
+                    // The checkpoint (fixed per query, identical on every row) marks the latest
+                    // timestamp ingestion is known to have fully caught up to — used to flag the
+                    // still-loading tail of the sparkline.
+                    if (response.results.length > 0) {
+                        actions.setLiveLogsCheckpoint(response.results[0].live_logs_checkpoint ?? null)
+                    }
                     return response.results
                 },
                 fetchNextLogsPage: async ({ limit }, breakpoint) => {
@@ -242,14 +724,20 @@ export const logsViewerDataLogic = kea<logsViewerDataLogicType>([
                             orderBy: values.orderBy,
                             dateRange: values.utcDateRange,
                             searchTerm: values.filters.searchTerm,
-                            filterGroup: values.filters.filterGroup as PropertyGroupFilter,
-                            severityLevels: values.filters.severityLevels,
-                            serviceNames: values.filters.serviceNames,
+                            filterGroup: values.queryFilterGroup as PropertyGroupFilter,
+                            ...unsetColumnQueryFields(),
+                            personId: values.personId,
+                            sessionId: values.sessionId,
+                            customColumns: values.customColumns,
                             after: values.nextCursor,
                         },
                         signal,
                     })
                     actions.setLogsAbortController(null)
+                    // See the matching guard in fetchLogs: an empty-body 2xx response resolves to null.
+                    if (!response) {
+                        throw new Error('Logs query returned an empty response')
+                    }
                     actions.setHasMoreLogsToLoad(!!response.hasMore)
                     actions.setNextCursor(response.nextCursor ?? null)
                     return [...values.logs, ...response.results]
@@ -270,17 +758,20 @@ export const logsViewerDataLogic = kea<logsViewerDataLogicType>([
                             orderBy: values.orderBy,
                             dateRange: values.utcDateRange,
                             searchTerm: values.filters.searchTerm,
-                            filterGroup: values.filters.filterGroup as PropertyGroupFilter,
-                            severityLevels: values.filters.severityLevels,
-                            serviceNames: values.filters.serviceNames,
-                            sparklineBreakdownBy: values.sparklineBreakdownBy,
+                            filterGroup: values.queryFilterGroup as PropertyGroupFilter,
+                            ...unsetColumnQueryFields(),
+                            // The severity result key, colors, and live-tail merge all assume a
+                            // severity breakdown, so state it rather than lean on the server default.
+                            sparklineBreakdownBy: 'severity',
+                            personId: values.personId,
+                            sessionId: values.sessionId,
                         },
                         signal,
                     })
                     actions.setSparklineAbortController(null)
                     return response
                 },
-                setSparkline: ({ sparkline }) => sparkline,
+                setSparkline: ({ sparkline }) => sparkline ?? [],
             },
         ],
     })),
@@ -324,6 +815,14 @@ export const logsViewerDataLogic = kea<logsViewerDataLogicType>([
                         continue
                     }
                     seen.add(log.uuid)
+
+                    // Existing log references are stable across polls — cache hit = no re-render.
+                    const cached = parsedLogCache.get(log)
+                    if (cached) {
+                        result.push(cached)
+                        continue
+                    }
+
                     const cleanBody = colors.unstyle(log.body)
                     let parsedBody: JsonType | null = null
                     try {
@@ -331,40 +830,38 @@ export const logsViewerDataLogic = kea<logsViewerDataLogicType>([
                     } catch {
                         // Not JSON, that's fine
                     }
-                    result.push({
+                    const parsed: ParsedLogMessage = {
                         ...log,
                         attributes: stringifyLogAttributes(log.attributes),
                         cleanBody,
                         parsedBody,
                         originalLog: log,
-                    })
+                    }
+                    parsedLogCache.set(log, parsed)
+                    result.push(parsed)
                 }
 
                 return result
             },
         ],
         sparklineData: [
-            (s) => [s.sparkline, s.sparklineBreakdownBy],
-            (sparkline: any[], sparklineBreakdownBy: LogsSparklineBreakdownBy) => {
-                const breakdownKey = sparklineBreakdownBy
+            (s) => [s.sparkline],
+            (sparkline: any[] | null) => {
+                if (!sparkline) {
+                    return { dates: [], data: [] }
+                }
 
                 let lastTime = ''
                 let i = -1
-                const labels: string[] = []
                 const dates: string[] = []
                 const accumulated = sparkline.reduce(
                     (accumulator, currentItem) => {
                         if (currentItem.time !== lastTime) {
-                            labels.push(
-                                humanFriendlyDetailedTime(currentItem.time, 'YYYY-MM-DD', 'HH:mm:ss', {
-                                    timestampStyle: 'absolute',
-                                })
-                            )
                             dates.push(currentItem.time)
                             lastTime = currentItem.time
                             i++
                         }
-                        const key = currentItem[breakdownKey]
+                        const key = currentItem.severity
                         if (!key) {
                             return accumulator
                         }
@@ -380,53 +877,197 @@ export const logsViewerDataLogic = kea<logsViewerDataLogicType>([
                     {} as Record<string, number[]>
                 )
 
-                const data = Object.entries(accumulated)
-                    .sort(([a], [b]) => a.localeCompare(b))
-                    .map(([name, values], index) => ({
-                        name,
-                        values: values as number[],
-                        color:
-                            sparklineBreakdownBy === 'service'
-                                ? dataColorVars[index % dataColorVars.length]
-                                : {
-                                      fatal: 'danger-dark',
-                                      error: 'danger',
-                                      warn: 'warning',
-                                      info: 'brand-blue',
-                                      debug: 'muted',
-                                      trace: 'muted-alt',
-                                  }[name],
-                    }))
-                    .filter((series) => series.values.reduce((a, b) => a + b) > 0)
+                // A key with no rows in the newest buckets stops accumulating early, leaving an array
+                // shorter than `dates`. Quill requires `data.length === labels.length`: a ragged array
+                // desyncs bar positions and clamps `stroke.partial.fromIndex` onto a complete bar,
+                // rendering it as still-ingesting.
+                const padToDatesLength = (values: number[]): number[] => {
+                    while (values.length < dates.length) {
+                        values.push(0)
+                    }
+                    return values
+                }
 
-                return { data, labels, dates }
+                // The endpoint folds everything past its top-N into one bucket under a sentinel key.
+                // Left as-is that sorts to the front (it starts with '$') and draws as a breakdown
+                // value literally named "$$_posthog_breakdown_other_$$".
+                const data = Object.entries(accumulated)
+                    .filter(([name]) => name !== OTHER_BREAKDOWN_VALUE)
+                    .sort(([a], [b]) => a.localeCompare(b))
+                    .map(([name, values]) => ({
+                        name,
+                        values: padToDatesLength(values as number[]),
+                        color: {
+                            fatal: 'danger-dark',
+                            error: 'danger',
+                            warn: 'warning',
+                            info: 'brand-blue',
+                            debug: 'muted',
+                            trace: 'muted-alt',
+                        }[name],
+                    }))
+                const otherValues = accumulated[OTHER_BREAKDOWN_VALUE]
+                if (otherValues) {
+                    // Last and muted, so it reads as an aggregate rather than as another breakdown value.
+                    data.push({
+                        name: OTHER_BREAKDOWN_LABEL,
+                        values: padToDatesLength(otherValues as number[]),
+                        color: 'muted',
+                    })
+                }
+
+                return { data, dates }
+            },
+        ],
+        // Sparkline bar indices that are still being ingested (incomplete), to be hatched. A bucket is
+        // incomplete when its end is past the ingestion checkpoint. The latest bucket is the in-progress
+        // bar so the checkpoint always trails "now" a little; we only flag anything once the checkpoint
+        // lags the latest bucket's *start* by at least a quarter of a bar, otherwise ingestion is
+        // effectively caught up. When the lag spans more than two buckets but they're all empty, we flag
+        // only the latest bar rather than hatching a wide empty stretch. Bucket times and the checkpoint
+        // are both UTC ISO strings, so the relative comparison is timezone-safe.
+        //
+        // Empty while the sparkline query is in flight or before a fresh checkpoint lands (it's cleared
+        // on each new query); otherwise the hatch flickers mid-load as new data and a new checkpoint race.
+        sparklineIncompleteBarIndices: [
+            (s) => [s.sparklineData, s.liveLogsCheckpoint, s.sparklineLoading],
+            (
+                sparklineData: { dates: string[]; data: { values: number[] }[] },
+                liveLogsCheckpoint: string | null,
+                sparklineLoading: boolean
+            ): number[] => {
+                const { dates, data } = sparklineData
+                if (sparklineLoading || !liveLogsCheckpoint || dates.length < 2) {
+                    return []
+                }
+                const firstBucketMs = dayjs(dates[0]).valueOf()
+                const lastBucketMs = dayjs(dates[dates.length - 1]).valueOf()
+                const intervalMs = dayjs(dates[1]).valueOf() - firstBucketMs
+                if (intervalMs <= 0) {
+                    return []
+                }
+                const checkpointMs = dayjs(liveLogsCheckpoint).valueOf()
+                if (!Number.isFinite(checkpointMs) || lastBucketMs - checkpointMs < intervalMs * 0.25) {
+                    return []
+                }
+                const incomplete = dates.reduce<number[]>((indices, date, index) => {
+                    if (dayjs(date).valueOf() + intervalMs > checkpointMs) {
+                        indices.push(index)
+                    }
+                    return indices
+                }, [])
+                const bucketTotal = (index: number): number =>
+                    data.reduce((sum, series) => sum + (series.values[index] ?? 0), 0)
+                if (incomplete.length > 2 && incomplete.every((index) => bucketTotal(index) === 0)) {
+                    return [dates.length - 1]
+                }
+                return incomplete
             },
         ],
         totalLogsMatchingFilters: [
             (s) => [s.sparkline],
-            (sparkline): number => sparkline.reduce((sum, item) => sum + item.count, 0),
+            (sparkline: any[]): number => sparkline?.reduce((sum: number, item: any) => sum + item.count, 0) ?? 0,
         ],
         logsRemainingToLoad: [
             (s) => [s.totalLogsMatchingFilters, s.logs],
-            (totalLogsMatchingFilters, logs): number => totalLogsMatchingFilters - logs.length,
+            (totalLogsMatchingFilters: number, logs: LogMessage[]): number => totalLogsMatchingFilters - logs.length,
         ],
     }),
 
-    listeners(({ actions, values, cache }) => ({
-        setSparklineBreakdownBy: () => {
-            actions.fetchSparkline()
+    subscriptions(({ actions }) => ({
+        // Subscribe to the combined query view rather than the user-editable filterGroup
+        // so the query reruns when pinned filters change (e.g. team `logs_distinct_id_attribute_keys`
+        // resolves after mount), not just when the user edits filters.
+        queryFilterGroup: (filterGroup: UniversalFiltersGroup, oldFilterGroup: UniversalFiltersGroup | undefined) => {
+            if (shouldSkipFilterGroupChange(filterGroup, oldFilterGroup)) {
+                return
+            }
+            actions.handleQueryChange('attributes')
         },
-        fetchLogsFailure: ({ error }) => {
-            const errorStr = String(error).toLowerCase()
-            if (error !== NEW_QUERY_STARTED_ERROR_MESSAGE && !errorStr.includes('abort')) {
-                lemonToast.error(`Failed to load logs: ${error}`)
+    })),
+
+    listeners(({ actions, values, cache, props }) => ({
+        handleQueryChange: ({ filterType, extraProps }) => {
+            if (values.hasRunQuery) {
+                posthog.capture('logs filter changed', { filter_type: filterType, ...extraProps })
+                actions.addProductIntent({
+                    product_type: ProductKey.LOGS,
+                    intent_context: ProductIntentContext.LOGS_SET_FILTERS,
+                })
+            }
+            actions.runQuery()
+        },
+        setSearchTerm: ({ searchTerm }) => {
+            actions.handleQueryChange('search', { search_term_length: searchTerm?.length ?? 0 })
+        },
+        setDateRange: () => {
+            actions.handleQueryChange('date_range')
+        },
+        setFilters: ({ pushToHistory }) => {
+            if (pushToHistory) {
+                actions.handleQueryChange('bulk')
+            } else {
+                actions.runQuery()
             }
         },
-        fetchNextLogsPageFailure: ({ error }) => {
-            const errorStr = String(error).toLowerCase()
-            if (error !== NEW_QUERY_STARTED_ERROR_MESSAGE && !errorStr.includes('abort')) {
-                lemonToast.error(`Failed to load more logs: ${error}`)
+        setOrderBy: ({ orderBy, source }) => {
+            posthog.capture('logs setting changed', { setting: 'order_by', value: orderBy, source })
+            actions.runQuery()
+        },
+        // Structural column changes refetch only when the lowered wire value differs from what
+        // the last query sent — resizing or reordering columns never re-runs the query.
+        setColumns: () => {
+            if (JSON.stringify(values.customColumns ?? null) !== cache.lastSentCustomColumns) {
+                actions.runQuery()
             }
+        },
+        addColumn: () => {
+            if (JSON.stringify(values.customColumns ?? null) !== cache.lastSentCustomColumns) {
+                actions.runQuery()
+            }
+        },
+        removeColumn: () => {
+            if (JSON.stringify(values.customColumns ?? null) !== cache.lastSentCustomColumns) {
+                actions.runQuery()
+            }
+        },
+        fetchLogsFailure: ({ error, errorObject }) => {
+            if (isUserInitiatedError(error)) {
+                return
+            }
+            lemonToast.error(`Failed to load logs: ${error}`)
+            const { error_type, status_code } = classifyQueryError(errorObject ?? error)
+            posthog.capture('logs query failed', {
+                query_type: 'logs',
+                error_type,
+                status_code,
+                error_message: String(error),
+            })
+        },
+        fetchNextLogsPageFailure: ({ error, errorObject }) => {
+            if (isUserInitiatedError(error)) {
+                return
+            }
+            lemonToast.error(`Failed to load more logs: ${error}`)
+            const { error_type, status_code } = classifyQueryError(errorObject ?? error)
+            posthog.capture('logs query failed', {
+                query_type: 'logs_next_page',
+                error_type,
+                status_code,
+                error_message: String(error),
+            })
+        },
+        fetchSparklineFailure: ({ error, errorObject }) => {
+            if (isUserInitiatedError(error)) {
+                return
+            }
+            const { error_type, status_code } = classifyQueryError(errorObject ?? error)
+            posthog.capture('logs query failed', {
+                query_type: 'sparkline',
+                error_type,
+                status_code,
+                error_message: String(error),
+            })
         },
         fetchLogsSuccess: ({ logs }) => {
             if (logs.length === 0) {
@@ -452,35 +1093,30 @@ export const logsViewerDataLogic = kea<logsViewerDataLogicType>([
             if (debounce) {
                 await breakpoint(debounce)
             }
-            // Track query execution (skip initial page load)
-            if (values.hasRunQuery) {
-                posthog.capture('logs query executed', {
-                    has_search_term: !!values.filters.searchTerm,
-                    has_filters: values.filters.filterGroup.values.length > 0,
-                    severity_count: values.filters.severityLevels?.length ?? 0,
-                    service_count: values.filters.serviceNames?.length ?? 0,
-                })
-            }
             actions.clearLogs()
             actions.fetchLogs()
             actions.fetchSparkline()
             actions.cancelInProgressLiveTail(null)
         },
+        refreshQuery: () => {
+            actions.runQuery()
+            actions.bumpFacetRefresh()
+        },
         cancelInProgressLogs: ({ logsAbortController }) => {
             if (values.logsAbortController !== null) {
-                values.logsAbortController.abort(NEW_QUERY_STARTED_ERROR_MESSAGE)
+                values.logsAbortController.abort(new DOMException(NEW_QUERY_STARTED_ERROR_MESSAGE, 'AbortError'))
             }
             actions.setLogsAbortController(logsAbortController)
         },
         cancelInProgressSparkline: ({ sparklineAbortController }) => {
             if (values.sparklineAbortController !== null) {
-                values.sparklineAbortController.abort(NEW_QUERY_STARTED_ERROR_MESSAGE)
+                values.sparklineAbortController.abort(new DOMException(NEW_QUERY_STARTED_ERROR_MESSAGE, 'AbortError'))
             }
             actions.setSparklineAbortController(sparklineAbortController)
         },
         cancelInProgressLiveTail: ({ liveTailAbortController }) => {
             if (values.liveTailAbortController !== null) {
-                values.liveTailAbortController.abort('live tail request cancelled')
+                values.liveTailAbortController.abort(new DOMException('live tail request cancelled', 'AbortError'))
             }
             actions.setLiveTailAbortController(liveTailAbortController)
             cache.disposables.dispose('liveTailTimer')
@@ -510,9 +1146,11 @@ export const logsViewerDataLogic = kea<logsViewerDataLogicType>([
                         orderBy: values.orderBy,
                         dateRange: values.utcDateRange,
                         searchTerm: values.filters.searchTerm,
-                        filterGroup: values.filters.filterGroup as PropertyGroupFilter,
-                        severityLevels: values.filters.severityLevels,
-                        serviceNames: values.filters.serviceNames,
+                        filterGroup: values.queryFilterGroup as PropertyGroupFilter,
+                        ...unsetColumnQueryFields(),
+                        personId: values.personId,
+                        sessionId: values.sessionId,
+                        customColumns: values.customColumns,
                         liveLogsCheckpoint: values.liveLogsCheckpoint ?? undefined,
                     },
                     signal,
@@ -530,11 +1168,11 @@ export const logsViewerDataLogic = kea<logsViewerDataLogicType>([
 
                 if (newLogs.length > 0) {
                     actions.setLiveTailInterval(DEFAULT_LIVE_TAIL_POLL_INTERVAL_MS)
+                    // Prepend new logs; existing references stay untouched (see parsedLogCache comment).
+                    // Replacing newLogUuids highlights the new batch and un-highlights the previous one.
+                    actions.setNewLogUuids(newLogs.map((log) => log.uuid))
                     actions.setLogs(
-                        [
-                            ...newLogs.map((log) => ({ ...log, new: true })),
-                            ...values.logs.map((log) => ({ ...log, new: false })),
-                        ]
+                        [...newLogs, ...values.logs]
                             .sort((a, b) => Date.parse(b.timestamp) - Date.parse(a.timestamp))
                             .slice(0, DEFAULT_LOGS_PAGE_SIZE)
                     )
@@ -545,34 +1183,47 @@ export const logsViewerDataLogic = kea<logsViewerDataLogicType>([
                         DEFAULT_LIVE_TAIL_POLL_INTERVAL_MAX_MS
                     )
                     actions.setLiveTailInterval(newInterval)
+                    // No new logs this tick — clear the previous batch's highlights so rows that
+                    // scroll out and back don't replay the arrival animation on a quiet stream.
+                    actions.setNewLogUuids([])
                 }
             } catch (error) {
-                if (signal.aborted) {
+                if (signal.aborted || !logsViewerDataLogic.isMounted(props.id)) {
                     return
                 }
                 console.error('Live tail polling error:', error)
+                const { error_type, status_code } = classifyQueryError(error)
+                posthog.capture('logs query failed', {
+                    query_type: 'live_tail',
+                    error_type,
+                    status_code,
+                    error_message: String(error),
+                })
                 actions.setLiveTailRunning(false)
             } finally {
-                actions.setLiveTailAbortController(null)
-                if (values.liveTailRunning) {
-                    cache.disposables.add(() => {
-                        const timerId = setTimeout(
-                            () => {
-                                actions.pollForNewLogs()
-                            },
-                            Math.max(duration, values.liveTailPollInterval)
-                        )
-                        return () => clearTimeout(timerId)
-                    }, 'liveTailTimer')
+                // beforeUnmount aborts the in-flight controller and marks liveTailRunning false,
+                // but those are plain dispatches during teardown, not guaranteed to run their
+                // listeners before the logic's keyed path is torn down. So an unmount that lands
+                // while this request is in flight can resolve normally afterwards. Re-check both
+                // signals before touching actions/values, or this can dispatch against an
+                // already-unmounted keyed logic instance and throw "[KEA] Can not find path ...".
+                if (!signal.aborted && logsViewerDataLogic.isMounted(props.id)) {
+                    actions.setLiveTailAbortController(null)
+                    if (values.liveTailRunning) {
+                        cache.disposables.add(() => {
+                            const timerId = setTimeout(
+                                () => {
+                                    actions.pollForNewLogs()
+                                },
+                                Math.max(duration, values.liveTailPollInterval)
+                            )
+                            return () => clearTimeout(timerId)
+                        }, 'liveTailTimer')
+                    }
                 }
             }
         },
-        // insert logs into the sparkline data (only works for severity breakdown)
         addLogsToSparkline: (logs: LogMessage[]) => {
-            // Only update incrementally for severity breakdown - service would need service_name from logs
-            if (values.sparklineBreakdownBy !== 'severity') {
-                return
-            }
             // if the sparkline hasn't loaded do nothing.
             if (!values.sparkline || values.sparkline.length < 2) {
                 return
@@ -615,11 +1266,15 @@ export const logsViewerDataLogic = kea<logsViewerDataLogicType>([
         beforeUnmount: () => {
             actions.setLiveTailRunning(false)
             actions.cancelInProgressLiveTail(null)
+            // Abort with an `AbortError`, never a bare string: `fetch` rejects with the reason
+            // exactly as given, and `handleFetch` only re-throws it untouched when it is a real
+            // `AbortError`. A string reason falls through and gets relabelled as an `ApiError`, so
+            // tearing the viewer down looks like a failed request in the console.
             if (values.logsAbortController) {
-                values.logsAbortController.abort('unmounting component')
+                values.logsAbortController.abort(new DOMException(UNMOUNTING_ERROR_MESSAGE, 'AbortError'))
             }
             if (values.sparklineAbortController) {
-                values.sparklineAbortController.abort('unmounting component')
+                values.sparklineAbortController.abort(new DOMException(UNMOUNTING_ERROR_MESSAGE, 'AbortError'))
             }
         },
     })),

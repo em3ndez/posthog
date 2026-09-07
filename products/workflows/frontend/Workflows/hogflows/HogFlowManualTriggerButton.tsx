@@ -1,17 +1,17 @@
 import { useActions, useValues } from 'kea'
 
-import { IconClock, IconPlayFilled } from '@posthog/icons'
+import { IconPlayFilled } from '@posthog/icons'
 import { IconChevronDown } from '@posthog/icons'
 import { LemonButton, LemonInput, Popover } from '@posthog/lemon-ui'
 
 import { LemonField } from 'lib/lemon-ui/LemonField'
-import { humanFriendlyNumber } from 'lib/utils'
+import { humanFriendlyNumber } from 'lib/utils/numbers'
 
 import { CyclotronJobInputSchemaType } from '~/types'
 
 import { WorkflowLogicProps, workflowLogic } from '../workflowLogic'
 import { hogFlowManualTriggerButtonLogic } from './HogFlowManualTriggerButtonLogic'
-import { batchTriggerLogic } from './steps/batchTriggerLogic'
+import { batchTriggerLogic, getAudienceDedupeKey, hogFlowSendsEmail } from './steps/batchTriggerLogic'
 
 const TriggerPopover = ({
     setPopoverVisible,
@@ -21,27 +21,37 @@ const TriggerPopover = ({
     props: WorkflowLogicProps
 }): JSX.Element => {
     const logic = hogFlowManualTriggerButtonLogic(props)
-    const { workflow, variableValues, inputs, isScheduleTrigger } = useValues(logic)
+    const { workflow, variableValues, inputs } = useValues(logic)
     const { setInput, clearInputs, triggerManualWorkflow, triggerBatchWorkflow } = useActions(logic)
+
+    const isAccountAudience =
+        workflow?.trigger?.type === 'batch' && workflow.trigger.filters?.audience_type === 'accounts'
 
     const { blastRadius, blastRadiusLoading } = useValues(
         batchTriggerLogic({
             id: props.id,
             filters: workflow?.trigger?.type === 'batch' ? workflow?.trigger?.filters : undefined,
+            // Account audiences carry no person, so email dedup never applies to them.
+            dedupeKey: isAccountAudience ? undefined : getAudienceDedupeKey(workflow),
+            sendsEmail: hogFlowSendsEmail(workflow),
         })
     )
 
+    const blastRadiusExceeded =
+        workflow?.trigger?.type === 'batch' &&
+        blastRadius != null &&
+        blastRadius.limit != null &&
+        blastRadius.affected > blastRadius.limit
+
     const blastRadiusSuffix = (): string => {
         if (workflow?.trigger?.type === 'batch') {
-            return blastRadius ? ` for ${humanFriendlyNumber(blastRadius.users_affected)} users` : ' for ...'
+            const noun = isAccountAudience ? 'accounts' : 'users'
+            return blastRadius ? ` for ${humanFriendlyNumber(blastRadius.affected)} ${noun}` : ' for ...'
         }
         return ''
     }
 
-    const getButtonText = (): string => {
-        const action = isScheduleTrigger ? 'Schedule workflow' : 'Run workflow'
-        return `${action}${blastRadiusSuffix()}`
-    }
+    const getButtonText = (): string => `Run workflow${blastRadiusSuffix()}`
 
     const variablesSection =
         !workflow?.variables || workflow.variables.length === 0 ? (
@@ -103,24 +113,23 @@ const TriggerPopover = ({
                     type="primary"
                     status="alt"
                     loading={blastRadiusLoading}
+                    disabledReason={
+                        blastRadiusExceeded && blastRadius?.limit != null
+                            ? `Your audience is above this project's batch limit of ${humanFriendlyNumber(blastRadius.limit)} ${isAccountAudience ? 'accounts' : 'users'}. Add filters to narrow it.${hogFlowSendsEmail(workflow) ? ' The limit rises as the project builds a clean sending history.' : ''}`
+                            : undefined
+                    }
                     onClick={() => {
                         if (workflow?.trigger?.type === 'batch') {
-                            triggerBatchWorkflow(
-                                variableValues,
-                                workflow?.trigger?.filters || { properties: [] },
-                                workflow?.trigger?.scheduled_at || null
-                            )
-                        } else if (workflow?.trigger?.type === 'manual') {
+                            triggerBatchWorkflow(variableValues, workflow?.trigger?.filters || { properties: [] })
+                        } else {
                             triggerManualWorkflow(variableValues)
-                        } else if (workflow?.trigger?.type === 'schedule') {
-                            triggerManualWorkflow(variableValues, workflow?.trigger?.scheduled_at)
                         }
 
                         setPopoverVisible(false)
                         clearInputs()
                     }}
                     data-attr="run-workflow-btn"
-                    sideIcon={isScheduleTrigger ? <IconClock /> : <IconPlayFilled />}
+                    sideIcon={<IconPlayFilled />}
                 >
                     {getButtonText()}
                 </LemonButton>
@@ -131,11 +140,9 @@ const TriggerPopover = ({
 
 export const HogFlowManualTriggerButton = (props: WorkflowLogicProps = {}): JSX.Element => {
     const logic = hogFlowManualTriggerButtonLogic(props)
-    const { workflow, workflowChanged } = useValues(workflowLogic(props))
+    const { workflow, hasUnsavedChanges } = useValues(workflowLogic(props))
     const { popoverVisible } = useValues(logic)
     const { setPopoverVisible } = useActions(logic)
-
-    const isScheduleTrigger = workflow?.trigger?.type === 'schedule'
 
     const triggerButton = (
         <LemonButton
@@ -144,15 +151,15 @@ export const HogFlowManualTriggerButton = (props: WorkflowLogicProps = {}): JSX.
             disabledReason={
                 workflow?.status !== 'active'
                     ? 'Must enable workflow to use trigger'
-                    : workflowChanged
+                    : hasUnsavedChanges
                       ? 'Save changes first'
                       : undefined
             }
             sideIcon={<IconChevronDown className={`transition-transform ${popoverVisible ? 'rotate-180' : ''}`} />}
-            tooltip={isScheduleTrigger ? 'Schedule workflow' : 'Triggers workflow immediately'}
+            tooltip="Triggers workflow immediately"
             onClick={() => setPopoverVisible(!popoverVisible)}
         >
-            {isScheduleTrigger ? 'Schedule' : 'Trigger'}
+            Trigger
         </LemonButton>
     )
 

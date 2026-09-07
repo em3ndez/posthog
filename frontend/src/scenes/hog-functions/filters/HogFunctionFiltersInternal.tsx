@@ -6,8 +6,13 @@ import { LemonSelect } from '@posthog/lemon-ui'
 import { PropertyFilters } from 'lib/components/PropertyFilters/PropertyFilters'
 import { TaxonomicFilterGroupType } from 'lib/components/TaxonomicFilter/types'
 import { LemonField } from 'lib/lemon-ui/LemonField'
+import { Link } from 'lib/lemon-ui/Link'
+import { urls } from 'scenes/urls'
 
+import { PropValue } from '~/models/propertyDefinitionsModel'
 import { AnyPropertyFilter, CyclotronJobFiltersType, HogFunctionConfigurationContextId } from '~/types'
+
+import { ActivityLogListScope } from 'products/platform_features/frontend/generated/api.schemas'
 
 import { hogFunctionConfigurationLogic } from '../configuration/hogFunctionConfigurationLogic'
 
@@ -31,6 +36,34 @@ export const getProductEventFilterOptions = (contextId: HogFunctionConfiguration
                     label: 'Error tracking issue reopened',
                     value: '$error_tracking_issue_reopened',
                 },
+                {
+                    label: 'Error tracking issue spiking',
+                    value: '$error_tracking_issue_spiking',
+                },
+                {
+                    label: 'Error tracking issue resolved',
+                    value: '$error_tracking_issue_resolved',
+                },
+                {
+                    label: 'Error tracking issue suppressed',
+                    value: '$error_tracking_issue_suppressed',
+                },
+                {
+                    label: 'Error tracking issue assigned',
+                    value: '$error_tracking_issue_assigned',
+                },
+                {
+                    label: 'Error tracking issue unassigned',
+                    value: '$error_tracking_issue_unassigned',
+                },
+                {
+                    label: 'Error tracking issue merged',
+                    value: '$error_tracking_issue_merged',
+                },
+                {
+                    label: 'Error tracking issue split',
+                    value: '$error_tracking_issue_split',
+                },
             ]
         case 'insight-alerts':
             return [
@@ -39,11 +72,48 @@ export const getProductEventFilterOptions = (contextId: HogFunctionConfiguration
                     value: '$insight_alert_firing',
                 },
             ]
+        case 'logs-alerting':
+            return [
+                {
+                    label: 'Log alert firing',
+                    value: '$logs_alert_firing',
+                },
+                {
+                    label: 'Log alert resolved',
+                    value: '$logs_alert_resolved',
+                },
+                {
+                    label: 'Log alert auto-disabled',
+                    value: '$logs_alert_auto_disabled',
+                },
+                {
+                    label: 'Log alert errored',
+                    value: '$logs_alert_errored',
+                },
+            ]
         case 'discussion-mention':
             return [
                 {
                     label: 'Discussion mention',
                     value: '$discussion_mention_created',
+                },
+            ]
+        case 'health-alerts':
+            return [
+                {
+                    label: 'Health check fired',
+                    value: '$health_check_issue_firing',
+                },
+                {
+                    label: 'Health check resolved',
+                    value: '$health_check_issue_resolved',
+                },
+            ]
+        case 'batch-export-alerts':
+            return [
+                {
+                    label: 'Batch export run failed',
+                    value: '$batch_export_run_failed',
                 },
             ]
         default:
@@ -78,18 +148,64 @@ export const getProductEventPropertyFilterOptions = (contextId: HogFunctionConfi
                 'created_at',
             ]
         case 'error-tracking':
-            return ['$exception_types', '$exception_values', '$exception_sources', '$exception_functions']
+            return [
+                '$exception_types',
+                '$exception_values',
+                '$exception_sources',
+                '$exception_functions',
+                '$exception_handled',
+            ]
     }
 
     return []
+}
+
+// Hoisted so repeated calls return stable references, keeping downstream memos idle.
+// The generated enum mirrors the backend ActivityScope literal, unlike the handwritten
+// frontend ActivityScope enum, which lags behind it.
+const ACTIVITY_LOG_SCOPE_VALUES: PropValue[] = Object.values(ActivityLogListScope)
+    .sort()
+    .map((name) => ({ name }))
+// The standard lifecycle activities. Scopes also log custom activities (e.g. 'exported'),
+// which can still be entered as custom values.
+const ACTIVITY_LOG_ACTIVITY_VALUES: PropValue[] = ['created', 'updated', 'deleted'].map((name) => ({ name }))
+const NO_SUGGESTED_VALUES: PropValue[] = []
+
+/**
+ * Value suggestions for the property filters on the 'Trigger' field. Internal events are
+ * never ingested into ClickHouse, so the default events-table suggestions would surface
+ * values of same-named properties from unrelated analytics events. Instead, offer the
+ * statically known values, and no suggestions (free text) for keys without a known value set.
+ */
+export const getProductEventPropertyValues = (
+    contextId: HogFunctionConfigurationContextId,
+    propertyKey: string
+): PropValue[] | null => {
+    if (contextId !== 'activity-log') {
+        return null
+    }
+    switch (propertyKey) {
+        case 'scope':
+            return ACTIVITY_LOG_SCOPE_VALUES
+        case 'activity':
+            return ACTIVITY_LOG_ACTIVITY_VALUES
+        default:
+            return NO_SUGGESTED_VALUES
+    }
 }
 
 const getSimpleFilterValue = (value?: CyclotronJobFiltersType): string | undefined => {
     return value?.events?.[0]?.id
 }
 
-const setSimpleFilterValue = (options: FilterOption[], value: string): CyclotronJobFiltersType => {
-    return {
+const setSimpleFilterValue = (
+    options: FilterOption[],
+    value: string,
+    previous: CyclotronJobFiltersType | undefined,
+    contextId: HogFunctionConfigurationContextId
+): CyclotronJobFiltersType => {
+    const next: CyclotronJobFiltersType = {
+        source: 'internal-events',
         events: [
             {
                 name: options.find((option) => option.value === value)?.label,
@@ -98,12 +214,30 @@ const setSimpleFilterValue = (options: FilterOption[], value: string): Cyclotron
             },
         ],
     }
+    // Preserve properties bound by Logs alerting (alert_id) and batch export alerts
+    // (batch_export_id) — the trigger event id changes between the context's events, but the
+    // binding to the parent resource must survive.
+    if (
+        (contextId === 'logs-alerting' || contextId === 'batch-export-alerts') &&
+        previous?.properties &&
+        previous.properties.length > 0
+    ) {
+        next.properties = previous.properties
+    }
+    return next
 }
 
 export function HogFunctionFiltersInternal(): JSX.Element {
     const { contextId } = useValues(hogFunctionConfigurationLogic)
 
     const options = useMemo(() => getProductEventFilterOptions(contextId), [contextId])
+
+    const staticValueOptions = useMemo(
+        () =>
+            (propertyKey: string): PropValue[] | null =>
+                getProductEventPropertyValues(contextId, propertyKey),
+        [contextId]
+    )
 
     const taxonomicGroupTypes = useMemo(() => {
         if (contextId === 'error-tracking') {
@@ -116,6 +250,12 @@ export function HogFunctionFiltersInternal(): JSX.Element {
             return [TaxonomicFilterGroupType.Events]
         } else if (contextId === 'activity-log') {
             return [TaxonomicFilterGroupType.ActivityLogProperties]
+        } else if (contextId === 'logs-alerting') {
+            return [TaxonomicFilterGroupType.EventProperties]
+        } else if (contextId === 'health-alerts') {
+            return [TaxonomicFilterGroupType.EventProperties]
+        } else if (contextId === 'batch-export-alerts') {
+            return [TaxonomicFilterGroupType.EventProperties]
         }
         return []
     }, [contextId])
@@ -129,9 +269,10 @@ export function HogFunctionFiltersInternal(): JSX.Element {
                         <LemonSelect
                             options={options}
                             value={getSimpleFilterValue(value)}
-                            onChange={(value) => onChange(setSimpleFilterValue(options, value))}
+                            onChange={(next) => onChange(setSimpleFilterValue(options, next, value, contextId))}
                             placeholder="Select a filter"
                         />
+                        {contextId === 'logs-alerting' ? <LogsAlertBindingHint filters={value} /> : null}
                         {taxonomicGroupTypes.length > 0 ? (
                             <PropertyFilters
                                 key={contextId}
@@ -146,11 +287,36 @@ export function HogFunctionFiltersInternal(): JSX.Element {
                                 pageKey={`hog-function-internal-property-filters-${contextId}`}
                                 buttonSize="small"
                                 disablePopover
+                                staticValueOptions={staticValueOptions}
                             />
                         ) : null}
                     </>
                 )}
             </LemonField>
+        </div>
+    )
+}
+
+function LogsAlertBindingHint({ filters }: { filters: CyclotronJobFiltersType | undefined }): JSX.Element | null {
+    const alertIdProp = filters?.properties?.find((p) => 'key' in p && p.key === 'alert_id')
+    const rawValue = alertIdProp && 'value' in alertIdProp ? alertIdProp.value : undefined
+    const alertId =
+        typeof rawValue === 'string'
+            ? rawValue
+            : Array.isArray(rawValue) && typeof rawValue[0] === 'string'
+              ? rawValue[0]
+              : null
+
+    if (!alertId) {
+        return null
+    }
+
+    return (
+        <div className="text-xs text-secondary flex items-center gap-1 flex-wrap">
+            <span>Bound to alert</span>
+            <Link to={urls.logsAlertDetail(alertId)}>
+                <code className="text-xs">{alertId}</code>
+            </Link>
         </div>
     )
 }

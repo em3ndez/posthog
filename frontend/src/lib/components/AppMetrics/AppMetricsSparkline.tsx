@@ -5,11 +5,30 @@ import { useInView } from 'react-intersection-observer'
 import { LemonSkeleton } from '@posthog/lemon-ui'
 
 import { Sparkline, SparklineTimeSeries } from 'lib/components/Sparkline'
-import { inStorybookTestRunner } from 'lib/utils'
+import { inStorybookTestRunner } from 'lib/utils/dom'
 
 import { AppMetricsLogicProps, appMetricsLogic } from './appMetricsLogic'
 
-export function AppMetricsSparkline(props: AppMetricsLogicProps): JSX.Element {
+export interface AppMetricsSparklineProps extends AppMetricsLogicProps {
+    /** Series names to render in the success color. Defaults to `['success']`. */
+    successMetricNames?: string[]
+    /** Optional display labels keyed by series name (e.g. `{ rows_synced: 'Rows synced' }`). */
+    metricLabels?: Record<string, string>
+    /** Optional vars.scss color names keyed by series name; takes precedence over `successMetricNames`. */
+    metricColors?: Record<string, string>
+    /** Bars stack their series. Pass `'line'` when series overlap and a summed height would mislead. @default 'bar' */
+    type?: 'bar' | 'line'
+}
+
+const DEFAULT_SUCCESS_METRIC_NAMES = ['success']
+
+export function AppMetricsSparkline({
+    successMetricNames,
+    metricLabels,
+    metricColors,
+    type,
+    ...props
+}: AppMetricsSparklineProps): JSX.Element {
     const logic = appMetricsLogic(props)
     const { appMetricsTrends, appMetricsTrendsLoading, params } = useValues(logic)
     const { loadAppMetricsTrends } = useActions(logic)
@@ -24,8 +43,9 @@ export function AppMetricsSparkline(props: AppMetricsLogicProps): JSX.Element {
     }, [inView]) // oxlint-disable-line react-hooks/exhaustive-deps
 
     const displayData: SparklineTimeSeries[] = useMemo(() => {
-        // We sort the series based on the given metricKind
+        const successNames = successMetricNames ?? DEFAULT_SUCCESS_METRIC_NAMES
 
+        // We sort the series based on the given metricKind
         const sortListValue = params.breakdownBy === 'metric_kind' ? params.metricKind : params.metricName
         const sortList = sortListValue ? (Array.isArray(sortListValue) ? sortListValue : [sortListValue]) : []
 
@@ -38,12 +58,12 @@ export function AppMetricsSparkline(props: AppMetricsLogicProps): JSX.Element {
 
         return (
             sortedSeries?.map((s) => ({
-                color: s.name === 'success' ? 'success' : 'danger',
-                name: s.name,
+                color: metricColors?.[s.name] ?? (successNames.includes(s.name) ? 'success' : 'danger'),
+                name: metricLabels?.[s.name] ?? s.name,
                 values: s.values,
             })) || []
         )
-    }, [appMetricsTrends, params])
+    }, [appMetricsTrends, params, successMetricNames, metricLabels, metricColors])
 
     const labels = appMetricsTrends?.labels || []
 
@@ -54,7 +74,7 @@ export function AppMetricsSparkline(props: AppMetricsLogicProps): JSX.Element {
             ) : !appMetricsTrends || appMetricsTrendsLoading ? (
                 <LemonSkeleton className="h-8 max-w-24" />
             ) : (
-                <Sparkline labels={labels} data={displayData} className="h-8 max-w-24" maximumIndicator={false} />
+                <Sparkline labels={labels} data={displayData} type={type} className="h-8 max-w-24" />
             )}
         </div>
     )

@@ -1,4 +1,4 @@
-import equal from 'fast-deep-equal'
+import { deepEqual as equal } from 'fast-equals'
 
 import { LemonTag } from 'lib/lemon-ui/LemonTag'
 
@@ -95,6 +95,14 @@ const getRatioChanges = (metricBefore: ExperimentMetric, metricAfter: Experiment
         return `changed the denominator`
     }
 
+    // check if outlier handling was changed for either component
+    if (!equal(metricBefore.numerator_outlier_handling, metricAfter.numerator_outlier_handling)) {
+        return `changed the numerator outlier handling`
+    }
+    if (!equal(metricBefore.denominator_outlier_handling, metricAfter.denominator_outlier_handling)) {
+        return `changed the denominator outlier handling`
+    }
+
     return null
 }
 export const getMetricChanges = (
@@ -156,8 +164,11 @@ export const getMetricChanges = (
     if (metricBefore.conversion_window && !metricAfter.conversion_window) {
         changes.push('set the conversion window to the experiment duration')
     }
-    // check if conversion window was added (set to time window)
-    if (!metricBefore.conversion_window && metricAfter.conversion_window) {
+    if (
+        metricAfter.conversion_window &&
+        (metricBefore.conversion_window !== metricAfter.conversion_window ||
+            metricBefore.conversion_window_unit !== metricAfter.conversion_window_unit)
+    ) {
         changes.push(
             `set the conversion window to ${metricAfter.conversion_window} ${metricAfter.conversion_window_unit}`
         )
@@ -200,6 +211,14 @@ export const getMetricChanges = (
     const ratioChanges = getRatioChanges(metricBefore, metricAfter)
     if (ratioChanges) {
         changes.push(ratioChanges)
+    }
+
+    if (changes.length === 0) {
+        return (
+            <span>
+                changed the metric <LemonTag>{metricBefore.name || getDefaultMetricTitle(metricBefore)}</LemonTag>
+            </span>
+        )
     }
 
     /**

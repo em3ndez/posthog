@@ -3,6 +3,8 @@ from typing import Any, cast
 import pytest
 from posthog.test.base import BaseTest
 
+from parameterized import parameterized
+
 from posthog.schema import (
     ActionsNode,
     AggregationAxisFormat,
@@ -1349,14 +1351,14 @@ class TestFilterToQuery(BaseTest):
             BreakdownFilter(breakdowns=[{"type": BreakdownType.EVENT, "property": "$browser"}]),
         )
 
-        filter: dict[str, Any] = {
+        filter_with_multiple_breakdowns: dict[str, Any] = {
             "breakdowns": [
                 {"type": "event", "property": "$browser"},
                 {"type": "session", "property": "$session_duration"},
             ]
         }
 
-        query = filter_to_query(filter)
+        query = filter_to_query(filter_with_multiple_breakdowns)
 
         assert isinstance(query, TrendsQuery)
         self.assertEqual(
@@ -1387,6 +1389,8 @@ class TestFilterToQuery(BaseTest):
             "aggregation_axis_prefix": "pre",
             "aggregation_axis_postfix": "post",
             "decimal_places": 5,
+            "x_axis_label": "Signup date",
+            "y_axis_label": "Unique users",
             "formula": "A + B",
             "shown_as": "Volume",
             "display": "ActionsAreaGraph",
@@ -1407,6 +1411,8 @@ class TestFilterToQuery(BaseTest):
                 formula="A + B",
                 display=ChartDisplayType.ACTIONS_AREA_GRAPH,
                 decimalPlaces=5,
+                xAxisLabel="Signup date",
+                yAxisLabel="Unique users",
                 showLegend=True,
                 showPercentStackView=True,
             ),
@@ -1673,43 +1679,30 @@ class TestFilterToQuery(BaseTest):
             ),
         )
 
-    def test_funnels_multiple_breakdowns(self):
-        filter: dict[str, Any] = {
-            "insight": "FUNNELS",
-            "breakdowns": [
-                {"type": "session", "property": "$session_duration"},
-            ],
-        }
+    @parameterized.expand(
+        [
+            (
+                "single",
+                [{"type": "session", "property": "$session_duration"}],
+                BreakdownFilter(breakdown="$session_duration", breakdown_type=BreakdownType.SESSION),
+            ),
+            (
+                "no_breakdown_type",
+                [{"property": "prop"}],
+                BreakdownFilter(breakdown="prop", breakdown_type=BreakdownType.EVENT),
+            ),
+            # An empty list used to raise "found more than one breakdown", so the insight never
+            # converted. It now lands where an absent `breakdowns` key lands: no breakdown property.
+            ("empty", [], BreakdownFilter(breakdown_type=BreakdownType.EVENT)),
+        ]
+    )
+    def test_funnels_breakdowns(self, _name, breakdowns, expected):
+        filter: dict[str, Any] = {"insight": "FUNNELS", "breakdowns": breakdowns}
 
         query = filter_to_query(filter)
 
         assert isinstance(query, FunnelsQuery)
-        self.assertEqual(
-            query.breakdownFilter,
-            BreakdownFilter(
-                breakdown="$session_duration",
-                breakdown_type=BreakdownType.SESSION,
-            ),
-        )
-
-    def test_funnels_multiple_breakdowns_no_breakdown_type(self):
-        filter: dict[str, Any] = {
-            "insight": "FUNNELS",
-            "breakdowns": [
-                {"property": "prop"},
-            ],
-        }
-
-        query = filter_to_query(filter)
-
-        assert isinstance(query, FunnelsQuery)
-        self.assertEqual(
-            query.breakdownFilter,
-            BreakdownFilter(
-                breakdown="prop",
-                breakdown_type=BreakdownType.EVENT,
-            ),
-        )
+        self.assertEqual(query.breakdownFilter, expected)
 
     def test_funnels_use_first_time_for_user_math(self):
         filter: dict[str, Any] = {

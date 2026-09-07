@@ -9,13 +9,9 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    width: var(--annotations-overlay-tick-interval);
-    height: 3rem;
-    margin-left: calc(
-        var(--annotations-overlay-tick-interval) *
-            var(--annotations-badge-index) - var(--annotations-overlay-chart-area-left) +
-            var(--annotations-overlay-first-tick-left)
-    );
+    width: 1.5rem;
+    height: 1.5rem;
+    margin-left: var(--annotations-badge-left);
     appearance: none !important;
     cursor: pointer;
     background: none;
@@ -28,6 +24,20 @@
         // Override .LemonBadge--position-self-centered
         transform: scale(var(--annotations-badge-scale));
         transform-origin: center;
+    }
+
+    // Hug the emoji with a soft blurred halo of the chart background instead of a
+    // solid disc. The drop-shadow follows the glyph alpha, so it crops to the icon
+    // shape and fades out rather than hiding the axis line behind it.
+    > .LemonBadge.AnnotationsBadge__emoji {
+        --lemon-badge-size: 1.5rem;
+        --lemon-badge-font-size: 1rem;
+
+        color: inherit;
+        background: none;
+        filter: drop-shadow(0 0 1px var(--color-bg-surface-primary))
+            drop-shadow(0 0 2px var(--color-bg-surface-primary)) drop-shadow(0 0 3px var(--color-bg-surface-primary));
+        border-color: transparent;
     }
 }
 

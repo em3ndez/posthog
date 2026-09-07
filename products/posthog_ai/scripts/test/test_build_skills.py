@@ -7,6 +7,7 @@ import types
 import zipfile
 import textwrap
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -15,6 +16,7 @@ from products.posthog_ai.scripts.build_skills import (
     SkillBuilder,
     SkillDiscoverer,
     SkillRenderer,
+    _check_tool_references,
     parse_frontmatter,
     validate_frontmatter,
 )
@@ -166,7 +168,7 @@ def test_render_j2_basic(tmp_path: Path) -> None:
     j2_file = tmp_path / "SKILL.md.j2"
     j2_file.write_text("Hello {{ name }}!\n")
     renderer = SkillRenderer()
-    renderer.env.globals["name"] = "World"
+    cast(dict[str, Any], renderer.env.globals)["name"] = "World"
     result = renderer.render(j2_file)
     assert result == "Hello World!\n"
 
@@ -175,7 +177,7 @@ def test_render_j2_with_conditionals(tmp_path: Path) -> None:
     j2_file = tmp_path / "SKILL.md.j2"
     j2_file.write_text("{% if show %}visible{% else %}hidden{% endif %}\n")
     renderer = SkillRenderer()
-    renderer.env.globals["show"] = True
+    cast(dict[str, Any], renderer.env.globals)["show"] = True
     result = renderer.render(j2_file)
     assert result == "visible"
 
@@ -460,6 +462,19 @@ def test_lint_all_catches_missing_frontmatter(tmp_path: Path) -> None:
     assert builder.lint_all() is False
 
 
+def test_lint_all_catches_overlong_project_skill_description(tmp_path: Path) -> None:
+    skill_dir = tmp_path / ".agents" / "skills" / "bad-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(f"---\nname: bad-skill\ndescription: {'x' * 1025}\n---\n# Body\n")
+
+    builder = SkillBuilder(
+        repo_root=tmp_path,
+        products_dir=tmp_path / "products",
+        output_dir=tmp_path / "output",
+    )
+    assert builder.lint_all() is False
+
+
 def test_lint_all_catches_bad_jinja2_syntax(tmp_path: Path) -> None:
     skill_dir = tmp_path / "products" / "alpha" / "skills" / "broken-j2"
     skill_dir.mkdir(parents=True)
@@ -489,6 +504,30 @@ def test_lint_all_catches_bad_jinja2_in_subdirectory(tmp_path: Path) -> None:
     assert builder.lint_all() is False
 
 
+@pytest.mark.parametrize(
+    "link_target,expected",
+    [
+        ("references/payload.md.j2", False),
+        ("references/payload.md", True),
+        ("references/missing.md", False),
+    ],
+)
+def test_lint_all_checks_reference_links_against_the_bundle(tmp_path: Path, link_target: str, expected: bool) -> None:
+    skill_dir = tmp_path / "products" / "alpha" / "skills" / "linker"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(f"---\nname: linker\ndescription: D\n---\nSee [payload]({link_target}).\n")
+    refs = skill_dir / "references"
+    refs.mkdir()
+    (refs / "payload.md.j2").write_text("# {{ 'rendered' }}\n")
+
+    builder = SkillBuilder(
+        repo_root=tmp_path,
+        products_dir=tmp_path / "products",
+        output_dir=tmp_path / "output",
+    )
+    assert builder.lint_all() is expected
+
+
 def test_lint_all_catches_duplicate_skill_names(tmp_path: Path) -> None:
     for product in ("alpha", "beta"):
         skill_dir = tmp_path / "products" / product / "skills" / "same-name"
@@ -501,6 +540,64 @@ def test_lint_all_catches_duplicate_skill_names(tmp_path: Path) -> None:
         output_dir=tmp_path / "output",
     )
     assert builder.lint_all() is False
+
+
+@pytest.mark.parametrize(
+    "relpath,reserved_name,content",
+    [
+        (
+            "local-copy.md",
+            "instrument-feature-flags",
+            "---\nname: instrument-feature-flags\ndescription: Copy\n---\nBody\n",
+        ),
+        (
+            "local-copy/SKILL.md",
+            "instrument-logs",
+            "---\nname: instrument-logs\ndescription: Copy\n---\nBody\n",
+        ),
+        (
+            "local-copy/SKILL.md.j2",
+            "instrument-error-tracking",
+            "---\nname: instrument-error-tracking\ndescription: Copy\n---\n# {{ 'x' }}\n",
+        ),
+    ],
+    ids=["loose-file", "renamed-dir", "j2-entry"],
+)
+def test_lint_all_catches_reserved_name_in_frontmatter(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], relpath: str, reserved_name: str, content: str
+) -> None:
+    skill_file = tmp_path / "products" / "alpha" / "skills" / relpath
+    skill_file.parent.mkdir(parents=True)
+    skill_file.write_text(content)
+
+    builder = SkillBuilder(
+        repo_root=tmp_path,
+        products_dir=tmp_path / "products",
+        output_dir=tmp_path / "output",
+    )
+    assert builder.lint_all() is False
+    stderr = capsys.readouterr().err
+    assert f"'{reserved_name}' is owned by PostHog/context-mill" in stderr
+    # The path is the only part that tells an author which file to delete.
+    assert str(skill_file.relative_to(tmp_path)) in stderr
+
+
+def test_build_skill_rejects_reserved_name_after_rendering(tmp_path: Path) -> None:
+    # A templated name that only becomes an omnibus name once rendered slips past
+    # lint_all, which reads the raw frontmatter. build_skill sees the rendered
+    # name, so it must still refuse it.
+    skill_dir = tmp_path / "products" / "alpha" / "skills" / "local-copy"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md.j2").write_text("---\nname: instrument-{{ 'logs' }}\ndescription: Copy\n---\n# Body\n")
+
+    renderer = SkillRenderer()
+    skill = DiscoveredSkill(
+        name="local-copy", source_file=skill_dir / "SKILL.md.j2", product_dir=tmp_path / "products" / "alpha", depth=1
+    )
+    builder = SkillBuilder(repo_root=tmp_path, products_dir=tmp_path / "products", output_dir=tmp_path / "output")
+
+    with pytest.raises(ValueError, match="owned by PostHog/context-mill"):
+        builder.build_skill(skill, renderer)
 
 
 def test_build_skill_rejects_binary_file(tmp_path: Path) -> None:
@@ -625,3 +722,86 @@ def test_init_skill_rejects_missing_product(tmp_path: Path) -> None:
     builder = SkillBuilder(repo_root=tmp_path, products_dir=tmp_path / "products", output_dir=tmp_path / "output")
     with pytest.raises(FileNotFoundError, match="does not exist"):
         builder.init_skill("nonexistent_product", "some-skill")
+
+
+_REF_TOOLS = {
+    "execute-sql",
+    "experiment-ship-variant",
+    "feature-flag-get-all",
+    "external-data-schemas-partial-update",
+    "read-data-schema",
+    "scout-runs-list",
+    "scout-emit-signal",
+}
+_REF_SKILLS = {"finding-experiments", "creating-experiments"}
+
+
+@pytest.mark.parametrize(
+    "text,expected_names",
+    [
+        ("search flags with the feature-flags-get-all tool first", ["feature-flags-get-all"]),
+        ("load the finding-experiment skill first", ["finding-experiment"]),
+        ("use the launch, end, or ship_variant tools instead", ["ship_variant"]),
+        ("`execute_sql`: query the experiments table", ["execute_sql"]),
+        ("use the `execute_sql` tool", ["execute_sql"]),
+        ("Use the `experiment_results_summary` tool", []),
+        ("load the `managing-unicorns` skill first", []),
+        ("query it via `does-not-exist-here`", []),
+        ('fetch the entity via `read_data("experiments", id)`', []),
+        ("use the read-data-schema tool to discover events", []),
+        ("change the sync type with the `partial-update` tool", []),
+        ("browse with the feature-flag tools", []),
+        ("this is a per-file tool for editing", []),
+        ("rank by the highest-error tool first", []),
+        ("Deep-dive skills are useful here", []),
+        ("teams enrolled via the `signals-scout` feature flag", []),
+        ("load the finding-experiments skill first", []),
+        ("resolve the reference via `creating-experiments`", []),
+        ('check `get_feature_flag("key", distinct_id)` in the SDK', []),
+        ('then `emit_signal("anomaly", ...)` from the SDK', []),
+    ],
+    ids=[
+        "renamed-tool-near-miss",
+        "renamed-skill-near-miss",
+        "snake-case-in-plural-phrase",
+        "wrong-casing",
+        "one-finding-when-phrase-and-casing-rules-overlap",
+        "fictional-backticked-tool-no-resemblance",
+        "fictional-backticked-skill-no-resemblance",
+        "fictional-invocation-no-resemblance",
+        "sdk-call-syntax-no-resemblance",
+        "exact-tool-name",
+        "suffix-shorthand",
+        "plural-family-reference",
+        "bare-prose-adjective-per-file",
+        "bare-prose-adjective-highest-error",
+        "capitalized-prose-no-mid-word-match",
+        "entity-noun-after-backticks",
+        "existing-skill",
+        "skill-name-in-invocation-context",
+        "sdk-call-distinct-name",
+        "sdk-call-colliding-with-tool-suffix",
+    ],
+)
+def test_check_tool_references(text: str, expected_names: list[str]) -> None:
+    findings = _check_tool_references(text, "test", _REF_TOOLS, _REF_SKILLS)
+    assert [f.name for f in findings] == expected_names
+
+
+@pytest.mark.parametrize(
+    "text,expected_suggestion",
+    [
+        ("use the launch or ship_variant tools instead", "did you mean experiment-ship-variant"),
+        ("search flags with the feature-flags-get-all tool first", "did you mean feature-flag-get-all"),
+    ],
+)
+def test_check_tool_references_suggests_real_tool(text: str, expected_suggestion: str) -> None:
+    (finding,) = _check_tool_references(text, "test", _REF_TOOLS, _REF_SKILLS)
+    assert expected_suggestion in finding.message
+
+
+def test_check_tool_references_reports_line_and_column() -> None:
+    text = "intro line\nsearch with the feature-flags-get-all tool here\n"
+    (finding,) = _check_tool_references(text, "skill.md", _REF_TOOLS, _REF_SKILLS)
+    assert (finding.line, finding.col) == (2, 17)
+    assert finding.name == "feature-flags-get-all"

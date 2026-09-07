@@ -12,21 +12,23 @@ import {
     setActiveProjectAndOrg,
     validateEnvironmentVariables,
 } from '@/shared/test-utils'
-import eventDefinitionsTool from '@/tools/projects/eventDefinitions'
+import createEventDefinitionTool from '@/tools/projects/createEventDefinition'
 import getProjectsTool from '@/tools/projects/getProjects'
-import propertyDefinitionsTool from '@/tools/projects/propertyDefinitions'
 import setActiveProjectTool from '@/tools/projects/setActive'
 import updateEventDefinitionTool from '@/tools/projects/updateEventDefinition'
+import updatePropertyDefinitionTool from '@/tools/projects/updatePropertyDefinition'
 import type { Context } from '@/tools/types'
 
 describe('Projects', { concurrent: false }, () => {
     let context: Context
+    let testPropertyName: string
     const createdResources: CreatedResources = {
         featureFlags: [],
         insights: [],
         dashboards: [],
         surveys: [],
         actions: [],
+        cohorts: [],
     }
 
     beforeAll(async () => {
@@ -68,194 +70,55 @@ describe('Projects', { concurrent: false }, () => {
     describe('switch-project tool', () => {
         const setTool = setActiveProjectTool()
 
-        it('should set active project', async () => {
+        it('should set active project and return context prompt', async () => {
             const targetProject = TEST_PROJECT_ID!
             const setResult = await setTool.handler(context, { projectId: Number(targetProject) })
 
-            expect(setResult.content[0].text).toBe(`Switched to project ${targetProject}`)
+            const text = setResult.content[0]!.text
+            expect(text).toContain(`Switched to project ${targetProject}`)
+            expect(text).toContain('Current context:')
         })
     })
 
-    describe('properties-list tool', () => {
-        const propertyDefsTool = propertyDefinitionsTool()
+    describe('event-definition-create tool', () => {
+        const createTool = createEventDefinitionTool()
+        const createdEventDefinitionIds: string[] = []
 
-        it('should get property definitions for a specific event', async () => {
-            const result = await propertyDefsTool.handler(context, {
-                type: 'event',
-                eventName: '$pageview',
+        afterEach(async () => {
+            for (const id of createdEventDefinitionIds) {
+                try {
+                    await context.api.request({
+                        method: 'DELETE',
+                        path: `/api/projects/${TEST_PROJECT_ID}/event_definitions/${id}/`,
+                    })
+                } catch (error) {
+                    console.warn(`Failed to cleanup event definition ${id}:`, error)
+                }
+            }
+            createdEventDefinitionIds.length = 0
+        })
+
+        it('should create a definition for an event with no prior captured event', async () => {
+            const eventName = `mcp_test_event_${uuidv4()}`
+            const result = await createTool.handler(context, {
+                eventName,
+                data: { description: 'Defined before ingestion', tags: ['mcp-test'] },
             })
-            const propertyDefs = parseToolResponse(result)
+            const eventDef = parseToolResponse(result)
+            createdEventDefinitionIds.push(eventDef.id)
 
-            expect(Array.isArray(propertyDefs)).toBe(true)
+            expect(eventDef.name).toBe(eventName)
+            expect(eventDef.description).toBe('Defined before ingestion')
+            expect(eventDef.tags).toContain('mcp-test')
+            expect(eventDef.url).toContain(`/data-management/events/${eventDef.id}`)
         })
 
-        it('should return property definitions with proper structure', async () => {
-            const result = await propertyDefsTool.handler(context, {
-                type: 'event',
-                eventName: '$pageview',
-            })
-            const propertyDefs = parseToolResponse(result)
+        it('should throw error when the event definition already exists', async () => {
+            const eventName = `mcp_test_event_${uuidv4()}`
+            const first = await createTool.handler(context, { eventName })
+            createdEventDefinitionIds.push(parseToolResponse(first).id)
 
-            if (propertyDefs.length > 0) {
-                const prop = propertyDefs[0]
-                expect(prop).toHaveProperty('name')
-                expect(prop).toHaveProperty('property_type')
-                expect(typeof prop.name).toBe('string')
-                // property_type can be a string or null
-                expect(['string', 'object', 'undefined'].includes(typeof prop.property_type)).toBe(true)
-            }
-        })
-
-        it('should handle invalid event names gracefully', async () => {
-            try {
-                const result = await propertyDefsTool.handler(context, {
-                    type: 'event',
-                    eventName: `non-existent-event-${uuidv4()}`,
-                })
-                const propertyDefs = parseToolResponse(result)
-                expect(Array.isArray(propertyDefs)).toBe(true)
-            } catch (error) {
-                expect(error).toBeInstanceOf(Error)
-            }
-        })
-
-        it('should get property definitions for persons', async () => {
-            const result = await propertyDefsTool.handler(context, {
-                type: 'person',
-            })
-            const propertyDefs = parseToolResponse(result)
-            expect(Array.isArray(propertyDefs)).toBe(true)
-            expect(propertyDefs.length).toBeGreaterThan(0)
-        })
-
-        it('should respect limit parameter', async () => {
-            const result = await propertyDefsTool.handler(context, {
-                type: 'event',
-                eventName: '$pageview',
-                limit: 5,
-            })
-            const propertyDefs = parseToolResponse(result)
-            expect(propertyDefs.length).toBeLessThanOrEqual(5)
-        })
-
-        it('should respect offset parameter', async () => {
-            const allResult = await propertyDefsTool.handler(context, {
-                type: 'person',
-                limit: 10,
-            })
-            const allProps = parseToolResponse(allResult)
-
-            if (allProps.length > 1) {
-                const offsetResult = await propertyDefsTool.handler(context, {
-                    type: 'person',
-                    limit: 10,
-                    offset: 1,
-                })
-                const offsetProps = parseToolResponse(offsetResult)
-                // Verify offset is working by checking first result is different from original first result
-                expect(offsetProps[0].name).not.toBe(allProps[0].name)
-            }
-        })
-
-        it('should use default limit when not specified', async () => {
-            const result = await propertyDefsTool.handler(context, {
-                type: 'person',
-            })
-            const propertyDefs = parseToolResponse(result)
-            expect(propertyDefs.length).toBeLessThanOrEqual(50)
-        })
-    })
-
-    describe('event-definitions-list tool', () => {
-        const eventDefsTool = eventDefinitionsTool()
-
-        it('should list all event definitions for active project', async () => {
-            const result = await eventDefsTool.handler(context, {})
-            const eventDefs = parseToolResponse(result)
-
-            expect(Array.isArray(eventDefs)).toBe(true)
-        })
-
-        it('should return event definitions with proper structure', async () => {
-            const result = await eventDefsTool.handler(context, {})
-            const eventDefs = parseToolResponse(result)
-
-            if (eventDefs.length > 0) {
-                const eventDef = eventDefs[0]
-                expect(eventDef).toHaveProperty('name')
-                expect(eventDef).toHaveProperty('last_seen_at')
-                expect(typeof eventDef.name).toBe('string')
-            }
-        })
-
-        it('should include common events like $pageview', async () => {
-            const result = await eventDefsTool.handler(context, {})
-            const eventDefs = parseToolResponse(result)
-
-            const pageviewEvent = eventDefs.find((event: any) => event.name === '$pageview')
-            if (eventDefs.length > 0) {
-                expect(pageviewEvent).toBeTruthy()
-            }
-        })
-
-        it('should filter event definitions with search parameter', async () => {
-            const result = await eventDefsTool.handler(context, { q: 'pageview' })
-            const eventDefs = parseToolResponse(result)
-
-            expect(Array.isArray(eventDefs)).toBe(true)
-
-            // All returned events should contain "pageview" in their name
-            for (const event of eventDefs) {
-                expect(event.name.toLowerCase()).toContain('pageview')
-            }
-        })
-
-        it('should return empty array when searching for non-existent events', async () => {
-            const result = await eventDefsTool.handler(context, { q: 'non-existent-event-xyz123' })
-            const eventDefs = parseToolResponse(result)
-
-            expect(Array.isArray(eventDefs)).toBe(true)
-            expect(eventDefs.length).toBe(0)
-        })
-
-        it('should return all events when no search parameter is provided', async () => {
-            const resultWithoutSearch = await eventDefsTool.handler(context, {})
-            const resultWithSearch = await eventDefsTool.handler(context, { q: 'pageview' })
-
-            const allEventDefs = parseToolResponse(resultWithoutSearch)
-            const filteredEventDefs = parseToolResponse(resultWithSearch)
-
-            expect(Array.isArray(allEventDefs)).toBe(true)
-            expect(Array.isArray(filteredEventDefs)).toBe(true)
-
-            if (allEventDefs.length > 0 && filteredEventDefs.length > 0) {
-                // Filtered results should be a subset of all results
-                expect(filteredEventDefs.length).toBeLessThanOrEqual(allEventDefs.length)
-            }
-        })
-
-        it('should respect limit parameter', async () => {
-            const result = await eventDefsTool.handler(context, { limit: 5 })
-            const eventDefs = parseToolResponse(result)
-            expect(eventDefs.length).toBeLessThanOrEqual(5)
-        })
-
-        it('should respect offset parameter', async () => {
-            const allResult = await eventDefsTool.handler(context, { limit: 10 })
-            const allEvents = parseToolResponse(allResult)
-
-            if (allEvents.length > 1) {
-                const offsetResult = await eventDefsTool.handler(context, { limit: 10, offset: 1 })
-                const offsetEvents = parseToolResponse(offsetResult)
-                // Verify offset is working by checking first result is different from original first result
-                expect(offsetEvents[0].name).not.toBe(allEvents[0].name)
-            }
-        })
-
-        it('should use default limit when not specified', async () => {
-            const result = await eventDefsTool.handler(context, {})
-            const eventDefs = parseToolResponse(result)
-            expect(eventDefs.length).toBeLessThanOrEqual(50)
+            await expect(createTool.handler(context, { eventName })).rejects.toThrow()
         })
     })
 
@@ -325,6 +188,94 @@ describe('Projects', { concurrent: false }, () => {
         })
     })
 
+    describe('property-definition-update tool', () => {
+        const updateTool = updatePropertyDefinitionTool()
+
+        beforeAll(async () => {
+            const searchResult = await context.api.request<{ results: { name: string }[] }>({
+                method: 'GET',
+                path: `/api/projects/${TEST_PROJECT_ID}/property_definitions/`,
+                query: { type: 'event', limit: 100 },
+            })
+
+            const propertyDefinition =
+                searchResult.results.find((def) => def.name === '$browser') ?? searchResult.results[0]
+            if (!propertyDefinition) {
+                throw new Error('Expected the test project to have at least one event property definition')
+            }
+
+            testPropertyName = propertyDefinition.name
+        })
+
+        it('should update property definition description', async () => {
+            const testDescription = `Test description ${uuidv4()}`
+            const result = await updateTool.handler(context, {
+                propertyName: testPropertyName,
+                type: 'event',
+                data: { description: testDescription },
+            })
+            const propertyDef = parseToolResponse(result)
+
+            expect(propertyDef.description).toBe(testDescription)
+            expect(propertyDef.name).toBe(testPropertyName)
+            // The definition-detail route is keyed by id, not name, so the link must carry the id
+            expect(propertyDef.url).toContain(`/data-management/properties/${propertyDef.id}`)
+        })
+
+        it('should update property definition tags', async () => {
+            const testTag = `test-tag-${uuidv4().slice(0, 8)}`
+            const result = await updateTool.handler(context, {
+                propertyName: testPropertyName,
+                type: 'event',
+                data: { tags: [testTag] },
+            })
+            const propertyDef = parseToolResponse(result)
+
+            expect(propertyDef.tags).toContain(testTag)
+        })
+
+        it('should update verified status', async () => {
+            const result = await updateTool.handler(context, {
+                propertyName: testPropertyName,
+                type: 'event',
+                data: { verified: true },
+            })
+            const propertyDef = parseToolResponse(result)
+
+            expect(propertyDef.verified).toBe(true)
+        })
+
+        it('should update multiple fields at once', async () => {
+            const testDescription = `Multi-field test ${uuidv4()}`
+            const testTag = `multi-tag-${uuidv4().slice(0, 8)}`
+            const result = await updateTool.handler(context, {
+                propertyName: testPropertyName,
+                type: 'event',
+                data: {
+                    description: testDescription,
+                    tags: [testTag],
+                    verified: true,
+                },
+            })
+            const propertyDef = parseToolResponse(result)
+
+            expect(propertyDef.description).toBe(testDescription)
+            expect(propertyDef.tags).toContain(testTag)
+            expect(propertyDef.verified).toBe(true)
+        })
+
+        it('should throw error for non-existent property', async () => {
+            const nonExistentProperty = `non-existent-property-${uuidv4()}`
+            await expect(
+                updateTool.handler(context, {
+                    propertyName: nonExistentProperty,
+                    type: 'event',
+                    data: { description: 'test' },
+                })
+            ).rejects.toThrow()
+        })
+    })
+
     describe('Projects workflow', () => {
         it.skip('should support listing and setting active project workflow', async () => {
             const getTool = getProjectsTool()
@@ -337,7 +288,7 @@ describe('Projects', { concurrent: false }, () => {
             const targetProject = projects.find((p: any) => p.id === Number(TEST_PROJECT_ID)) || projects[0]
 
             const setResult = await setTool.handler(context, { projectId: targetProject.id })
-            expect(setResult.content[0].text).toBe(`Switched to project ${targetProject.id}`)
+            expect(setResult.content[0]!.text).toContain(`Switched to project ${targetProject.id}`)
 
             await context.cache.set('projectId', targetProject.id.toString())
         })

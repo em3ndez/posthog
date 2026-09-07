@@ -2,7 +2,7 @@ import { combineUrl } from 'kea-router'
 
 import { urls } from 'scenes/urls'
 
-import { FileSystemIconType, ProductKey } from '~/queries/schema/schema-general'
+import { FileSystemIconType, ProductItemCategory, ProductKey } from '~/queries/schema/schema-general'
 
 import { FileSystemIconColor, ProductManifest } from '../../frontend/src/types'
 
@@ -12,8 +12,8 @@ export const manifest: ProductManifest = {
         dashboards: (): string => '/dashboard',
         dashboard: (id: string | number, highlightInsightId?: string): string =>
             combineUrl(`/dashboard/${id}`, highlightInsightId ? { highlightInsightId } : {}).url,
-        dashboardTextTile: (id: string | number, textTileId: string | number): string =>
-            `${urls.dashboard(id)}/text-tiles/${textTileId}`,
+        dashboardTile: (id: string | number, tileId: string | number): string =>
+            `${urls.dashboard(id)}/tiles/${tileId}`,
         dashboardSharing: (id: string | number): string => `/dashboard/${id}/sharing`,
         dashboardSubscriptions: (id: string | number): string => `/dashboard/${id}/subscriptions`,
         dashboardSubscription: (id: string | number, subscriptionId: string): string =>
@@ -45,7 +45,7 @@ export const manifest: ProductManifest = {
         {
             path: 'Dashboards',
             intents: [ProductKey.PRODUCT_ANALYTICS],
-            category: 'Analytics',
+            category: ProductItemCategory.ANALYTICS,
             type: 'dashboard',
             iconType: 'dashboard',
             iconColor: ['var(--color-product-dashboards-light)'],

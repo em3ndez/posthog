@@ -1,3 +1,4 @@
+import { createMockJobQueue } from '~/tests/helpers/mocks/job-queue.mock'
 import { mockProducerObserver } from '~/tests/helpers/mocks/producer.mock'
 import { mockFetch } from '~/tests/helpers/mocks/request.mock'
 
@@ -7,15 +8,16 @@ import { DateTime, Settings } from 'luxon'
 import supertest from 'supertest'
 import express from 'ultimate-express'
 
-import { setupExpressApp } from '~/api/router'
 import { insertHogFunction, insertHogFunctionTemplate } from '~/cdp/_tests/fixtures'
 import { CdpApi } from '~/cdp/cdp-api'
 import { HogFunctionType } from '~/cdp/types'
-import { KAFKA_WAREHOUSE_SOURCE_WEBHOOKS } from '~/config/kafka-topics'
-import { getFirstTeam, resetTestDatabase } from '~/tests/helpers/sql'
+import { setupExpressApp } from '~/common/api/router'
+import { KAFKA_WAREHOUSE_SOURCE_WEBHOOKS } from '~/common/config/kafka-topics'
+import { closeHub, createHub } from '~/common/utils/db/hub'
+import { parseJSON } from '~/common/utils/json-parse'
+import { createCdpConsumerDeps } from '~/tests/helpers/cdp'
+import { createTestTeamFixture } from '~/tests/helpers/sql'
 import { Hub, Team } from '~/types'
-import { closeHub, createHub } from '~/utils/db/hub'
-import { parseJSON } from '~/utils/json-parse'
 
 import { compileInputs } from '../templates/test/test-helpers'
 
@@ -40,10 +42,28 @@ const STRIPE_INPUTS_SCHEMA = [
         required: false,
         secret: false,
     },
+    {
+        type: 'json' as const,
+        key: 'schema_mapping',
+        label: 'Schema mapping',
+        description: 'Maps Stripe object types to ExternalDataSchema IDs',
+        required: true,
+        secret: false,
+        hidden: true,
+    },
+    {
+        type: 'string' as const,
+        key: 'source_id',
+        label: 'Source ID',
+        description: 'The ExternalDataSource ID this webhook is associated with',
+        required: true,
+        secret: false,
+        hidden: true,
+    },
 ]
 
 const STRIPE_HOG_CODE = `
-if(request.method != 'POST') {
+if (request.method != 'POST') {
   return {
     'httpResponse': {
       'status': 405,
@@ -107,7 +127,29 @@ if (not inputs.bypass_signature_check) {
   }
 }
 
-return request.body
+let objectType := request.body.data?.object?.object
+
+if (empty(objectType)) {
+  return {
+    'httpResponse': {
+      'status': 200,
+      'body': 'No object type found, skipping'
+    }
+  }
+}
+
+let schemaId := inputs.schema_mapping?.[objectType]
+
+if (empty(schemaId)) {
+  return {
+    'httpResponse': {
+      'status': 200,
+      'body': f'No schema mapping for object type: {objectType}, skipping'
+    }
+  }
+}
+
+produceToWarehouseWebhooks(request.body, schemaId)
 `
 
 // Minimal template-like object for compileInputs (only needs inputs_schema)
@@ -118,9 +160,8 @@ describe('DWH source webhooks', () => {
     let team: Team
 
     beforeEach(async () => {
-        await resetTestDatabase()
         hub = await createHub({})
-        team = await getFirstTeam(hub)
+        team = (await createTestTeamFixture(hub.postgres)).team
         mockFetch.mockClear()
     })
 
@@ -133,12 +174,24 @@ describe('DWH source webhooks', () => {
         let app: express.Application
         let server: Server
         let hogFunction: HogFunctionType
+        let stripeTemplateId: string
+        let defaultTemplateId: string
 
-        const schemaId = 'test-schema-id-123'
+        const invoiceSchemaId = 'test-schema-id-invoice'
+        const chargeSchemaId = 'test-schema-id-charge'
+        const subscriptionSchemaId = 'test-schema-id-subscription'
+        const schemaMapping = {
+            invoice: invoiceSchemaId,
+            charge: chargeSchemaId,
+            subscription: subscriptionSchemaId,
+        }
         const signingSecret = 'whsec_testsecret'
 
         beforeEach(async () => {
-            api = new CdpApi(hub)
+            api = new CdpApi(hub, createCdpConsumerDeps(hub), {
+                hogQueue: createMockJobQueue(),
+                hogflowQueue: createMockJobQueue(),
+            })
             app = setupExpressApp()
             app.use('/', api.router())
             server = app.listen(0, () => {})
@@ -147,9 +200,12 @@ describe('DWH source webhooks', () => {
             const fixedTime = DateTime.fromObject({ year: 2025, month: 1, day: 1 }, { zone: 'UTC' })
             jest.spyOn(Date, 'now').mockReturnValue(fixedTime.toMillis())
 
+            stripeTemplateId = `${STRIPE_TEMPLATE_ID}-${team.id}`
+            defaultTemplateId = `template-warehouse-source-default-${team.id}`
+
             // Insert the warehouse source templates into the DB
             await insertHogFunctionTemplate(hub.postgres, {
-                id: STRIPE_TEMPLATE_ID,
+                id: stripeTemplateId,
                 name: 'Stripe warehouse source webhook',
                 type: 'warehouse_source_webhook',
                 code: STRIPE_HOG_CODE,
@@ -157,23 +213,24 @@ describe('DWH source webhooks', () => {
             })
 
             await insertHogFunctionTemplate(hub.postgres, {
-                id: 'template-warehouse-source-default',
+                id: defaultTemplateId,
                 name: 'Default warehouse source webhook',
                 type: 'warehouse_source_webhook',
-                code: 'return request.body',
+                code: 'produceToWarehouseWebhooks(request.body)',
                 inputs_schema: [],
             })
 
             hogFunction = await insertHogFunction(hub.postgres, team.id, {
                 type: 'warehouse_source_webhook',
-                template_id: STRIPE_TEMPLATE_ID,
+                template_id: stripeTemplateId,
                 bytecode: [],
                 inputs: {
                     ...(await compileInputs(stripeTemplateForInputs, {
                         signing_secret: signingSecret,
                         bypass_signature_check: false,
                     })),
-                    schema_id: { value: schemaId },
+                    schema_mapping: { value: schemaMapping },
+                    source_id: { value: 'test-source-id' },
                     source_type: { value: 'Stripe' },
                 },
             })
@@ -188,7 +245,10 @@ describe('DWH source webhooks', () => {
 
         const createStripeWebhookRequest = (secret: string, body?: Record<string, any>) => {
             const payload = JSON.stringify(
-                body ?? { type: 'invoice.payment_succeeded', data: { object: { id: 'inv_1' } } }
+                body ?? {
+                    type: 'invoice.payment_succeeded',
+                    data: { object: { id: 'inv_1', object: 'invoice' } },
+                }
             )
             const timestamp = Math.floor(Date.now() / 1000)
             const signature = crypto
@@ -235,17 +295,21 @@ describe('DWH source webhooks', () => {
                 body: webhookReq.body,
             })
 
-            expect(res.status).toEqual(200)
-            expect(res.body).toEqual({ status: 'ok' })
+            expect(res.status).toEqual(201)
+            expect(res.body).toEqual({ status: 'queued' })
 
             await waitForBackgroundTasks()
 
             const kafkaMessages = getDwhKafkaMessages()
             expect(kafkaMessages).toHaveLength(1)
-            expect(kafkaMessages[0].key).toEqual(`${team.id}:${schemaId}`)
+            expect(kafkaMessages[0].key).toEqual(`${team.id}:${invoiceSchemaId}`)
             expect(kafkaMessages[0].value).toMatchObject({
-                type: 'invoice.payment_succeeded',
-                data: { object: { id: 'inv_1' } },
+                team_id: team.id,
+                schema_id: invoiceSchemaId,
+                payload: JSON.stringify({
+                    type: 'invoice.payment_succeeded',
+                    data: { object: { id: 'inv_1', object: 'invoice' } },
+                }),
             })
         })
 
@@ -275,54 +339,64 @@ describe('DWH source webhooks', () => {
         it('should bypass signature check when configured', async () => {
             const bypassFunction = await insertHogFunction(hub.postgres, team.id, {
                 type: 'warehouse_source_webhook',
-                template_id: STRIPE_TEMPLATE_ID,
+                template_id: stripeTemplateId,
                 bytecode: [],
                 inputs: {
                     ...(await compileInputs(stripeTemplateForInputs, {
                         signing_secret: '',
                         bypass_signature_check: true,
                     })),
-                    schema_id: { value: schemaId },
+                    schema_mapping: { value: schemaMapping },
+                    source_id: { value: 'test-source-id' },
                     source_type: { value: 'Stripe' },
                 },
             })
 
             const res = await doDwhPostRequest({
                 webhookId: bypassFunction.id,
-                body: { type: 'charge.succeeded', data: { object: { id: 'ch_1' } } },
+                body: { type: 'charge.succeeded', data: { object: { id: 'ch_1', object: 'charge' } } },
             })
 
-            expect(res.status).toEqual(200)
-            expect(res.body).toEqual({ status: 'ok' })
+            expect(res.status).toEqual(201)
+            expect(res.body).toEqual({ status: 'queued' })
 
             await waitForBackgroundTasks()
 
             const kafkaMessages = getDwhKafkaMessages()
             expect(kafkaMessages).toHaveLength(1)
-            expect(kafkaMessages[0].key).toEqual(`${team.id}:${schemaId}`)
+            expect(kafkaMessages[0].key).toEqual(`${team.id}:${chargeSchemaId}`)
         })
 
-        it('should return 500 when schema_id is missing from hog function inputs', async () => {
-            const noSchemaFunction = await insertHogFunction(hub.postgres, team.id, {
-                type: 'warehouse_source_webhook',
-                template_id: STRIPE_TEMPLATE_ID,
-                bytecode: [],
-                inputs: {
-                    ...(await compileInputs(stripeTemplateForInputs, {
-                        signing_secret: '',
-                        bypass_signature_check: true,
-                    })),
-                    source_type: { value: 'Stripe' },
-                },
+        it('should return 200 and skip when object type is not in schema_mapping', async () => {
+            const webhookReq = createStripeWebhookRequest(signingSecret, {
+                type: 'payment_intent.created',
+                data: { object: { id: 'pi_1', object: 'payment_intent' } },
             })
 
             const res = await doDwhPostRequest({
-                webhookId: noSchemaFunction.id,
-                body: { type: 'charge.succeeded' },
+                headers: webhookReq.headers,
+                body: webhookReq.body,
             })
 
-            expect(res.status).toEqual(500)
-            expect(res.body).toEqual({ error: 'Missing schema_id on hog function' })
+            expect(res.status).toEqual(200)
+            expect(res.text).toContain('No schema mapping for object type')
+            expect(getDwhKafkaMessages()).toHaveLength(0)
+        })
+
+        it('should return 200 and skip when event has no object type', async () => {
+            const webhookReq = createStripeWebhookRequest(signingSecret, {
+                type: 'some.event',
+                data: { object: { id: 'obj_1' } },
+            })
+
+            const res = await doDwhPostRequest({
+                headers: webhookReq.headers,
+                body: webhookReq.body,
+            })
+
+            expect(res.status).toEqual(200)
+            expect(res.text).toContain('No object type found')
+            expect(getDwhKafkaMessages()).toHaveLength(0)
         })
 
         it('should include the full webhook body in the Kafka payload', async () => {
@@ -331,6 +405,7 @@ describe('DWH source webhooks', () => {
                 data: {
                     object: {
                         id: 'sub_123',
+                        object: 'subscription',
                         customer: 'cus_456',
                         status: 'active',
                         items: { data: [{ price: { id: 'price_789' } }] },
@@ -344,12 +419,16 @@ describe('DWH source webhooks', () => {
                 body: webhookReq.body,
             })
 
-            expect(res.status).toEqual(200)
+            expect(res.status).toEqual(201)
             await waitForBackgroundTasks()
 
             const kafkaMessages = getDwhKafkaMessages()
             expect(kafkaMessages).toHaveLength(1)
-            expect(kafkaMessages[0].value).toMatchObject(eventBody)
+            expect(kafkaMessages[0].value).toMatchObject({
+                team_id: team.id,
+                schema_id: subscriptionSchemaId,
+                payload: JSON.stringify(eventBody),
+            })
         })
     })
 })

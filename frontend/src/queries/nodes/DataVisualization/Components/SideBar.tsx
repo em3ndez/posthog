@@ -16,6 +16,11 @@ type TabContent = {
     shouldShow: (displayType: ChartDisplayType) => boolean
 }
 
+export const isDisplayTabSupported = (displayType: ChartDisplayType): boolean =>
+    displayType !== ChartDisplayType.ActionsTable &&
+    displayType !== ChartDisplayType.BoldNumber &&
+    displayType !== ChartDisplayType.TwoDimensionalHeatmap
+
 const TABS_TO_CONTENT: Record<SideBarTab, TabContent> = {
     [SideBarTab.Series]: {
         label: 'Series',
@@ -30,26 +35,23 @@ const TABS_TO_CONTENT: Record<SideBarTab, TabContent> = {
     [SideBarTab.Display]: {
         label: 'Display',
         content: <DisplayTab />,
-        shouldShow: (displayType: ChartDisplayType): boolean =>
-            displayType !== ChartDisplayType.ActionsTable &&
-            displayType !== ChartDisplayType.BoldNumber &&
-            displayType !== ChartDisplayType.TwoDimensionalHeatmap,
+        shouldShow: isDisplayTabSupported,
     },
 }
 
 export const SideBar = (): JSX.Element => {
-    const { activeSideBarTab, visualizationType } = useValues(dataVisualizationLogic)
+    const { activeSideBarTab, effectiveVisualizationType } = useValues(dataVisualizationLogic)
     const { setSideBarTab } = useActions(dataVisualizationLogic)
 
     const tabs: LemonTab<string>[] = useMemo(
         () =>
             Object.entries(TABS_TO_CONTENT)
-                .filter(([_, tab]) => tab.shouldShow(visualizationType))
+                .filter(([_, tab]) => tab.shouldShow(effectiveVisualizationType))
                 .map(([key, tab]) => ({
                     label: tab.label,
                     key,
                 })),
-        [visualizationType]
+        [effectiveVisualizationType]
     )
 
     return (

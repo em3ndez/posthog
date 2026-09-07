@@ -6,20 +6,22 @@ import { Field, Form } from 'kea-forms'
 import { router } from 'kea-router'
 import { useEffect } from 'react'
 
+import * as judge from '@posthog/brand/hoggies/png/judge'
+import * as star from '@posthog/brand/hoggies/png/star'
 import { LemonButton, LemonDivider, LemonInput, Link } from '@posthog/lemon-ui'
 
+import { pngHoggie } from 'lib/brand/hoggies'
 import { RestrictionScope, useRestrictedArea } from 'lib/components/RestrictedArea'
 import { supportLogic } from 'lib/components/Support/supportLogic'
-import { JudgeHog, StarHog } from 'lib/components/hedgehogs'
-import { OrganizationMembershipLevel } from 'lib/constants'
 import { FEATURE_FLAGS } from 'lib/constants'
 import { dayjs } from 'lib/dayjs'
 import { LemonBanner } from 'lib/lemon-ui/LemonBanner'
 import { SpinnerOverlay } from 'lib/lemon-ui/Spinner/Spinner'
 import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
-import { toSentenceCase } from 'lib/utils'
-import { preflightLogic } from 'scenes/PreflightCheck/preflightLogic'
+import { toSentenceCase } from 'lib/utils/strings'
 import { couponLogic } from 'scenes/coupons/couponLogic'
+import { membersLogic } from 'scenes/organization/membersLogic'
+import { preflightLogic } from 'scenes/PreflightCheck/preflightLogic'
 import { SceneExport } from 'scenes/sceneTypes'
 import { urls } from 'scenes/urls'
 
@@ -27,13 +29,16 @@ import { ProductKey } from '~/queries/schema/schema-general'
 import { BillingProductV2Type } from '~/types'
 
 import { BillingHero } from './BillingHero'
+import { billingLogic } from './billingLogic'
 import { BillingNoAccess } from './BillingNoAccess'
 import { BillingProduct } from './BillingProduct'
 import { BillingSummary } from './BillingSummary'
 import { CreditCTAHero } from './CreditCTAHero'
 import { StripePortalButton } from './StripePortalButton'
 import { UnsubscribeCard } from './UnsubscribeCard'
-import { billingLogic } from './billingLogic'
+
+const HedgehogJudge = pngHoggie(judge)
+const HedgehogStar = pngHoggie(star)
 
 export const scene: SceneExport = {
     component: Billing,
@@ -50,6 +55,9 @@ export function Billing(): JSX.Element {
         showBillingSummary,
         showCreditCTAHero,
         showBillingHero,
+        minimumBillingAccessLevel,
+        canOnlyViewUsageAndSpend,
+        hasSupportAddonPlan,
     } = useValues(billingLogic)
     const { reportBillingShown } = useActions(billingLogic)
     const { preflight, isCloudOrDev } = useValues(preflightLogic)
@@ -57,18 +65,23 @@ export function Billing(): JSX.Element {
     const { featureFlags } = useValues(featureFlagLogic)
     const { location, searchParams } = useValues(router)
     const { activeCoupons, couponsOverviewLoading } = useValues(couponLogic({}))
+    const { memberCount } = useValues(membersLogic)
 
     const restrictionReason = useRestrictedArea({
-        minimumAccessLevel: OrganizationMembershipLevel.Admin,
+        minimumAccessLevel: minimumBillingAccessLevel,
         scope: RestrictionScope.Organization,
     })
 
     useEffect(() => {
         if (location.pathname === urls.organizationBilling() && featureFlags[FEATURE_FLAGS.USAGE_SPEND_DASHBOARDS]) {
-            router.actions.replace(urls.organizationBillingSection('overview'), searchParams)
+            // View-only members can't see the Overview tab, so land them on Usage instead
+            router.actions.replace(
+                urls.organizationBillingSection(canOnlyViewUsageAndSpend ? 'usage' : 'overview'),
+                searchParams
+            )
             return
         }
-    }, [featureFlags, location.pathname, searchParams])
+    }, [featureFlags, location.pathname, searchParams, canOnlyViewUsageAndSpend])
 
     useEffect(() => {
         if (billing) {
@@ -100,7 +113,7 @@ export function Billing(): JSX.Element {
                         'There was an issue retrieving your current billing information. If this message persists, please '
                     }
                     {preflight?.cloud ? (
-                        <Link onClick={() => openSupportForm({ kind: 'bug', target_area: 'billing' })}>
+                        <Link onClick={() => openSupportForm({ kind: 'bug', billing_issue: true })}>
                             submit a bug report
                         </Link>
                     ) : (
@@ -151,7 +164,7 @@ export function Billing(): JSX.Element {
             {billing?.trial ? (
                 <LemonBanner type="info" hideIcon className="max-w-300 mb-2">
                     <div className="flex items-center gap-4">
-                        <JudgeHog className="w-20 h-20 flex-shrink-0" />
+                        <HedgehogJudge className="w-20 h-20 flex-shrink-0" />
                         <div>
                             <p className="text-lg">You're on (a) trial</p>
                             <p>
@@ -195,7 +208,7 @@ export function Billing(): JSX.Element {
                 <div className="mt-6 max-w-300">
                     <LemonBanner type="info" hideIcon>
                         <div className="flex items-center gap-4">
-                            <StarHog className="w-16 h-16 flex-shrink-0" />
+                            <HedgehogStar className="w-16 h-16 flex-shrink-0" />
                             <div>
                                 <p className="font-semibold mb-2">You have active coupons!</p>
                                 <ul className="list-disc list-inside space-y-1">
@@ -231,7 +244,7 @@ export function Billing(): JSX.Element {
                 <h2>Products</h2>
             </div>
 
-            {(featureFlags[FEATURE_FLAGS.REORDER_PLATFORM_ADDON_BILLING_SECTION] === 'test-top-of-page'
+            {(memberCount >= 5 && !hasSupportAddonPlan
                 ? [
                       platformAndSupportProduct,
                       ...(products?.filter((product) => product.type !== ProductKey.PLATFORM_AND_SUPPORT) ?? []),
@@ -247,6 +260,7 @@ export function Billing(): JSX.Element {
                         <BillingProduct product={x} />
                     </div>
                 ))}
+
             <div>
                 {billing?.subscription_level == 'paid' && !!platformAndSupportProduct ? (
                     <>

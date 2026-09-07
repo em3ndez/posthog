@@ -1,48 +1,80 @@
-import { LemonTag, Link, Tooltip } from '@posthog/lemon-ui'
+import { LemonBanner, LemonTag, Link, Tooltip } from '@posthog/lemon-ui'
+import { LLMProviderKeysSettings } from '@posthog/products-ai-observability/frontend/settings/LLMProviderKeysSettings'
+import { ParserRecipesSettings } from '@posthog/products-ai-observability/frontend/settings/ParserRecipesSettings'
 import { ErrorTrackingAlerting } from '@posthog/products-error-tracking/frontend/scenes/ErrorTrackingConfigurationScene/alerting/ErrorTrackingAlerting'
+import { AssignmentRules } from '@posthog/products-error-tracking/frontend/scenes/ErrorTrackingConfigurationScene/assignment_rules/AssignmentRules'
+import { GroupingRules } from '@posthog/products-error-tracking/frontend/scenes/ErrorTrackingConfigurationScene/grouping_rules/GroupingRules'
+import { RateLimitSettings } from '@posthog/products-error-tracking/frontend/scenes/ErrorTrackingConfigurationScene/rate_limit/RateLimitSettings'
 import { Releases } from '@posthog/products-error-tracking/frontend/scenes/ErrorTrackingConfigurationScene/releases/Releases'
-import { AutoAssignmentRules } from '@posthog/products-error-tracking/frontend/scenes/ErrorTrackingConfigurationScene/rules/AutoAssignmentRules'
-import { CustomGroupingRules } from '@posthog/products-error-tracking/frontend/scenes/ErrorTrackingConfigurationScene/rules/CustomGroupingRules'
+import { SeverityRules } from '@posthog/products-error-tracking/frontend/scenes/ErrorTrackingConfigurationScene/severity_rules/SeverityRules'
 import { SpikeDetectionSettings } from '@posthog/products-error-tracking/frontend/scenes/ErrorTrackingConfigurationScene/spike_detection/SpikeDetectionSettings'
 import { SymbolSets } from '@posthog/products-error-tracking/frontend/scenes/ErrorTrackingConfigurationScene/symbol_sets/SymbolSets'
-import { LLMProviderKeysSettings } from '@posthog/products-llm-analytics/frontend/settings/LLMProviderKeysSettings'
+import { McpStoreSettings } from '@posthog/products-mcp-store/frontend/McpStoreSettings'
 import { EventConfiguration } from '@posthog/products-revenue-analytics/frontend/settings/EventConfiguration'
 import { ExternalDataSourceConfiguration } from '@posthog/products-revenue-analytics/frontend/settings/ExternalDataSourceConfiguration'
 import { FilterTestAccountsConfiguration as RevenueAnalyticsFilterTestAccountsConfiguration } from '@posthog/products-revenue-analytics/frontend/settings/FilterTestAccountsConfiguration'
-import { GoalsConfiguration } from '@posthog/products-revenue-analytics/frontend/settings/GoalsConfiguration'
 
-import { AccessControlAction } from 'lib/components/AccessControlAction'
 import { BaseCurrency } from 'lib/components/BaseCurrency/BaseCurrency'
+import { FeaturePreviews, FeaturePreviewsComingSoon } from 'lib/components/FeaturePreviews/FeaturePreviews'
+import { FlaggedFeature } from 'lib/components/FlaggedFeature'
 import { FEATURE_SUPPORT } from 'lib/components/SupportedPlatforms/featureSupport'
-import { OrganizationMembershipLevel } from 'lib/constants'
-import { dayjs } from 'lib/dayjs'
+import { FEATURE_FLAGS, OrganizationMembershipLevel } from 'lib/constants'
+import { PersonalPosthogConnections } from 'lib/integrations/PosthogConnect'
+import { DefaultMinimumDetectableEffect } from 'scenes/experiments/DefaultMinimumDetectableEffect'
+import { GitHub, Linear, Slack } from 'scenes/integrations/definitions'
 import { BounceRateDurationSetting } from 'scenes/settings/environment/BounceRateDuration'
 import { BounceRatePageViewModeSetting } from 'scenes/settings/environment/BounceRatePageViewMode'
 import { CookielessServerHashModeSetting } from 'scenes/settings/environment/CookielessServerHashMode'
+import { CustomBotDefinitions } from 'scenes/settings/environment/CustomBotDefinitions'
 import { CustomChannelTypes } from 'scenes/settings/environment/CustomChannelTypes'
 import { DeadClicksAutocaptureSettings } from 'scenes/settings/environment/DeadClicksAutocaptureSettings'
 import { MaxChangelogSettings } from 'scenes/settings/environment/MaxChangelogSettings'
 import { MaxMemorySettings } from 'scenes/settings/environment/MaxMemorySettings'
+import { PersonLastSeenAtEnabled } from 'scenes/settings/environment/PersonLastSeenAtEnabled'
 import { PersonsJoinMode } from 'scenes/settings/environment/PersonsJoinMode'
 import { PersonsOnEvents } from 'scenes/settings/environment/PersonsOnEvents'
 import { PreAggregatedTablesSetting } from 'scenes/settings/environment/PreAggregatedTablesSetting'
 import { ReplayTriggers } from 'scenes/settings/environment/ReplayTriggers'
 import { SessionsTableVersion } from 'scenes/settings/environment/SessionsTableVersion'
 import { SessionsV2JoinModeSettings } from 'scenes/settings/environment/SessionsV2JoinModeSettings'
+import {
+    TaskAgentMyPreferenceSettings,
+    TaskAgentProjectDefaultSettings,
+} from 'scenes/settings/environment/TaskAgentDefaultsSettings'
+import { OrganizationMCPAccess } from 'scenes/settings/organization/OrganizationMCPAccess'
 import { urls } from 'scenes/urls'
 
+import { ConfigScopeEnumApi } from '~/generated/core/api.schemas'
+import { AccessResolutionPreview } from '~/layout/navigation-3000/sidepanel/panels/access_control/ResolutionPreview/AccessResolutionPreview'
 import {
     DefaultRoleSelector,
     RolesAccessControls,
 } from '~/layout/navigation-3000/sidepanel/panels/access_control/RolesAccessControls'
-import { AccessControlLevel, AccessControlResourceType, Realm } from '~/types'
+import { AccessControlLevel, AccessControlResourceType, AvailableFeature, Realm } from '~/types'
 
-import { CustomerAnalyticsDashboardEvents } from 'products/customer_analytics/frontend/scenes/CustomerAnalyticsConfigurationScene/events/CustomerAnalyticsDashboardEvents'
+import { AISection } from 'products/conversations/frontend/scenes/settings/AISection'
+import { GeneralSection } from 'products/conversations/frontend/scenes/settings/GeneralSection'
+import { NotificationsSection } from 'products/conversations/frontend/scenes/settings/NotificationsSection'
+import { ZendeskImportSection } from 'products/conversations/frontend/scenes/settings/ZendeskImportSection'
+import { CustomerAnalyticsEventStream } from 'products/customer_analytics/frontend/components/EventStream/CustomerAnalyticsEventStream'
+import { AccountTrackRules } from 'products/customer_analytics/frontend/scenes/CustomerAnalyticsConfigurationScene/account/AccountTrackRules'
+import { CustomerAnalyticsAccountConfig } from 'products/customer_analytics/frontend/scenes/CustomerAnalyticsConfigurationScene/account/CustomerAnalyticsAccountConfig'
 import {
-    ExceptionAutocaptureToggle,
-    ExceptionIngestionControls,
-    ExceptionSuppressionRules,
-} from 'products/error_tracking/frontend/scenes/ErrorTrackingConfigurationScene/exception_autocapture/ExceptionAutocaptureSettings'
+    WarehouseGroupPropertiesSetting,
+    WarehousePersonPropertiesSetting,
+} from 'products/customer_analytics/frontend/scenes/CustomerAnalyticsConfigurationScene/account/WarehousePersonPropertiesSetting'
+import { CalendarSyncConfig } from 'products/customer_analytics/frontend/scenes/CustomerAnalyticsConfigurationScene/calendar/CalendarSyncConfig'
+import { CustomerAnalyticsDashboardEvents } from 'products/customer_analytics/frontend/scenes/CustomerAnalyticsConfigurationScene/events/CustomerAnalyticsDashboardEvents'
+import { ExceptionAutocaptureToggle } from 'products/error_tracking/frontend/scenes/ErrorTrackingConfigurationScene/exception_autocapture/ExceptionAutocaptureSettings'
+import { SuppressionRules } from 'products/error_tracking/frontend/scenes/ErrorTrackingConfigurationScene/suppression_rules/SuppressionRules'
+import { MAX_LOOKBACK_DAYS, MIN_LOOKBACK_DAYS } from 'products/experiments/frontend/constants'
+import { LogsAlertingSection } from 'products/logs/frontend/components/LogsAlerting/LogsAlertingSection'
+import { LogsMetricRulesSection } from 'products/logs/frontend/components/LogsMetricRules/LogsMetricRulesSection'
+import { LogsRetentionSection } from 'products/logs/frontend/components/LogsRetention/LogsRetentionSection'
+import { LogsSamplingSection } from 'products/logs/frontend/components/LogsSampling/LogsSamplingSection'
+import { LogsFeatureFlagKeys } from 'products/logs/frontend/logsFeatureFlagKeys'
+import { WorkflowsEmailTrackingConsentSettings } from 'products/workflows/frontend/scenes/settings/WorkflowsEmailTrackingConsentSettings'
+import { WorkflowsEngagementEventsSettings } from 'products/workflows/frontend/scenes/settings/WorkflowsEngagementEventsSettings'
 
 import { IntegrationsList } from '../../lib/integrations/IntegrationsList'
 import {
@@ -51,33 +83,48 @@ import {
     ActivityLogSettings,
 } from './environment/ActivityLogSettings'
 import { AutocaptureSettings, WebVitalsAutocaptureSettings } from './environment/AutocaptureSettings'
-import { CSPReportingSettings } from './environment/CSPReportingSettings'
 import { CorrelationConfig } from './environment/CorrelationConfig'
+import { CSPReportingSettings } from './environment/CSPReportingSettings'
 import { DataAttributes } from './environment/DataAttributes'
 import { DataColorThemes } from './environment/DataColorThemes'
+import { DefaultCupedEnabled } from './environment/DefaultCupedEnabled'
+import { DefaultCupedLookbackDays } from './environment/DefaultCupedLookbackDays'
 import { DefaultExperimentConfidenceLevel } from './environment/DefaultExperimentConfidenceLevel'
 import { DefaultExperimentStatsMethod } from './environment/DefaultExperimentStatsMethod'
+import { DefaultOnlyCountMaturedUsers } from './environment/DefaultOnlyCountMaturedUsers'
+import { DefaultSequentialTestingEnabled } from './environment/DefaultSequentialTestingEnabled'
+import { DefaultSequentialTuningParameter } from './environment/DefaultSequentialTuningParameter'
 import { DiscussionMentionNotifications } from './environment/DiscussionSettings'
+import { ErrorTrackingConfigurationMovedBanner } from './environment/ErrorTrackingConfigurationMovedBanner'
 import { ErrorTrackingIntegrations } from './environment/ErrorTrackingIntegrations'
 import { ExperimentRecalculationTime } from './environment/ExperimentRecalculationTime'
 import {
     DefaultEvaluationContexts,
+    DefaultReleaseConditions,
+    EvaluationContextSuggestions,
     FlagChangeConfirmationSettings,
     FlagPersistenceSettings,
     FlagsSecureApiKeys,
     RequireEvaluationContexts,
+    RequireFeatureFlagTags,
 } from './environment/FeatureFlagSettings'
-import { FeaturePreviewsComingSoon, FeaturePreviewsSettings } from './environment/FeaturePreviewsSettings'
 import { GroupAnalyticsConfig } from './environment/GroupAnalyticsConfig'
 import { HeatmapsSettings } from './environment/HeatmapsSettings'
 import { HumanFriendlyComparisonPeriodsSetting } from './environment/HumanFriendlyComparisonPeriodsSetting'
 import { IPAllowListInfo } from './environment/IPAllowListInfo'
 import { IPCapture } from './environment/IPCapture'
-import { GithubIntegration, LinearIntegration } from './environment/Integrations'
-import { LogsCaptureSettings, LogsJsonParseSettings, LogsRetentionSettings } from './environment/LogsCaptureSettings'
-import MCPServerSettings from './environment/MCPServerSettings'
+import { JsSnippetVersionPin } from './environment/JsSnippetVersionPin'
+import {
+    LogsCaptureSettings,
+    LogsJsonParseSettings,
+    LogsPiiScrubSettings,
+    LogsRetentionSettings,
+} from './environment/LogsCaptureSettings'
+import { LogsDistinctIdAttributeKeys } from './environment/LogsDistinctIdAttributeKeys'
+import { LogsSessionIdAttributeKeys } from './environment/LogsSessionIdAttributeKeys'
 import { ManagedReverseProxy } from './environment/ManagedReverseProxy'
 import { MarketingAnalyticsSettingsWrapper } from './environment/MarketingAnalyticsSettingsWrapper'
+import MCPServerSettings from './environment/MCPServerSettings'
 import { PathCleaningFiltersConfig } from './environment/PathCleaningFiltersConfig'
 import { PersonDisplayNameProperties } from './environment/PersonDisplayNameProperties'
 import { ReplayIntegrations } from './environment/ReplayIntegrations'
@@ -92,51 +139,66 @@ import {
     ReplayNetworkCapture,
     ReplayNetworkHeadersPayloads,
 } from './environment/SessionRecordingSettings'
-import { SlackIntegration } from './environment/SlackIntegration'
 import { SurveyDefaultAppearance, SurveyEnableToggle } from './environment/SurveySettings'
 import { TeamAccessControl } from './environment/TeamAccessControl'
-import { TeamDangerZone } from './environment/TeamDangerZone'
-import {
-    TeamAuthorizedURLs,
-    TeamBusinessModel,
-    TeamDisplayName,
-    TeamTimezone,
-    TeamVariables,
-    WebSnippetV2,
-} from './environment/TeamSettings'
+import { TeamAuthorizedURLs, TeamBusinessModel, TeamTimezone, TeamVariables } from './environment/TeamSettings'
 import { ProjectAccountFiltersSetting } from './environment/TestAccountFiltersConfig'
+import { TracingDistinctIdAttributeKeys } from './environment/TracingDistinctIdAttributeKeys'
+import { TracingSessionIdAttributeKeys } from './environment/TracingSessionIdAttributeKeys'
 import { UsageMetricsConfig } from './environment/UsageMetricsConfig'
 import { WebAnalyticsEnablePreAggregatedTables } from './environment/WebAnalyticsAPISetting'
-import { WebhookIntegration } from './environment/WebhookIntegration'
+import { AIHipaaDisclaimer, getExternalAIProvidersTooltipTitle } from './organization/aiConsentCopy'
 import { ApprovalPolicies } from './organization/Approvals/ApprovalPolicies'
 import { ChangeRequestsList } from './organization/Approvals/ChangeRequestsList'
+import { CIMDVerificationTokens } from './organization/CIMDVerificationTokens'
+import { IdentityProviderFeatureSection } from './organization/IdentityProviderConfig/IdentityProviderFeatureSection'
 import { Invites } from './organization/Invites'
 import { Members } from './organization/Members'
-import { MembersPlatformAddonAd } from './organization/MembersPlatformAddonAd'
+import { NotificationGovernanceSetting } from './organization/NotificationGovernanceSetting'
+import { OAuthApps } from './organization/OAuthApps'
 import { OrganizationAI } from './organization/OrgAI'
-import { OrganizationDisplayName } from './organization/OrgDisplayName'
-import { OrganizationEmailPreferences } from './organization/OrgEmailPreferences'
-import { OrgIPAnonymizationDefault } from './organization/OrgIPAnonymizationDefault'
+import { OrganizationAITrainingOptOut } from './organization/OrgAITraining'
 import { OrganizationDangerZone } from './organization/OrganizationDangerZone'
 import { OrganizationIntegrations } from './organization/OrganizationIntegrations'
+import { OrganizationPersonalAPIKeys } from './organization/OrganizationPersonalAPIKeys'
 import { OrganizationSecuritySettings } from './organization/OrganizationSecuritySettings'
+import { OrganizationDesktopBetaTerms } from './organization/OrgDesktopBetaTerms'
+import { OrganizationDisplayName } from './organization/OrgDisplayName'
+import { OrgIPAnonymizationDefault } from './organization/OrgIPAnonymizationDefault'
+import { OrganizationVariables } from './organization/OrgVariables'
+import { EnforceVerifiedDomains } from './organization/VerifiedDomains/EnforceVerifiedDomains'
 import { VerifiedDomains } from './organization/VerifiedDomains/VerifiedDomains'
 import { ProjectDangerZone } from './project/ProjectDangerZone'
+import { ProjectDetails } from './project/ProjectDetails'
 import { ProjectMove } from './project/ProjectMove'
-import { ProjectDisplayName } from './project/ProjectSettings'
+import { ProjectSecretAPIKeys } from './project/ProjectSecretAPIKeys'
 import { SettingSection } from './types'
 import { AllowImpersonation } from './user/AllowImpersonation'
 import { ChangePassword, ChangePasswordTitle } from './user/ChangePassword'
+import { ConnectedApps } from './user/ConnectedApps'
 import { HedgehogModeSettings } from './user/HedgehogModeSettings'
+import { LoginSessions } from './user/LoginSessions'
+import { MCPHintsSetting } from './user/MCPHintsSetting'
 import { OptOutCapture } from './user/OptOutCapture'
 import { PasskeySettings } from './user/PasskeySettings'
 import { PersonalAPIKeys } from './user/PersonalAPIKeys'
-import { SqlEditorTabPreference } from './user/SqlEditorTabPreference'
+import { PersonalGitHubIntegrations, PersonalSlackIntegrations } from './user/PersonalIntegrations'
+import { ProfilePictureSettings } from './user/ProfilePictureSettings'
+import { RealtimeNotificationPreferences } from './user/RealtimeNotificationPreferences'
+import { Reminders } from './user/Reminders'
+import { SidebarAutoSuggestSetting } from './user/SidebarProductSettings'
+import {
+    HomepageSetting,
+    SidebarItemsSetting,
+    SidebarLayoutSetting,
+    SidebarMyToolsSetting,
+} from './user/SidebarSettings'
 import { ThemeSwitcher } from './user/ThemeSwitcher'
 import { TwoFactorSettings } from './user/TwoFactorSettings'
 import { UpdateEmailPreferences } from './user/UpdateEmailPreferences'
 import { UserDangerZone } from './user/UserDangerZone'
 import { UserDetails } from './user/UserDetails'
+import { WebAnalyticsAchievementsSetting } from './user/WebAnalyticsAchievementsSetting'
 
 export const SETTINGS_MAP: SettingSection[] = [
     // ENVIRONMENT
@@ -202,20 +264,19 @@ export const SETTINGS_MAP: SettingSection[] = [
                 ],
             },
             {
-                id: 'snippet-v2',
+                id: 'js-snippet-version',
                 title: (
                     <>
-                        Web snippet V2{' '}
+                        Snippet version{' '}
                         <LemonTag type="warning" className="ml-1 uppercase">
                             Experimental
                         </LemonTag>
                     </>
                 ),
-                description:
-                    'The V2 snippet includes your project config automatically along with the PostHog JS code, leading to faster load times and fewer calls needed before the SDK is fully functional.',
-                flag: 'REMOTE_CONFIG',
-                component: <WebSnippetV2 />,
-                keywords: ['javascript', 'install', 'setup', 'v2', 'fast'],
+                description: 'Pin the snippet to a specific version of posthog-js. Defaults to the latest v1 release.',
+                flag: ['JS_SNIPPET_VERSIONING'],
+                component: <JsSnippetVersionPin />,
+                keywords: ['version', 'pin', 'snippet', 'sdk', 'posthog-js'],
             },
         ],
     },
@@ -226,10 +287,10 @@ export const SETTINGS_MAP: SettingSection[] = [
         settings: [
             {
                 id: 'display-name',
-                title: 'Display name',
-                description: 'A human-friendly name for this environment.',
-                component: <TeamDisplayName />,
-                keywords: ['name', 'rename', 'label'],
+                title: 'Project details',
+                description: 'Name this project and label it so you can group and find it across your organization.',
+                component: <ProjectDetails />,
+                keywords: ['name', 'rename', 'label', 'tag', 'tags'],
             },
             {
                 id: 'date-and-time',
@@ -238,6 +299,28 @@ export const SETTINGS_MAP: SettingSection[] = [
                     'Set the timezone and week start day used for displaying and bucketing time-series data in insights and dashboards. You may need to refresh insights for changes to apply.',
                 component: <TeamTimezone />,
                 keywords: ['timezone', 'utc', 'locale', 'week start'],
+            },
+            {
+                // Project-wide, not product analytics specific: these filters apply to insights,
+                // web analytics, revenue analytics, session replay, and CDP destinations alike.
+                id: 'internal-user-filtering',
+                title: 'Filter out internal and test users',
+                description:
+                    'Define filters to exclude internal users and test accounts from your analytics. Filtered users will not appear in insights by default.',
+                docsUrl: 'https://posthog.com/tutorials/filter-internal-users',
+                component: <ProjectAccountFiltersSetting />,
+                keywords: ['test account', 'internal', 'exclude', 'filter'],
+            },
+            {
+                // Project-wide, like internal user filtering above: these definitions feed the
+                // `Is bot` property, which is available to every query, not only web analytics.
+                id: 'custom-bot-definitions',
+                title: 'Custom bots',
+                description:
+                    'Add your own crawlers and scripts to the bots PostHog already detects, so you can tell them apart from real visitors.',
+                docsUrl: 'https://posthog.com/docs/web-analytics/bot-detection',
+                component: <CustomBotDefinitions />,
+                keywords: ['bot', 'crawler', 'spider', 'scraper', 'user agent', 'ai'],
             },
             {
                 id: 'business-model',
@@ -258,52 +341,6 @@ export const SETTINGS_MAP: SettingSection[] = [
     },
     {
         level: 'environment',
-        id: 'environment-autocapture',
-        title: 'Autocapture',
-        settings: [
-            {
-                id: 'autocapture',
-                title: 'Autocapture',
-                description:
-                    'Automatically capture frontend events such as clicks, input changes, and form submissions when using the web JavaScript SDK. Also available for React Native and iOS via code configuration.',
-                docsUrl: 'https://posthog.com/docs/product-analytics/autocapture',
-                platformSupport: FEATURE_SUPPORT.autocapture,
-                component: <AutocaptureSettings />,
-                keywords: ['click', 'input', 'form', 'dom', 'automatic', 'event'],
-            },
-            {
-                id: 'autocapture-data-attributes',
-                title: 'Data attributes',
-                description:
-                    'Specify data attributes used in your app (e.g. data-attr, data-custom-id). These attributes help the toolbar and action definitions match unique elements on your pages. Use * as a wildcard.',
-                docsUrl: 'https://posthog.com/docs/product-analytics/autocapture#data-attributes',
-                component: <DataAttributes />,
-                keywords: ['selector', 'css', 'element', 'toolbar', 'action'],
-            },
-            {
-                id: 'web-vitals-autocapture',
-                title: 'Web vitals autocapture',
-                description:
-                    "Capture Google Chrome's web vitals metrics (LCP, CLS, FCP, INP). These events enhance web analytics and session replay with performance data.",
-                docsUrl: 'https://posthog.com/docs/web-analytics/web-vitals',
-                platformSupport: FEATURE_SUPPORT.webVitals,
-                component: <WebVitalsAutocaptureSettings />,
-                keywords: ['lcp', 'cls', 'inp', 'fcp', 'performance', 'core web vitals'],
-            },
-            {
-                id: 'dead-clicks-autocapture',
-                title: 'Dead clicks autocapture',
-                description:
-                    "Track clicks that don't result in any action (no scroll, text selection, or DOM mutation). Dead clicks help you find elements users expect to be interactive but aren't.",
-                docsUrl: 'https://posthog.com/docs/toolbar/heatmaps#dead-clicks',
-                platformSupport: FEATURE_SUPPORT.deadClicks,
-                component: <DeadClicksAutocaptureSettings />,
-                keywords: ['rage click', 'broken', 'unresponsive', 'frustration'],
-            },
-        ],
-    },
-    {
-        level: 'environment',
         id: 'environment-max',
         title: 'PostHog AI',
         group: 'AI',
@@ -317,6 +354,7 @@ export const SETTINGS_MAP: SettingSection[] = [
                 hideOn: [Realm.SelfHostedClickHouse, Realm.SelfHostedPostgres],
             },
             {
+                // FIXME: changelog should probably not be here since it updates user's settings. Maybe belongs under account settings?
                 id: 'changelog',
                 title: 'Changelog',
                 description:
@@ -328,12 +366,36 @@ export const SETTINGS_MAP: SettingSection[] = [
     },
     {
         level: 'environment',
-        id: 'mcp-server',
-        title: 'MCP server',
+        id: 'environment-task-agents',
+        title: 'Model preferences',
         group: 'AI',
         settings: [
             {
-                id: 'mcp-server-configure',
+                id: 'task-agent-project-default',
+                title: 'Project default model',
+                description:
+                    'The model agent runs launch with when nobody picks one. Everyone on this project inherits it in the new PostHog AI view, in Slack, and in PostHog Desktop.',
+                component: <TaskAgentProjectDefaultSettings />,
+                keywords: ['ai', 'model', 'claude', 'codex', 'agent', 'tasks', 'default', 'slack', 'desktop'],
+            },
+            {
+                id: 'task-agent-my-preference',
+                title: 'My default model',
+                description:
+                    'The model your own runs launch with, overriding the project default. Applies in the new PostHog AI view, in Slack, and in PostHog Desktop.',
+                component: <TaskAgentMyPreferenceSettings />,
+                keywords: ['ai', 'model', 'claude', 'codex', 'agent', 'tasks', 'preference', 'slack', 'desktop'],
+            },
+        ],
+    },
+    {
+        level: 'environment',
+        id: 'posthog-mcp',
+        title: 'PostHog MCP',
+        group: 'AI',
+        settings: [
+            {
+                id: 'posthog-mcp-configure',
                 title: 'Model Context Protocol (MCP) server',
                 description:
                     'Connect PostHog to AI tools like Claude, Cursor, and Copilot via the MCP protocol for data-driven AI assistance.',
@@ -345,20 +407,53 @@ export const SETTINGS_MAP: SettingSection[] = [
     },
     {
         level: 'environment',
+        id: 'mcp-servers',
+        title: 'MCP servers',
+        group: 'AI',
+        flag: 'MCP_GATEWAY',
+        settings: [
+            {
+                id: 'mcp-servers-manage',
+                title: null,
+                component: <McpStoreSettings />,
+                keywords: ['mcp', 'server', 'install', 'oauth', 'ai', 'agent'],
+            },
+        ],
+    },
+    {
+        level: 'environment',
+        id: 'environment-ai-observability',
+        title: 'AI observability',
+        group: 'Products',
+        settings: [
+            {
+                id: 'ai-observability-byok',
+                title: 'Bring your own key (BYOK)',
+                description:
+                    'Add and manage provider API keys for AI observability features, including evaluations and playground.',
+                component: <LLMProviderKeysSettings />,
+                docsUrl: 'https://posthog.com/docs/ai-evals/evaluations',
+                keywords: ['llm', 'provider', 'api key', 'openai', 'anthropic', 'gemini', 'playground'],
+            },
+            {
+                id: 'ai-observability-parser-recipes',
+                title: 'Custom parsing',
+                description:
+                    "Add recipes that normalize provider message shapes the built-in recipes don't cover. They apply when rendering traces.",
+                component: <ParserRecipesSettings />,
+                keywords: ['parser', 'recipe', 'normalize', 'trace', 'provider', 'custom parsing', 'content'],
+            },
+        ],
+    },
+    {
+        level: 'environment',
         id: 'environment-csp-reporting',
         title: 'CSP reporting',
-        flag: 'CSP_REPORTING',
+        group: 'Products',
         settings: [
             {
                 id: 'csp-reporting',
-                title: (
-                    <>
-                        CSP reporting{' '}
-                        <LemonTag type="warning" className="ml-1 uppercase">
-                            Beta
-                        </LemonTag>
-                    </>
-                ),
+                title: 'CSP reporting',
                 description:
                     'Collect Content Security Policy violation reports to monitor and debug CSP issues on your site.',
                 component: <CSPReportingSettings />,
@@ -397,6 +492,498 @@ export const SETTINGS_MAP: SettingSection[] = [
                 flag: 'CUSTOMER_ANALYTICS',
                 keywords: ['dashboard', 'customer', 'events'],
             },
+            {
+                id: 'customer-analytics-accounts',
+                title: 'Accounts',
+                description: 'Select which group type represents an account in customer analytics.',
+                component: <CustomerAnalyticsAccountConfig />,
+                flag: ['CUSTOMER_ANALYTICS', 'CUSTOMER_ANALYTICS_CSP'],
+                keywords: ['accounts', 'group', 'b2b'],
+            },
+            {
+                id: 'customer-analytics-track-rules',
+                title: 'Track rules',
+                description: 'Choose which active accounts appear in Customer analytics.',
+                component: <AccountTrackRules />,
+                flag: ['CUSTOMER_ANALYTICS', 'CUSTOMER_ANALYTICS_TRACK_RULES'],
+                keywords: ['accounts', 'track', 'ignore', 'rules', 'filter'],
+            },
+            {
+                id: 'customer-analytics-calendar-sync',
+                title: 'Google account sync',
+                description:
+                    'Connect your Google account to sync customer meetings and email to matching accounts. Each team member connects their own account.',
+                component: <CalendarSyncConfig />,
+                flag: ['CUSTOMER_ANALYTICS', 'CUSTOMER_ANALYTICS_CSP'],
+                keywords: ['calendar', 'email', 'meetings', 'google', 'sync', 'accounts'],
+            },
+            {
+                id: 'customer-analytics-event-stream',
+                title: 'Event stream',
+                description:
+                    "Stream selected customers' events to a Slack channel of your choice in real time. Each team member configures their own stream: pick your events and channel here, then add customers from their account profiles.",
+                component: <CustomerAnalyticsEventStream />,
+                flag: ['CUSTOMER_ANALYTICS', 'CUSTOMER_ANALYTICS_CSP'],
+                keywords: ['event', 'stream', 'live', 'slack', 'accounts'],
+            },
+            {
+                id: 'customer-analytics-person-properties',
+                title: 'Person properties',
+                description:
+                    'Sync warehouse table columns onto matching people as person properties, and manage their schedule, backfills, and run history.',
+                component: <WarehousePersonPropertiesSetting />,
+                flag: 'WAREHOUSE_PERSON_PROPERTIES',
+                keywords: ['warehouse', 'person', 'properties', 'sync', 'backfill'],
+            },
+            {
+                id: 'customer-analytics-group-properties',
+                title: 'Group properties',
+                description:
+                    'Sync warehouse table columns onto matching groups as group properties, and manage their schedule, backfills, and run history.',
+                component: <WarehouseGroupPropertiesSetting />,
+                flag: 'WAREHOUSE_PERSON_PROPERTIES',
+                keywords: ['warehouse', 'group', 'properties', 'sync', 'backfill'],
+            },
+        ],
+    },
+    {
+        level: 'environment',
+        id: 'environment-error-tracking',
+        title: 'Error tracking',
+        group: 'Products',
+        accessControl: {
+            resourceType: AccessControlResourceType.ErrorTracking,
+            minimumAccessLevel: AccessControlLevel.Viewer,
+        },
+        settings: [
+            {
+                id: 'banner',
+                title: null,
+                component: <ErrorTrackingConfigurationMovedBanner />,
+            },
+            {
+                id: 'error-tracking-exception-autocapture',
+                title: 'Exception autocapture',
+                description:
+                    'Automatically capture frontend exceptions using onError and onUnhandledRejection listeners in the web JavaScript SDK.',
+                docsUrl: 'https://posthog.com/docs/error-tracking',
+                platformSupport: FEATURE_SUPPORT.errorTrackingExceptionAutocapture,
+                component: <ExceptionAutocaptureToggle />,
+                keywords: ['crash', 'bug', 'exception', 'stack trace'],
+            },
+            {
+                id: 'error-tracking-integrations',
+                title: 'Integrations',
+                description: 'Connect error tracking with external services like GitHub or Linear.',
+                component: <ErrorTrackingIntegrations />,
+                keywords: ['github', 'linear', 'gitlab', 'jira', 'integration', 'connect', 'issue'],
+            },
+        ],
+    },
+    {
+        level: 'environment',
+        id: 'environment-error-tracking-configuration',
+        title: 'Error tracking',
+        group: 'Products',
+        hideFromNavigation: true,
+        accessControl: {
+            resourceType: AccessControlResourceType.ErrorTracking,
+            minimumAccessLevel: AccessControlLevel.Viewer,
+        },
+        settings: [
+            {
+                id: 'error-tracking-exception-autocapture',
+                title: 'Exception autocapture',
+                description:
+                    'Automatically capture frontend exceptions using onError and onUnhandledRejection listeners in the web JavaScript SDK.',
+                docsUrl: 'https://posthog.com/docs/error-tracking',
+                platformSupport: FEATURE_SUPPORT.errorTrackingExceptionAutocapture,
+                component: <ExceptionAutocaptureToggle />,
+                keywords: ['crash', 'bug', 'exception', 'stack trace'],
+            },
+            {
+                id: 'error-tracking-alerting',
+                title: 'Alerting',
+                description: 'Configure alerts to get notified when new errors occur or error rates spike.',
+                component: <ErrorTrackingAlerting />,
+                keywords: ['notification', 'alert', 'threshold', 'spike'],
+            },
+            {
+                id: 'error-tracking-spike-detection',
+                title: 'Spike detection',
+                component: <SpikeDetectionSettings />,
+            },
+            {
+                id: 'error-tracking-rate-limits',
+                title: 'Rate limits',
+                component: <RateLimitSettings />,
+                flag: 'ERROR_TRACKING_RATE_LIMITING',
+                keywords: ['rate', 'limit', 'throttle', 'ingestion', 'cap', 'bypass'],
+            },
+            {
+                id: 'error-tracking-auto-assignment',
+                title: 'Assignment rules',
+                description: 'Automatically assign errors to team members based on rules you define.',
+                component: <AssignmentRules />,
+                keywords: ['assign', 'auto', 'owner', 'team', 'rule', 'routing'],
+            },
+            {
+                id: 'error-tracking-custom-grouping',
+                title: 'Grouping rules',
+                description: 'Define rules for how errors are grouped together into issues.',
+                component: <GroupingRules />,
+                keywords: ['group', 'custom', 'merge', 'fingerprint', 'dedup'],
+            },
+            {
+                id: 'error-tracking-severity-rules',
+                title: 'Severity rules',
+                description: 'Set the initial severity of new issues based on rules you define.',
+                component: <SeverityRules />,
+                keywords: ['severity', 'priority', 'triage', 'critical', 'rule'],
+            },
+            {
+                id: 'error-tracking-suppression-rules',
+                title: 'Suppression rules',
+                description: 'Filter out exceptions that match the given filters.',
+                component: <SuppressionRules />,
+                keywords: ['filter', 'ignore', 'suppress', 'exception', 'type', 'message'],
+            },
+            {
+                id: 'error-tracking-symbol-sets',
+                title: 'Symbol sets',
+                description: 'Upload source maps to get readable stack traces from minified code.',
+                docsUrl: 'https://posthog.com/docs/error-tracking/upload-source-maps',
+                component: <SymbolSets />,
+                keywords: ['source map', 'sourcemap', 'debug', 'minified', 'stack trace'],
+            },
+            {
+                id: 'error-tracking-releases',
+                title: 'Releases',
+                description: 'Track releases to see which version introduced errors and monitor deployment health.',
+                docsUrl: 'https://posthog.com/docs/error-tracking/releases',
+                component: <Releases />,
+                keywords: ['version', 'deploy', 'release', 'regression'],
+            },
+        ],
+    },
+    {
+        level: 'environment',
+        id: 'environment-experiments',
+        title: 'Experiments',
+        group: 'Products',
+        settings: [
+            {
+                id: 'environment-experiment-stats-method',
+                title: 'Default statistical method',
+                description:
+                    'Choose which statistical method to use by default for new experiments in this environment. Individual experiments can override this setting.',
+                docsUrl: 'https://posthog.com/docs/experiments',
+                component: <DefaultExperimentStatsMethod />,
+                keywords: ['bayesian', 'frequentist', 'statistics', 'ab test'],
+            },
+            {
+                id: 'environment-experiment-confidence-level',
+                title: 'Default confidence level',
+                description:
+                    'Higher confidence level reduces false positives but requires more data. Can be overridden per experiment.',
+                component: <DefaultExperimentConfidenceLevel />,
+                keywords: ['confidence', 'significance', 'p-value', 'false positive'],
+            },
+            {
+                id: 'environment-experiment-mde',
+                title: 'Default minimum detectable effect',
+                description:
+                    'The smallest effect size you want to detect with statistical significance. Lower values require more data and longer run times. Can be overridden per experiment.',
+                component: <DefaultMinimumDetectableEffect />,
+                keywords: ['mde', 'effect size', 'sensitivity', 'power', 'sample size'],
+            },
+            {
+                id: 'environment-experiment-recalculation-time',
+                title: 'Daily recalculation time',
+                description:
+                    "Select the time of day when experiment metrics should be recalculated. This time is in your project's timezone.",
+                component: <ExperimentRecalculationTime />,
+                keywords: ['schedule', 'refresh', 'update', 'time'],
+            },
+            {
+                id: 'environment-experiment-matured-users',
+                title: 'Default conversion window filter',
+                description:
+                    'When enabled, new experiments will only count participants whose full conversion window has elapsed. Can be overridden per experiment.',
+                component: <DefaultOnlyCountMaturedUsers />,
+                keywords: ['matured', 'conversion', 'window', 'filter'],
+            },
+            {
+                id: 'environment-experiment-cuped-enabled',
+                title: 'Default CUPED variance reduction',
+                description:
+                    'When enabled, experiments will use CUPED variance reduction. CUPED uses pre-experiment data to detect significant effects faster on supported metrics. Can be overridden per experiment.',
+                component: <DefaultCupedEnabled />,
+                keywords: ['cuped', 'variance', 'reduction', 'pre-experiment', 'covariate'],
+            },
+            {
+                id: 'environment-experiment-cuped-lookback-days',
+                title: 'Default CUPED lookback window',
+                description: `Number of days before the experiment start to use as the pre-experiment window for CUPED. Must be between ${MIN_LOOKBACK_DAYS} and ${MAX_LOOKBACK_DAYS} days. Can be overridden per experiment.`,
+                component: <DefaultCupedLookbackDays />,
+                keywords: ['cuped', 'lookback', 'pre-experiment', 'covariate', 'window'],
+            },
+            {
+                id: 'environment-experiment-sequential-testing-enabled',
+                title: 'Default sequential testing',
+                description:
+                    'When enabled, frequentist experiments will use sequential testing by default, producing always-valid p-values that are robust to peeking. Confidence intervals are wider in exchange. Only applies to the frequentist statistical method. Can be overridden per experiment.',
+                component: <DefaultSequentialTestingEnabled />,
+                keywords: ['sequential', 'peeking', 'always-valid', 'p-value', 'frequentist'],
+            },
+            {
+                id: 'environment-experiment-sequential-tuning-parameter',
+                title: 'Default sequential testing tuning parameter',
+                description:
+                    'Roughly the sample size at which the always-valid confidence sequence is tightest. Set close to the expected total sample size of new experiments to minimize the width penalty. Can be overridden per experiment.',
+                component: <DefaultSequentialTuningParameter />,
+                keywords: ['sequential', 'tuning', 'parameter', 'rho', 'frequentist'],
+            },
+        ],
+    },
+    {
+        level: 'environment',
+        id: 'environment-feature-flags',
+        title: 'Feature flags',
+        group: 'Products',
+        settings: [
+            {
+                id: 'feature-flags-interface',
+                title: 'Flag persistence',
+                description:
+                    'When enabled, all new feature flags will have persistence enabled by default. This ensures consistent user experiences across authentication steps.',
+                docsUrl:
+                    'https://posthog.com/docs/feature-flags/creating-feature-flags#persisting-feature-flags-across-authentication-steps',
+                component: <FlagPersistenceSettings />,
+                keywords: ['flag', 'persistence', 'authentication', 'consistent'],
+            },
+            {
+                id: 'feature-flag-confirmation',
+                title: 'Flag change confirmation',
+                description:
+                    'Show a confirmation modal before saving changes to existing feature flags, helping prevent accidental changes to release conditions.',
+                component: <FlagChangeConfirmationSettings />,
+                keywords: ['confirmation', 'safety', 'change', 'release'],
+            },
+            {
+                id: 'feature-flag-require-tags',
+                title: 'Require tags',
+                description:
+                    'Require every new feature flag to have at least one tag, and stop a tagged flag losing its last one, so flags stay attributable to a team or workstream. Flags created for surveys, experiments, early access features, product tours, and web experiments are exempt.',
+                component: <RequireFeatureFlagTags />,
+                keywords: ['tag', 'tags', 'require', 'governance'],
+            },
+            {
+                id: 'feature-flag-require-evaluation-contexts',
+                title: 'Require evaluation contexts',
+                description:
+                    'Require all new feature flags to have at least one evaluation context before they can be created, preventing flags that are not properly scoped.',
+                docsUrl: 'https://posthog.com/docs/feature-flags/evaluation-contexts',
+                flag: 'FLAG_EVALUATION_TAGS',
+                component: <RequireEvaluationContexts />,
+                keywords: ['evaluation', 'context', 'scope', 'require'],
+            },
+            {
+                id: 'feature-flag-default-evaluation-contexts',
+                title: 'Default evaluation contexts',
+                description:
+                    'Automatically apply default evaluation context tags to newly created feature flags. Users can still modify them during flag creation.',
+                docsUrl: 'https://posthog.com/docs/feature-flags/evaluation-contexts',
+                flag: 'DEFAULT_EVALUATION_ENVIRONMENTS',
+                component: <DefaultEvaluationContexts />,
+                keywords: ['evaluation', 'default', 'context', 'tag'],
+            },
+            {
+                id: 'feature-flag-default-release-conditions',
+                title: 'Default release conditions',
+                description:
+                    'Automatically apply default release conditions to newly created feature flags. Users can still modify them during flag creation.',
+                component: <DefaultReleaseConditions />,
+                keywords: ['release', 'conditions', 'default', 'rollout', 'groups'],
+            },
+            {
+                id: 'feature-flag-evaluation-context-suggestions',
+                title: 'Evaluation context suggestions',
+                description:
+                    'Manage which evaluation context names are suggested when scoping a feature flag. Hide stale or mistyped names from the suggestion list without affecting flags that already use them.',
+                docsUrl: 'https://posthog.com/docs/feature-flags/evaluation-contexts',
+                flag: 'FLAG_EVALUATION_TAGS',
+                component: <EvaluationContextSuggestions />,
+                keywords: ['evaluation', 'context', 'suggestion', 'hide', 'tag'],
+            },
+            {
+                id: 'feature-flag-secure-api-key',
+                title: 'Feature flags secure API key',
+                description: (
+                    <FlaggedFeature
+                        flag={FEATURE_FLAGS.PROJECT_SECRET_API_KEYS}
+                        fallback="Use this key for local evaluation of feature flags or remote config settings. Replaces personal API keys for local evaluation."
+                    >
+                        Deprecated. This key is still usable for local evaluation of feature flags or remote config
+                        settings, but new integrations should use a project secret API key with the feature_flag:read
+                        scope instead.
+                    </FlaggedFeature>
+                ),
+                searchDescription:
+                    'Use this key for local evaluation of feature flags or remote config settings. Replaces personal API keys for local evaluation.',
+                docsUrl: 'https://posthog.com/docs/feature-flags/local-evaluation',
+                component: <FlagsSecureApiKeys />,
+                keywords: ['api key', 'secret', 'local evaluation', 'remote config'],
+            },
+        ],
+    },
+    {
+        level: 'environment',
+        id: 'environment-heatmaps',
+        title: 'Heatmaps',
+        group: 'Products',
+        settings: [
+            {
+                id: 'heatmaps',
+                title: 'Heatmaps',
+                description:
+                    'Capture general clicks, mouse movements, and scrolling to create heatmaps. No additional events are created. Heatmaps are generated based on overall mouse or touch positions, useful for understanding general user behavior.',
+                docsUrl: 'https://posthog.com/docs/toolbar/heatmaps',
+                platformSupport: FEATURE_SUPPORT.heatmaps,
+                component: <HeatmapsSettings />,
+                keywords: ['click map', 'scroll', 'rage click', 'mouse', 'touch'],
+            },
+        ],
+    },
+    {
+        level: 'environment',
+        id: 'environment-logs',
+        title: 'Logs',
+        group: 'Products',
+        settings: [
+            {
+                id: 'logs',
+                title: 'Logs',
+                description:
+                    'Automatically capture browser console logs and send them to the Logs product for analysis and debugging. This is separate from session replay console log capture.',
+                docsUrl: 'https://posthog.com/docs/logs',
+                platformSupport: FEATURE_SUPPORT.logsCapture,
+                component: <LogsCaptureSettings />,
+                keywords: ['log', 'capture', 'collect', 'ingest', 'console'],
+            },
+            {
+                id: 'logs-json-parse',
+                title: 'JSON parse logs',
+                description:
+                    'Parse log lines that are valid JSON and add their fields as log attributes that can be used in filters.',
+                component: <LogsJsonParseSettings />,
+                flag: 'LOGS_SETTINGS_JSON',
+                keywords: ['json', 'parse', 'structured', 'format'],
+            },
+            {
+                id: 'logs-pii-scrub',
+                title: 'PII scrubbing',
+                description:
+                    'Remove or mask common personally identifiable information from log payloads during ingestion.',
+                component: <LogsPiiScrubSettings />,
+                flag: 'LOGS_SETTINGS_PII_SCRUB',
+                keywords: ['pii', 'privacy', 'gdpr', 'redact', 'mask', 'scrub', 'sensitive'],
+            },
+            {
+                id: 'logs-distinct-id-attribute-key',
+                title: 'Link to person',
+                description: (
+                    <>
+                        The log attributes PostHog reads to identify which person a log belongs to. A log is linked when
+                        any of these attributes matches one of the person&apos;s distinct IDs. Defaults to{' '}
+                        <code>posthogDistinctId</code>, the key the JavaScript and React Native SDKs auto-attach. Add
+                        keys only if your backend pipeline emits the person identifier under different attributes.
+                    </>
+                ),
+                searchDescription:
+                    "The log attributes PostHog reads to identify which person a log belongs to. A log is linked when any of these attributes matches one of the person's distinct IDs. Defaults to posthogDistinctId, the key the JavaScript and React Native SDKs auto-attach. Add keys only if your backend pipeline emits the person identifier under different attributes.",
+                component: <LogsDistinctIdAttributeKeys />,
+                keywords: ['log', 'person', 'distinct', 'attribute', 'pivot', 'profile', 'link'],
+            },
+            {
+                id: 'logs-session-id-attribute-keys',
+                title: 'Link to session',
+                description: (
+                    <>
+                        The log attributes PostHog reads to identify which session a log belongs to, checked in order
+                        with the first match winning, followed by other common session ID attributes. Defaults to{' '}
+                        <code>sessionId</code>, the key the JavaScript and React Native SDKs auto-attach. Add keys only
+                        if your pipeline emits the session ID under different attributes.
+                    </>
+                ),
+                searchDescription:
+                    'The log attributes PostHog reads to identify which session a log belongs to, checked in order with the first match winning, followed by other common session ID attributes. Defaults to sessionId, the key the JavaScript and React Native SDKs auto-attach. Add keys only if your pipeline emits the session ID under different attributes.',
+                component: <LogsSessionIdAttributeKeys />,
+                keywords: ['log', 'session', 'replay', 'attribute', 'link'],
+            },
+            {
+                id: 'logs-retention',
+                title: 'Retention',
+                description: (
+                    <span>
+                        How long to retain logs before they are automatically deleted.{' '}
+                        <strong>Changes only affect the retention for new logs</strong>. You can only change this
+                        setting at most once per 24 hours.
+                    </span>
+                ),
+                component: <LogsRetentionSettings />,
+                keywords: ['retention', 'storage', 'delete', 'ttl'],
+            },
+            {
+                id: 'logs-drop-rules',
+                title: 'Drop rules',
+                description:
+                    'Drop matching log lines before storage using ordered rules. Rules run in ingestion order (after optional scrub and JSON parse).',
+                component: <LogsSamplingSection />,
+                keywords: ['drop', 'exclude', 'filter', 'rules', 'path', 'attribute', 'volume', 'noise'],
+            },
+            {
+                id: 'logs-metric-rules',
+                title: 'Log-based metrics',
+                description:
+                    'Generate metrics from your logs at ingestion time. Metrics are computed before drop rules, so you can drop noisy logs and keep the trend.',
+                component: <LogsMetricRulesSection />,
+                flag: 'METRICS',
+                keywords: ['metric', 'metrics', 'log-based', 'generate', 'count', 'aggregate', 'logs to metrics'],
+            },
+            {
+                id: 'logs-retention-rules',
+                title: 'Retention rules',
+                description:
+                    "Keep matching logs longer or shorter than the environment default using ordered rules. The first matching rule sets a log's retention; retention is applied at ingest.",
+                component: <LogsRetentionSection />,
+                flag: LogsFeatureFlagKeys.retentionRules,
+                keywords: ['retention', 'storage', 'ttl', 'rules', 'filter', 'keep', 'expire'],
+            },
+            {
+                id: 'logs-alerting',
+                title: 'Alerting',
+                description: 'Configure alerts to get notified when log volumes breach thresholds.',
+                component: <LogsAlertingSection />,
+                keywords: ['notification', 'alert', 'threshold', 'logs'],
+            },
+        ],
+    },
+    {
+        level: 'environment',
+        id: 'environment-marketing-analytics',
+        title: 'Marketing analytics',
+        flag: 'WEB_ANALYTICS_MARKETING',
+        group: 'Products',
+        settings: [
+            {
+                id: 'marketing-settings',
+                title: 'Marketing settings',
+                description: 'Configure tracking and attribution settings for marketing analytics.',
+                docsUrl: 'https://posthog.com/docs/web-analytics/marketing-analytics',
+                component: <MarketingAnalyticsSettingsWrapper />,
+                keywords: ['utm', 'attribution', 'campaign', 'channel', 'marketing'],
+            },
         ],
     },
     {
@@ -406,24 +993,8 @@ export const SETTINGS_MAP: SettingSection[] = [
         group: 'Products',
         settings: [
             {
-                id: 'internal-user-filtering',
-                title: 'Filter out internal and test users',
-                description:
-                    'Define filters to exclude internal users and test accounts from your analytics. Filtered users will not appear in insights by default.',
-                docsUrl: 'https://posthog.com/tutorials/filter-internal-users',
-                component: <ProjectAccountFiltersSetting />,
-                keywords: ['test account', 'internal', 'exclude', 'filter'],
-            },
-            {
                 id: 'data-theme',
-                title: (
-                    <>
-                        Chart color themes
-                        <LemonTag type="warning" className="ml-1 uppercase">
-                            Beta
-                        </LemonTag>
-                    </>
-                ),
+                title: 'Chart color themes',
                 description: 'Customize the color palette used in charts and visualizations.',
                 component: <DataColorThemes />,
                 keywords: ['color', 'palette', 'chart', 'visualization'],
@@ -454,6 +1025,15 @@ export const SETTINGS_MAP: SettingSection[] = [
                 docsUrl: 'https://posthog.com/docs/data/persons',
                 component: <PersonDisplayNameProperties />,
                 keywords: ['name', 'email', 'identity', 'display'],
+            },
+            {
+                id: 'person-last-seen-at',
+                title: 'Person last seen tracking',
+                description:
+                    'When enabled, PostHog tracks when each person was last active. The value updates hourly and is visible in the People list.',
+                docsUrl: 'https://posthog.com/docs/data/persons',
+                component: <PersonLastSeenAtEnabled />,
+                keywords: ['person', 'last seen', 'activity', 'tracking'],
             },
             {
                 id: 'path-cleaning',
@@ -503,22 +1083,6 @@ export const SETTINGS_MAP: SettingSection[] = [
     },
     {
         level: 'environment',
-        id: 'environment-privacy',
-        title: 'Privacy',
-        settings: [
-            {
-                id: 'datacapture',
-                title: 'IP data capture configuration',
-                description:
-                    'When enabled, client IP addresses will not be stored with your events. Transformations like GeoIP enrichment and bot detection can still use the IP before it is discarded.',
-                docsUrl: 'https://posthog.com/docs/privacy',
-                component: <IPCapture />,
-                keywords: ['ip', 'anonymize', 'gdpr', 'privacy', 'geolocation', 'discard'],
-            },
-        ],
-    },
-    {
-        level: 'environment',
         id: 'environment-revenue-analytics',
         title: 'Revenue analytics',
         group: 'Products',
@@ -528,21 +1092,16 @@ export const SETTINGS_MAP: SettingSection[] = [
         },
         settings: [
             {
+                // FIXME: remove from "Revenue definitions" page
                 id: 'revenue-base-currency',
                 title: 'Base currency',
                 description: 'Set the base currency for revenue analytics calculations.',
-                component: (
-                    <AccessControlAction
-                        resourceType={AccessControlResourceType.RevenueAnalytics}
-                        minAccessLevel={AccessControlLevel.Editor}
-                    >
-                        <BaseCurrency hideTitle />
-                    </AccessControlAction>
-                ),
+                component: <BaseCurrency hideTitle />,
                 hideWhenNoSection: true,
                 keywords: ['money', 'currency', 'usd', 'eur'],
             },
             {
+                // FIXME: remove from "Revenue definitions" page
                 id: 'revenue-analytics-filter-test-accounts',
                 title: 'Filter out internal and test users from revenue analytics',
                 description: 'Exclude test accounts from revenue calculations and reports.',
@@ -550,13 +1109,7 @@ export const SETTINGS_MAP: SettingSection[] = [
                 keywords: ['test account', 'internal', 'exclude', 'filter', 'revenue'],
             },
             {
-                id: 'revenue-analytics-goals',
-                title: 'Revenue goals',
-                description: 'Set revenue targets to track performance against your business objectives.',
-                component: <GoalsConfiguration />,
-                keywords: ['target', 'mrr', 'arr', 'goal'],
-            },
-            {
+                // FIXME: should not be in settings
                 id: 'revenue-analytics-events',
                 title: 'Revenue events',
                 description: 'Configure which events represent revenue-generating actions.',
@@ -565,135 +1118,12 @@ export const SETTINGS_MAP: SettingSection[] = [
                 keywords: ['purchase', 'payment', 'subscription', 'charge'],
             },
             {
+                // FIXME: should not be in settings
                 id: 'revenue-analytics-external-data-sources',
                 title: 'External data sources',
                 description: 'Connect external data sources like Stripe for revenue tracking.',
                 component: <ExternalDataSourceConfiguration />,
                 keywords: ['stripe', 'import', 'sync', 'data warehouse'],
-            },
-        ],
-    },
-    {
-        level: 'environment',
-        id: 'environment-llm-analytics',
-        title: 'LLM analytics',
-        group: 'Products',
-        flag: 'LLM_ANALYTICS_EVALUATIONS',
-        accessControl: {
-            resourceType: AccessControlResourceType.LlmAnalytics,
-            minimumAccessLevel: AccessControlLevel.Editor,
-        },
-        settings: [
-            {
-                id: 'llm-analytics-byok',
-                title: 'Bring Your Own Key (BYOK)',
-                description:
-                    'Add and manage provider API keys for LLM analytics features, including evaluations and playground.',
-                component: <LLMProviderKeysSettings />,
-                docsUrl: 'https://posthog.com/docs/llm-analytics/evaluations',
-                keywords: ['llm', 'provider', 'api key', 'openai', 'anthropic', 'gemini', 'playground'],
-            },
-        ],
-    },
-    {
-        level: 'environment',
-        id: 'environment-marketing-analytics',
-        title: 'Marketing analytics',
-        flag: 'WEB_ANALYTICS_MARKETING',
-        group: 'Products',
-        settings: [
-            {
-                id: 'marketing-settings',
-                title: 'Marketing settings',
-                description: 'Configure tracking and attribution settings for marketing analytics.',
-                docsUrl: 'https://posthog.com/docs/web-analytics/marketing-analytics',
-                component: <MarketingAnalyticsSettingsWrapper />,
-                keywords: ['utm', 'attribution', 'campaign', 'channel', 'marketing'],
-            },
-        ],
-    },
-    {
-        level: 'environment',
-        id: 'environment-web-analytics',
-        title: 'Web analytics',
-        group: 'Products',
-        settings: [
-            {
-                id: 'web-analytics-authorized-urls',
-                title: 'Web analytics domains',
-                description:
-                    'Configure which domains are tracked in web analytics. Wildcards are not allowed — URLs must be concrete and launchable.',
-                component: <TeamAuthorizedURLs />,
-                keywords: ['domain', 'website', 'url'],
-            },
-            {
-                id: 'channel-type',
-                title: 'Custom channel type',
-                description: 'Define custom rules for categorizing traffic sources into channels.',
-                docsUrl: 'https://posthog.com/docs/data/channel-type',
-                component: <CustomChannelTypes />,
-                keywords: ['utm', 'source', 'medium', 'referrer', 'attribution'],
-            },
-            {
-                id: 'cookieless-server-hash-mode',
-                title: 'Cookieless server hash mode',
-                description:
-                    'Enable cookieless tracking using a privacy-preserving hash to count unique users without cookies. You must enable this here before enabling cookieless in posthog-js.',
-                docsUrl: 'https://posthog.com/docs/web-analytics/cookieless-tracking',
-                component: <CookielessServerHashModeSetting />,
-                keywords: ['cookie', 'privacy', 'gdpr', 'tracking', 'consent'],
-            },
-            {
-                id: 'bounce-rate-duration',
-                title: 'Bounce rate duration',
-                description:
-                    'Set how long a user can stay on a page (in seconds) before the session is not counted as a bounce. Default is 10 seconds.',
-                docsUrl: 'https://posthog.com/docs/web-analytics/bounce-rate',
-                component: <BounceRateDurationSetting />,
-                keywords: ['bounce', 'session', 'duration', 'seconds'],
-            },
-            {
-                id: 'bounce-rate-page-view-mode',
-                title: 'Bounce rate page view mode',
-                description:
-                    'Choose how pageviews are counted as part of the bounce rate calculation. Other factors like autocaptures and session duration are also considered.',
-                component: <BounceRatePageViewModeSetting />,
-                flag: 'SETTINGS_BOUNCE_RATE_PAGE_VIEW_MODE',
-                keywords: ['bounce', 'pageview', 'url', 'calculation'],
-            },
-            {
-                id: 'session-join-mode',
-                title: 'Session join mode',
-                description:
-                    "Choose which join mode to use for sessions. Don't change this unless you know what you're doing.",
-                component: <SessionsV2JoinModeSettings />,
-                flag: 'SETTINGS_SESSIONS_V2_JOIN',
-                keywords: ['session', 'join', 'string', 'uuid'],
-            },
-            {
-                id: 'web-analytics-pre-aggregated-tables',
-                title: 'Pre-aggregated tables',
-                description: 'Configure pre-aggregated tables to speed up web analytics queries.',
-                component: <PreAggregatedTablesSetting />,
-                flag: 'SETTINGS_WEB_ANALYTICS_PRE_AGGREGATED_TABLES',
-                keywords: ['performance', 'speed', 'query', 'materialized'],
-            },
-            {
-                id: 'web-analytics-opt-in-pre-aggregated-tables-and-api',
-                title: 'New query engine',
-                description: 'Enable the new pre-aggregated query engine for faster web analytics.',
-                component: <WebAnalyticsEnablePreAggregatedTables />,
-                flag: 'WEB_ANALYTICS_API',
-                keywords: ['performance', 'speed', 'query', 'api'],
-            },
-            {
-                id: 'web-vitals-autocapture',
-                title: 'Web vitals autocapture',
-                description: "Capture Google Chrome's web vitals metrics for web analytics performance tracking.",
-                docsUrl: 'https://posthog.com/docs/web-analytics/web-vitals',
-                platformSupport: FEATURE_SUPPORT.webVitals,
-                component: <WebVitalsAutocaptureSettings />,
-                keywords: ['lcp', 'cls', 'fcp', 'inp', 'performance', 'core web vitals'],
             },
         ],
     },
@@ -771,15 +1201,6 @@ export const SETTINGS_MAP: SettingSection[] = [
                 keywords: ['headers', 'payload', 'body', 'request', 'response'],
             },
             {
-                id: 'web-vitals-autocapture',
-                title: 'Web vitals',
-                description: 'Capture web vitals metrics alongside session recordings for performance analysis.',
-                docsUrl: 'https://posthog.com/docs/web-analytics/web-vitals',
-                platformSupport: FEATURE_SUPPORT.webVitals,
-                component: <WebVitalsAutocaptureSettings />,
-                keywords: ['lcp', 'cls', 'fcp', 'inp', 'performance'],
-            },
-            {
                 id: 'replay-authorized-domains',
                 title: 'Authorized domains for replay',
                 description:
@@ -791,14 +1212,7 @@ export const SETTINGS_MAP: SettingSection[] = [
             },
             {
                 id: 'replay-retention',
-                title: (
-                    <>
-                        Data retention
-                        <LemonTag type="success" className="ml-1 uppercase">
-                            New
-                        </LemonTag>
-                    </>
-                ),
+                title: 'Data retention',
                 description:
                     'Control how long your recordings are stored. Changes only affect the retention period for future recordings.',
                 component: <ReplayDataRetentionSettings />,
@@ -806,14 +1220,7 @@ export const SETTINGS_MAP: SettingSection[] = [
             },
             {
                 id: 'replay-integrations',
-                title: (
-                    <>
-                        Integrations
-                        <LemonTag type="success" className="ml-1 uppercase">
-                            New
-                        </LemonTag>
-                    </>
-                ),
+                title: 'Integrations',
                 description: 'Configure integrations to create and link issues from session replays.',
                 component: <ReplayIntegrations />,
                 keywords: ['integration', 'connect', 'third-party'],
@@ -822,19 +1229,82 @@ export const SETTINGS_MAP: SettingSection[] = [
     },
     {
         level: 'environment',
-        id: 'environment-heatmaps',
-        title: 'Heatmaps',
+        id: 'environment-conversations',
+        title: 'Support',
         group: 'Products',
         settings: [
             {
-                id: 'heatmaps',
-                title: 'Heatmaps',
+                id: 'conversations-general',
+                title: 'General',
+                component: <GeneralSection />,
+                keywords: [
+                    'conversation',
+                    'ticket',
+                    'message',
+                    'support',
+                    'general',
+                    'api',
+                    'domain',
+                    'identity',
+                    'secret',
+                    'channel',
+                    'widget',
+                    'email',
+                    'slack',
+                    'teams',
+                    'microsoft',
+                ],
+            },
+            {
+                id: 'conversations-notifications',
+                title: 'Notifications',
                 description:
-                    'Capture general clicks, mouse movements, and scrolling to create heatmaps. No additional events are created. Heatmaps are generated based on overall mouse or touch positions, useful for understanding general user behavior.',
-                docsUrl: 'https://posthog.com/docs/toolbar/heatmaps',
-                platformSupport: FEATURE_SUPPORT.heatmaps,
-                component: <HeatmapsSettings />,
-                keywords: ['click map', 'scroll', 'rage click', 'mouse', 'touch'],
+                    'We recommend setting up a workflow for fine-grained automation — Slack pings, SLA escalations, auto-tagging. For the basics, configure email or browser notifications.',
+                component: <NotificationsSection />,
+                allowForTeam: (t) => !!t?.conversations_enabled,
+                keywords: [
+                    'conversation',
+                    'ticket',
+                    'message',
+                    'support',
+                    'notification',
+                    'workflow',
+                    'email',
+                    'browser',
+                ],
+            },
+            {
+                id: 'conversations-imports',
+                title: (
+                    <>
+                        Imports
+                        <LemonTag type="highlight" size="small" className="ml-1">
+                            Beta
+                        </LemonTag>
+                    </>
+                ),
+                description: 'Import historical support data from external tools into Support.',
+                component: <ZendeskImportSection />,
+                flag: 'PRODUCT_SUPPORT_IMPORT_TICKETS',
+                allowForTeam: (t) => !!t?.conversations_enabled,
+                keywords: ['import', 'zendesk', 'migrate', 'ticket', 'support', 'conversation'],
+            },
+            {
+                id: 'conversations-ai',
+                title: (
+                    <>
+                        AI agent
+                        <LemonTag type="highlight" size="small" className="ml-1">
+                            Beta
+                        </LemonTag>
+                    </>
+                ),
+                description:
+                    'Automatically generate AI-powered reply suggestions grounded in your business knowledge sources.',
+                component: <AISection />,
+                flag: 'PRODUCT_SUPPORT_AI_SUGGESTION',
+                allowForTeam: (t) => !!t?.conversations_enabled,
+                keywords: ['ai', 'agent', 'suggestion', 'auto', 'reply', 'support', 'conversation', 'beta'],
             },
         ],
     },
@@ -867,213 +1337,177 @@ export const SETTINGS_MAP: SettingSection[] = [
     },
     {
         level: 'environment',
-        id: 'environment-feature-flags',
-        title: 'Feature flags',
+        id: 'environment-tracing',
+        title: 'Tracing',
         group: 'Products',
+        flag: ['TRACING', 'TRACING_SESSION_PERSON_LINKS'],
         settings: [
             {
-                id: 'feature-flags-interface',
-                title: 'Flag persistence',
-                description:
-                    'When enabled, all new feature flags will have persistence enabled by default. This ensures consistent user experiences across authentication steps.',
-                docsUrl:
-                    'https://posthog.com/docs/feature-flags/creating-feature-flags#persisting-feature-flags-across-authentication-steps',
-                component: <FlagPersistenceSettings />,
-                keywords: ['flag', 'persistence', 'authentication', 'consistent'],
+                id: 'tracing-distinct-id-attribute-keys',
+                title: 'Link to person',
+                description: (
+                    <>
+                        The span attributes PostHog reads to identify which person a trace belongs to. A span is linked
+                        when any of these attributes holds one of the person&apos;s distinct IDs. Defaults to{' '}
+                        <code>posthogDistinctId</code>. Add keys only if your pipeline emits the person identifier under
+                        different attributes.
+                    </>
+                ),
+                searchDescription:
+                    "The span attributes PostHog reads to identify which person a trace belongs to. A span is linked when any of these attributes holds one of the person's distinct IDs. Defaults to posthogDistinctId. Add keys only if your pipeline emits the person identifier under different attributes.",
+                component: <TracingDistinctIdAttributeKeys />,
+                keywords: ['trace', 'span', 'person', 'distinct', 'attribute', 'pivot', 'profile', 'link'],
             },
             {
-                id: 'feature-flag-confirmation',
-                title: 'Flag change confirmation',
-                description:
-                    'Show a confirmation modal before saving changes to existing feature flags, helping prevent accidental changes to release conditions.',
-                component: <FlagChangeConfirmationSettings />,
-                keywords: ['confirmation', 'safety', 'change', 'release'],
-            },
-            {
-                id: 'feature-flag-require-evaluation-contexts',
-                title: 'Require evaluation contexts',
-                description:
-                    'Require all new feature flags to have at least one evaluation context before they can be created, preventing flags that are not properly scoped.',
-                docsUrl: 'https://posthog.com/docs/feature-flags/evaluation-contexts',
-                flag: 'FLAG_EVALUATION_TAGS',
-                component: <RequireEvaluationContexts />,
-                keywords: ['evaluation', 'context', 'scope', 'require'],
-            },
-            {
-                id: 'feature-flag-default-evaluation-contexts',
-                title: 'Default evaluation contexts',
-                description:
-                    'Automatically apply default evaluation context tags to newly created feature flags. Users can still modify them during flag creation.',
-                docsUrl: 'https://posthog.com/docs/feature-flags/evaluation-contexts',
-                flag: 'DEFAULT_EVALUATION_ENVIRONMENTS',
-                component: <DefaultEvaluationContexts />,
-                keywords: ['evaluation', 'default', 'context', 'tag'],
-            },
-            {
-                id: 'feature-flag-secure-api-key',
-                title: 'Feature flags secure API key',
-                description:
-                    'Use this key for local evaluation of feature flags or remote config settings. Replaces personal API keys for local evaluation.',
-                docsUrl: 'https://posthog.com/docs/feature-flags/local-evaluation',
-                component: <FlagsSecureApiKeys />,
-                keywords: ['api key', 'secret', 'local evaluation', 'remote config'],
+                id: 'tracing-session-id-attribute-keys',
+                title: 'Link to session',
+                description: (
+                    <>
+                        The span attributes PostHog reads to identify which session a trace belongs to, checked in order
+                        with the first match winning, followed by other common session ID attributes. Defaults to{' '}
+                        <code>sessionId</code>. Add keys only if your pipeline emits the session ID under different
+                        attributes.
+                    </>
+                ),
+                searchDescription:
+                    'The span attributes PostHog reads to identify which session a trace belongs to, checked in order with the first match winning, followed by other common session ID attributes. Defaults to sessionId. Add keys only if your pipeline emits the session ID under different attributes.',
+                component: <TracingSessionIdAttributeKeys />,
+                keywords: ['trace', 'span', 'session', 'replay', 'attribute', 'link'],
             },
         ],
     },
     {
         level: 'environment',
-        id: 'environment-experiments',
-        title: 'Experiments',
+        id: 'environment-web-analytics',
+        title: 'Web analytics',
         group: 'Products',
         settings: [
             {
-                id: 'environment-experiment-stats-method',
-                title: 'Default statistical method',
+                id: 'web-analytics-authorized-urls',
+                title: 'Web analytics domains',
                 description:
-                    'Choose which statistical method to use by default for new experiments in this environment. Individual experiments can override this setting.',
-                docsUrl: 'https://posthog.com/docs/experiments',
-                component: <DefaultExperimentStatsMethod />,
-                keywords: ['bayesian', 'frequentist', 'statistics', 'ab test'],
+                    'Configure which domains are tracked in web analytics. Wildcards are not allowed — URLs must be concrete and launchable.',
+                component: <TeamAuthorizedURLs />,
+                keywords: ['domain', 'website', 'url'],
             },
             {
-                id: 'environment-experiment-confidence-level',
-                title: 'Default confidence level',
-                description:
-                    'Higher confidence level reduces false positives but requires more data. Can be overridden per experiment.',
-                component: <DefaultExperimentConfidenceLevel />,
-                keywords: ['confidence', 'significance', 'p-value', 'false positive'],
+                id: 'channel-type',
+                title: 'Custom channel type',
+                description: 'Define custom rules for categorizing traffic sources into channels.',
+                docsUrl: 'https://posthog.com/docs/data/channel-type',
+                component: <CustomChannelTypes />,
+                keywords: ['utm', 'source', 'medium', 'referrer', 'attribution'],
             },
             {
-                id: 'environment-experiment-recalculation-time',
-                title: 'Daily recalculation time',
+                id: 'cookieless-server-hash-mode',
+                title: 'Cookieless tracking',
                 description:
-                    "Select the time of day when experiment metrics should be recalculated. This time is in your project's timezone.",
-                component: <ExperimentRecalculationTime />,
-                keywords: ['schedule', 'refresh', 'update', 'time'],
+                    'Count unique users with a privacy-preserving hash instead of cookies. Enable this here, then enable cookieless mode in posthog-js.',
+                docsUrl: 'https://posthog.com/tutorials/cookieless-tracking',
+                component: <CookielessServerHashModeSetting />,
+                keywords: ['cookie', 'privacy', 'gdpr', 'tracking', 'consent'],
+            },
+            {
+                id: 'bounce-rate-duration',
+                title: 'Bounce rate duration',
+                description:
+                    'Set how long a user can stay on a page (in seconds) before the session is not counted as a bounce. Default is 10 seconds.',
+                docsUrl: 'https://posthog.com/tutorials/bounce-rate',
+                component: <BounceRateDurationSetting />,
+                keywords: ['bounce', 'session', 'duration', 'seconds'],
+            },
+            {
+                id: 'bounce-rate-page-view-mode',
+                title: 'Bounce rate page view mode',
+                description:
+                    'Choose how pageviews are counted as part of the bounce rate calculation. Other factors like autocaptures and session duration are also considered.',
+                component: <BounceRatePageViewModeSetting />,
+                flag: 'SETTINGS_BOUNCE_RATE_PAGE_VIEW_MODE',
+                keywords: ['bounce', 'pageview', 'url', 'calculation'],
+            },
+            {
+                id: 'session-join-mode',
+                title: 'Session join mode',
+                description:
+                    "Choose which join mode to use for sessions. Don't change this unless you know what you're doing.",
+                component: <SessionsV2JoinModeSettings />,
+                flag: 'SETTINGS_SESSIONS_V2_JOIN',
+                keywords: ['session', 'join', 'string', 'uuid'],
+            },
+            {
+                id: 'web-analytics-pre-aggregated-tables',
+                title: 'Pre-aggregated tables',
+                description: 'Configure pre-aggregated tables to speed up web analytics queries.',
+                component: <PreAggregatedTablesSetting />,
+                flag: 'SETTINGS_WEB_ANALYTICS_PRE_AGGREGATED_TABLES',
+                keywords: ['performance', 'speed', 'query', 'materialized'],
+            },
+            {
+                id: 'web-analytics-opt-in-pre-aggregated-tables-and-api',
+                title: 'New query engine',
+                description: 'Enable the new pre-aggregated query engine for faster web analytics.',
+                component: <WebAnalyticsEnablePreAggregatedTables />,
+                flag: 'WEB_ANALYTICS_API',
+                keywords: ['performance', 'speed', 'query', 'api'],
+            },
+            {
+                id: 'web-vitals-autocapture',
+                title: 'Web vitals autocapture',
+                description: "Capture Google Chrome's web vitals metrics for web analytics performance tracking.",
+                docsUrl: 'https://posthog.com/docs/web-analytics/web-vitals',
+                platformSupport: FEATURE_SUPPORT.webVitals,
+                component: <WebVitalsAutocaptureSettings />,
+                keywords: ['lcp', 'cls', 'fcp', 'inp', 'performance', 'core web vitals'],
             },
         ],
     },
     {
         level: 'environment',
-        id: 'environment-error-tracking',
-        title: 'Error tracking',
+        id: 'environment-workflows',
+        title: 'Workflows',
         group: 'Products',
         settings: [
             {
-                id: 'error-tracking-exception-autocapture',
-                title: 'Exception autocapture',
+                id: 'workflows-engagement-events',
+                title: 'Engagement events',
                 description:
-                    'Automatically capture frontend exceptions using onError and onUnhandledRejection listeners in the web JavaScript SDK.',
-                docsUrl: 'https://posthog.com/docs/error-tracking',
-                platformSupport: FEATURE_SUPPORT.errorTrackingExceptionAutocapture,
-                component: <ExceptionAutocaptureToggle />,
-                keywords: ['crash', 'bug', 'exception', 'stack trace'],
+                    'When enabled, email engagement activity (sent, delivered, opened, link clicked, bounced, blocked, failed) is captured as standard PostHog events alongside the existing workflow metrics. This lets you build insights, funnels, and dashboards from workflows data. These events count toward your event usage and are billed like any other event. This setting only controls event capture: it does not disable open and click tracking itself. To stop tracking opens and clicks for an email, turn off "Track opens and link clicks" on that email step.',
+                docsUrl: 'https://posthog.com/docs/workflows/engagement-events',
+                component: <WorkflowsEngagementEventsSettings />,
+                keywords: [
+                    'workflows',
+                    'email',
+                    'engagement',
+                    'events',
+                    'capture',
+                    'tracking',
+                    'sent',
+                    'delivered',
+                    'opened',
+                    'clicked',
+                    'bounced',
+                    'blocked',
+                    'failed',
+                ],
             },
             {
-                id: 'error-tracking-suppression-rules',
-                title: 'Suppression rules',
+                id: 'workflows-email-tracking-consent',
+                title: 'Email tracking consent',
                 description:
-                    'Filter autocaptured exceptions by type or message to skip capturing certain exceptions in the web SDK.',
-                platformSupport: FEATURE_SUPPORT.errorTrackingSuppressionRules,
-                component: <ExceptionSuppressionRules />,
-                keywords: ['filter', 'ignore', 'suppress', 'exception', 'type', 'message'],
-            },
-            {
-                id: 'error-tracking-ingestion-controls',
-                title: 'Autocapture controls',
-                description: 'Selectively enable exception autocapture based on the user or scenario.',
-                platformSupport: FEATURE_SUPPORT.errorTrackingSuppressionRules,
-                component: <ExceptionIngestionControls />,
-                flag: 'ERROR_TRACKING_INGESTION_CONTROLS',
-                keywords: ['ingestion', 'control', 'selective', 'autocapture'],
-            },
-            {
-                id: 'error-tracking-alerting',
-                title: 'Alerting',
-                description: 'Configure alerts to get notified when new errors occur or error rates spike.',
-                component: <ErrorTrackingAlerting />,
-                keywords: ['notification', 'alert', 'threshold', 'spike'],
-            },
-            {
-                id: 'error-tracking-spike-detection',
-                title: 'Spike detection',
-                component: <SpikeDetectionSettings />,
-                flag: 'ERROR_TRACKING_SPIKE_ALERTING',
-            },
-            {
-                id: 'error-tracking-auto-assignment',
-                title: 'Auto assignment rules',
-                description: 'Automatically assign errors to team members based on rules you define.',
-                component: <AutoAssignmentRules />,
-                keywords: ['assign', 'owner', 'team', 'rule', 'routing'],
-            },
-            {
-                id: 'error-tracking-custom-grouping',
-                title: 'Custom grouping rules',
-                description: 'Define rules for how errors are grouped together into issues.',
-                component: <CustomGroupingRules />,
-                keywords: ['group', 'merge', 'fingerprint', 'dedup'],
-            },
-            {
-                id: 'error-tracking-integrations',
-                title: 'Integrations',
-                description: 'Connect error tracking with external services like Sentry or PagerDuty.',
-                component: <ErrorTrackingIntegrations />,
-                keywords: ['sentry', 'pagerduty', 'integration', 'connect'],
-            },
-            {
-                id: 'error-tracking-symbol-sets',
-                title: 'Symbol sets',
-                description: 'Upload source maps to get readable stack traces from minified code.',
-                docsUrl: 'https://posthog.com/docs/error-tracking/source-maps',
-                component: <SymbolSets />,
-                keywords: ['source map', 'sourcemap', 'debug', 'minified', 'stack trace'],
-            },
-            {
-                id: 'error-tracking-releases',
-                title: 'Releases',
-                description: 'Track releases to see which version introduced errors and monitor deployment health.',
-                docsUrl: 'https://posthog.com/docs/error-tracking/releases',
-                component: <Releases />,
-                keywords: ['version', 'deploy', 'release', 'regression'],
-            },
-        ],
-    },
-    {
-        level: 'environment',
-        id: 'environment-logs',
-        title: 'Logs',
-        flag: 'LOGS_SETTINGS',
-        group: 'Products',
-        settings: [
-            {
-                id: 'logs',
-                title: 'Logs',
-                description:
-                    'Automatically capture browser console logs and send them to the Logs product for analysis and debugging. This is separate from session replay console log capture.',
-                docsUrl: 'https://posthog.com/docs/logs',
-                platformSupport: FEATURE_SUPPORT.logsCapture,
-                component: <LogsCaptureSettings />,
-                flag: 'LOGS_SETTINGS',
-                keywords: ['log', 'capture', 'collect', 'ingest', 'console'],
-            },
-            {
-                id: 'logs-json-parse',
-                title: 'JSON parse logs',
-                description:
-                    'Parse log lines that are valid JSON and add their fields as log attributes that can be used in filters.',
-                component: <LogsJsonParseSettings />,
-                flag: 'LOGS_SETTINGS_JSON',
-                keywords: ['json', 'parse', 'structured', 'format'],
-            },
-            {
-                id: 'logs-retention',
-                title: 'Retention',
-                description:
-                    'How long to retain logs before they are automatically deleted. You can only change this setting at most once per 24 hours.',
-                component: <LogsRetentionSettings />,
-                flag: 'LOGS_SETTINGS_RETENTION',
-                keywords: ['retention', 'storage', 'delete', 'ttl'],
+                    'Controls whether open and click tracking on marketing workflow emails requires recipient consent. Untracked emails contain no tracking pixel and no rewritten links, and never record opens or clicks. Transactional emails are exempt. Delivery, bounce, and unsubscribe events are always recorded.',
+                component: <WorkflowsEmailTrackingConsentSettings />,
+                keywords: [
+                    'workflows',
+                    'email',
+                    'tracking',
+                    'consent',
+                    'pixel',
+                    'cnil',
+                    'gdpr',
+                    'privacy',
+                    'opt-in',
+                    'opt-out',
+                ],
             },
         ],
     },
@@ -1096,10 +1530,16 @@ export const SETTINGS_MAP: SettingSection[] = [
         level: 'environment',
         id: 'environment-activity-logs',
         title: 'Activity logs',
+        payGate: {
+            feature: AvailableFeature.AUDIT_LOGS,
+            // pinned: `pay gate shown` property value, so renaming it breaks existing insights
+            featureDetail: 'activity-log-retention',
+            bypassForImpersonation: true,
+        },
         settings: [
             {
                 id: 'activity-log-settings',
-                title: 'Logs',
+                title: 'Activity logs',
                 description: 'View a log of changes made to this environment by team members.',
                 component: <ActivityLogSettings />,
                 keywords: ['audit', 'history', 'change', 'activity'],
@@ -1116,7 +1556,7 @@ export const SETTINGS_MAP: SettingSection[] = [
                 title: 'Notifications',
                 description: 'Get notified about activity log events via configured destinations.',
                 component: <ActivityLogNotifications />,
-                flag: 'CDP_ACTIVITY_LOG_NOTIFICATIONS',
+                allowForTeam: (t) => (t?.effective_membership_level ?? 0) >= OrganizationMembershipLevel.Admin,
                 keywords: ['notification', 'alert', 'activity', 'webhook'],
             },
         ],
@@ -1147,6 +1587,52 @@ export const SETTINGS_MAP: SettingSection[] = [
     },
     {
         level: 'environment',
+        id: 'environment-autocapture',
+        title: 'Autocapture',
+        settings: [
+            {
+                id: 'autocapture',
+                title: 'Autocapture',
+                description:
+                    'Automatically capture frontend events such as clicks, input changes, and form submissions when using the web JavaScript SDK. Also available for React Native and iOS via code configuration.',
+                docsUrl: 'https://posthog.com/docs/product-analytics/autocapture',
+                platformSupport: FEATURE_SUPPORT.autocapture,
+                component: <AutocaptureSettings />,
+                keywords: ['click', 'input', 'form', 'dom', 'automatic', 'event'],
+            },
+            {
+                id: 'autocapture-data-attributes',
+                title: 'Data attributes',
+                description:
+                    'Specify data attributes used in your app (e.g. data-attr, data-custom-id). These attributes help the toolbar and action definitions match unique elements on your pages. Use * as a wildcard.',
+                docsUrl: 'https://posthog.com/docs/product-analytics/autocapture#data-attributes',
+                component: <DataAttributes />,
+                keywords: ['selector', 'css', 'element', 'toolbar', 'action'],
+            },
+            {
+                id: 'web-vitals-autocapture',
+                title: 'Web vitals autocapture',
+                description:
+                    "Capture Google Chrome's web vitals metrics (LCP, CLS, FCP, INP). These events enhance web analytics and session replay with performance data.",
+                docsUrl: 'https://posthog.com/docs/web-analytics/web-vitals',
+                platformSupport: FEATURE_SUPPORT.webVitals,
+                component: <WebVitalsAutocaptureSettings />,
+                keywords: ['lcp', 'cls', 'inp', 'fcp', 'performance', 'core web vitals'],
+            },
+            {
+                id: 'dead-clicks-autocapture',
+                title: 'Dead clicks autocapture',
+                description:
+                    "Track clicks that don't result in any action (no scroll, text selection, or DOM mutation). Dead clicks help you find elements users expect to be interactive but aren't.",
+                docsUrl: 'https://posthog.com/docs/toolbar/heatmaps#dead-clicks',
+                platformSupport: FEATURE_SUPPORT.deadClicks,
+                component: <DeadClicksAutocaptureSettings />,
+                keywords: ['rage click', 'broken', 'unresponsive', 'frustration'],
+            },
+        ],
+    },
+    {
+        level: 'environment',
         id: 'environment-discussions',
         title: 'Discussions',
         settings: [
@@ -1155,9 +1641,17 @@ export const SETTINGS_MAP: SettingSection[] = [
                 title: 'Integrations',
                 description: 'Configure how discussion mentions are delivered via integrations.',
                 component: <DiscussionMentionNotifications />,
+                allowForTeam: (t) => (t?.effective_membership_level ?? 0) >= OrganizationMembershipLevel.Admin,
                 keywords: ['mention', 'notification', 'comment', 'discussion'],
             },
         ],
+    },
+    {
+        level: 'environment',
+        id: 'environment-exports',
+        title: 'Exports',
+        to: urls.exports(),
+        settings: [],
     },
     {
         level: 'environment',
@@ -1165,44 +1659,61 @@ export const SETTINGS_MAP: SettingSection[] = [
         title: 'Integrations',
         settings: [
             {
-                id: 'integration-webhooks',
-                title: 'Webhook integration',
-                description:
-                    'Send notifications when selected actions are performed by users. Supports Slack, Microsoft Teams, and Discord.',
-                docsUrl: 'https://posthog.com/docs/webhooks',
-                component: <WebhookIntegration />,
-                keywords: ['notification', 'alert', 'http', 'callback', 'slack', 'teams', 'discord'],
-            },
-            {
                 id: 'integration-slack',
                 title: 'Slack integration',
                 description:
                     'Integrate with Slack to subscribe to insights or dashboards for regular reports to channels of your choice.',
-                docsUrl: 'https://posthog.com/docs/webhooks/slack',
-                component: <SlackIntegration />,
+                docsUrl: Slack.docsUrl,
+                component: <Slack.SettingsSection />,
                 keywords: ['slack', 'channel', 'notification', 'subscribe', 'report'],
             },
             {
                 id: 'integration-github',
                 title: 'GitHub integration',
                 description: 'Connect GitHub to link issues and pull requests with PostHog insights.',
-                docsUrl: 'https://posthog.com/docs/error-tracking/integrations',
-                component: <GithubIntegration />,
+                docsUrl: GitHub.docsUrl,
+                component: <GitHub.SettingsSection connectSurface="settings" />,
                 keywords: ['github', 'git', 'repository', 'issue', 'pr'],
             },
             {
                 id: 'integration-linear',
                 title: 'Linear integration',
                 description: 'Connect Linear to create and link issues directly from PostHog.',
-                docsUrl: 'https://posthog.com/docs/error-tracking/integrations',
-                component: <LinearIntegration />,
+                docsUrl: Linear.docsUrl,
+                component: <Linear.SettingsSection />,
                 keywords: ['linear', 'issue', 'project management', 'task'],
             },
             {
                 id: 'integration-other',
                 title: 'Other integrations',
-                description: 'Browse and manage additional third-party integrations.',
-                component: <IntegrationsList omitKinds={['slack', 'github', 'linear']} />,
+                description:
+                    'Integrations connected from other product areas, such as pipeline destinations, data warehouse sources, error tracking, and marketing analytics.',
+                component: (
+                    <IntegrationsList
+                        omitKinds={['slack', 'github', 'linear']}
+                        titleText=""
+                        emptyState={
+                            <div className="px-4 py-6 text-center text-sm text-secondary rounded border bg-surface-primary">
+                                <p className="mb-1">No other integrations connected</p>
+                                <p className="text-xs text-muted text-balance mb-0">
+                                    These connect from the product area that uses them:{' '}
+                                    <Link to={urls.destinations()}>pipeline destinations</Link>,{' '}
+                                    <Link to={urls.sources()}>data warehouse sources</Link>,{' '}
+                                    <Link
+                                        to={urls.settings('environment-error-tracking', 'error-tracking-integrations')}
+                                    >
+                                        error tracking
+                                    </Link>{' '}
+                                    and{' '}
+                                    <Link to={urls.settings('environment-marketing-analytics', 'marketing-settings')}>
+                                        marketing analytics
+                                    </Link>
+                                    .
+                                </p>
+                            </div>
+                        }
+                    />
+                ),
                 keywords: ['integration', 'connect', 'third-party', 'app'],
             },
             {
@@ -1212,6 +1723,40 @@ export const SETTINGS_MAP: SettingSection[] = [
                     'PostHog Cloud uses static IP addresses for outbound traffic. Add these to your firewall allowlist if needed.',
                 component: <IPAllowListInfo />,
                 keywords: ['whitelist', 'firewall', 'allowlist', 'cidr', 'ip'],
+            },
+        ],
+    },
+    {
+        level: 'environment',
+        id: 'environment-privacy',
+        title: 'Privacy',
+        settings: [
+            {
+                id: 'datacapture',
+                title: 'IP data capture configuration',
+                description:
+                    'When enabled, client IP addresses will not be stored with your events. Transformations like GeoIP enrichment and bot detection can still use the IP before it is discarded. Note: this does not apply when Cookieless server hash mode is enabled, which strips the IP before transformations run.',
+                docsUrl: 'https://posthog.com/docs/privacy',
+                component: <IPCapture />,
+                keywords: ['ip', 'anonymize', 'gdpr', 'privacy', 'geolocation', 'discard'],
+            },
+        ],
+    },
+    {
+        level: 'environment',
+        id: 'environment-secret-api-keys',
+        title: 'Project secret API keys',
+        flag: 'PROJECT_SECRET_API_KEYS',
+        requiresReauthentication: true,
+        settings: [
+            {
+                id: 'environment-secret-api-keys',
+                title: 'Project secret API keys',
+                description:
+                    'These keys allow access to a select set of API endpoints, intended to be accessed exclusively by your systems. Only give keys the permissions they need, and delete unused keys promptly.',
+                docsUrl: 'https://posthog.com/docs/api',
+                component: <ProjectSecretAPIKeys />,
+                keywords: ['token', 'api key', 'authentication', 'secret'],
             },
         ],
     },
@@ -1231,55 +1776,26 @@ export const SETTINGS_MAP: SettingSection[] = [
                 id: 'environment-delete',
                 title: 'Delete environment',
                 description: 'Permanently delete this environment and all its data. This action cannot be undone.',
-                component: <TeamDangerZone />,
-                keywords: ['delete', 'remove', 'destroy'],
-            },
-        ],
-    },
-
-    // PROJECT - just project-details and project-danger-zone
-    {
-        level: 'project',
-        id: 'project-details',
-        title: 'General',
-        settings: [
-            {
-                id: 'display-name',
-                title: 'Display name',
-                description: 'A human-friendly name for this project.',
-                component: <ProjectDisplayName />,
-                keywords: ['name', 'rename', 'label'],
-            },
-        ],
-    },
-    {
-        level: 'project',
-        id: 'project-danger-zone',
-        title: 'Danger zone',
-        settings: [
-            {
-                id: 'project-move',
-                title: 'Move project',
-                description: 'Move this project to a different organization.',
-                component: <ProjectMove />,
-                keywords: ['transfer', 'move', 'organization'],
-            },
-            {
-                id: 'project-delete',
-                title: 'Delete project',
-                description: 'Permanently delete this project and all its environments. This action cannot be undone.',
                 component: <ProjectDangerZone />,
                 keywords: ['delete', 'remove', 'destroy'],
             },
         ],
     },
-
     // ORGANIZATION
     {
         level: 'organization',
         id: 'organization-details',
         title: 'General',
         settings: [
+            {
+                id: 'organization-admin-notice',
+                title: null,
+                component: (
+                    <LemonBanner type="info" className="my-4">
+                        You must be an organization admin or owner to change these settings.
+                    </LemonBanner>
+                ),
+            },
             {
                 id: 'organization-display-name',
                 title: 'Name & logo',
@@ -1289,13 +1805,19 @@ export const SETTINGS_MAP: SettingSection[] = [
                 keywords: ['name', 'rename', 'label', 'organization', 'logo', 'image', 'brand', 'icon', 'avatar'],
             },
             {
+                id: 'organization-id',
+                title: 'Organization ID',
+                description: "Your organization's unique identifier, used in the PostHog API.",
+                component: <OrganizationVariables />,
+                keywords: ['organization', 'id', 'uuid', 'identifier', 'copy'],
+            },
+            {
                 id: 'organization-ai-consent',
-                title: 'PostHog AI data analysis',
+                title: 'AI service providers',
                 description: (
-                    // Note: Sync the copy below with AIConsentPopoverWrapper.tsx
                     <>
                         PostHog AI features, such as the PostHog AI chat, use{' '}
-                        <Tooltip title={`As of ${dayjs().format('MMMM YYYY')}: Anthropic and OpenAI`}>
+                        <Tooltip title={getExternalAIProvidersTooltipTitle()}>
                             <dfn>external AI services</dfn>
                         </Tooltip>{' '}
                         for data analysis.
@@ -1303,13 +1825,61 @@ export const SETTINGS_MAP: SettingSection[] = [
                         This <i>can</i> involve transfer of identifying user data, so we ask for your org-wide consent
                         below.
                         <br />
-                        <strong>Your data will not be used for training models.</strong>
+                        <strong>Your data will not be used for training third-party models.</strong>
+                        <br />
+                        <br />
+                        <AIHipaaDisclaimer />
                     </>
                 ),
                 component: <OrganizationAI />,
-                keywords: ['llm', 'consent', 'opt-in', 'data sharing'],
+                keywords: [
+                    'ai',
+                    'max',
+                    'llm',
+                    'artificial intelligence',
+                    'consent',
+                    'approve',
+                    'enable',
+                    'opt-in',
+                    'data sharing',
+                ],
                 searchDescription:
                     'PostHog AI features use external AI services for data analysis. This can involve transfer of identifying user data.',
+            },
+            {
+                id: 'organization-desktop-beta-terms',
+                title: 'PostHog Desktop beta terms',
+                description: (
+                    <>
+                        Accept the additional data-processing terms for the PostHog Desktop beta.
+                        <br />
+                        <br />
+                        PostHog Desktop uses Baseten and Modal to process customer data, personal data, and PII. They
+                        are not currently listed as PostHog subprocessors for this feature.
+                        <br />
+                        <br />
+                        Your organization agrees to proceed notwithstanding that status. If this feature becomes
+                        generally available, PostHog will update the DPA and provide notice. This beta may change or be
+                        discontinued.
+                        <br />
+                        <br />
+                        <Link to="https://posthog.com/subprocessors" target="_blank">
+                            View PostHog subprocessors
+                        </Link>
+                    </>
+                ),
+                component: <OrganizationDesktopBetaTerms />,
+                keywords: ['desktop', 'beta', 'terms', 'consent', 'opt-in', 'data processing'],
+                searchDescription: 'Accept the additional data-processing terms for the PostHog Desktop beta.',
+            },
+            {
+                id: 'organization-ai-training-opt-out',
+                title: 'Internal AI training',
+                component: <OrganizationAITrainingOptOut />,
+                hideOn: [Realm.SelfHostedClickHouse, Realm.SelfHostedPostgres],
+                keywords: ['ai', 'training', 'opt-out', 'opt-in', 'model', 'max'],
+                searchDescription:
+                    'Control whether PostHog can use your data to train AI models. Turning this off disables AI features for your organization.',
             },
             {
                 id: 'organization-ip-anonymization-default',
@@ -1323,14 +1893,118 @@ export const SETTINGS_MAP: SettingSection[] = [
     },
     {
         level: 'organization',
+        id: 'organization-authentication',
+        title: 'Authentication',
+        settings: [
+            {
+                id: 'authentication-domains',
+                title: 'Authentication Domains',
+                docsUrl: 'https://posthog.com/docs/settings/sso',
+                component: <VerifiedDomains />,
+                keywords: ['sso', 'saml', 'single sign-on', 'domain verification', 'enforce'],
+            },
+            {
+                id: 'enforce-verified-domains',
+                title: 'Domain enforcement',
+                component: <EnforceVerifiedDomains />,
+                keywords: ['sso', 'verified domain', 'restrict', 'membership', 'invites'],
+            },
+            {
+                id: 'saml-configuration',
+                title: 'SAML single sign-on',
+                description:
+                    'Authenticate members through your identity provider using Security Assertion Markup Language (SAML).',
+                docsUrl: 'https://posthog.com/docs/data/sso#setting-up-saml',
+                component: <IdentityProviderFeatureSection configScope={ConfigScopeEnumApi.Saml} />,
+                flag: 'SSO_SETTINGS_REDESIGN',
+                keywords: ['sso', 'saml', 'single sign-on', 'identity provider'],
+            },
+            {
+                id: 'scim-configuration',
+                title: 'SCIM provisioning',
+                description:
+                    'Provision and deprovision organization members through your identity provider using System for Cross-domain Identity Management (SCIM).',
+                docsUrl: 'https://posthog.com/docs/data/sso#setting-up-scim',
+                component: <IdentityProviderFeatureSection configScope={ConfigScopeEnumApi.Scim} />,
+                flag: 'SSO_SETTINGS_REDESIGN',
+                keywords: ['scim', 'provisioning', 'identity provider'],
+            },
+            {
+                id: 'xaa-configuration',
+                title: 'XAA authentication',
+                description: 'Automate API and MCP access to PostHog with Cross App Access (XAA).',
+                docsUrl: 'https://posthog.com/docs/settings/id-jag',
+                component: <IdentityProviderFeatureSection configScope={ConfigScopeEnumApi.Xaa} />,
+                flag: ['SSO_SETTINGS_REDESIGN', 'XAA_AUTHENTICATION'],
+                keywords: ['xaa', 'id-jag', 'identity provider', 'token exchange'],
+            },
+        ],
+    },
+    {
+        level: 'organization',
+        id: 'organization-billing',
+        hideSelfHost: true,
+        title: 'Billing',
+        to: urls.organizationBilling(),
+        settings: [],
+        keywords: ['usage', 'subscription', 'invoice', 'plan', 'payment', 'spend', 'quota', 'credits', 'card'],
+    },
+    {
+        level: 'organization',
+        id: 'organization-cimd-verification-tokens',
+        title: 'CIMD verification tokens',
+        settings: [
+            {
+                id: 'organization-cimd-verification-tokens-list',
+                title: 'CIMD verification tokens',
+                description: 'Link CIMD partner applications to this organization for higher rate limits and identity.',
+                component: <CIMDVerificationTokens />,
+                keywords: ['cimd', 'oauth', 'partner', 'provisioning', 'verification', 'token', 'api', 'rate limit'],
+            },
+        ],
+    },
+    {
+        level: 'organization',
+        id: 'organization-integrations',
+        title: 'Integrations',
+        settings: [
+            {
+                id: 'organization-integrations-list',
+                title: 'Connected integrations',
+                description: 'Manage integrations connected at the organization level.',
+                component: <OrganizationIntegrations />,
+                keywords: ['integration', 'connect', 'third-party', 'oauth'],
+            },
+        ],
+    },
+    {
+        level: 'organization',
+        id: 'organization-legal-documents',
+        hideSelfHost: true,
+        title: 'Legal documents',
+        to: urls.legalDocuments(),
+        settings: [],
+        minimumAccessLevel: OrganizationMembershipLevel.Admin,
+    },
+    {
+        level: 'organization',
+        id: 'organization-proxy',
+        title: 'Managed reverse proxy',
+        settings: [
+            {
+                id: 'organization-proxy',
+                title: 'Managed reverse proxies',
+                docsUrl: 'https://posthog.com/docs/advanced/proxy',
+                component: <ManagedReverseProxy />,
+                keywords: ['custom domain', 'dns', 'cname', 'ad blocker', 'first party'],
+            },
+        ],
+    },
+    {
+        level: 'organization',
         id: 'organization-members',
         title: 'Members',
         settings: [
-            {
-                id: 'banner',
-                title: null,
-                component: <MembersPlatformAddonAd />,
-            },
             {
                 id: 'invites',
                 title: 'Pending invites',
@@ -1344,6 +2018,30 @@ export const SETTINGS_MAP: SettingSection[] = [
                 description: 'View and manage current members of your organization and their roles.',
                 component: <Members />,
                 keywords: ['member', 'user', 'role', 'admin', 'owner'],
+            },
+            {
+                id: 'member-notifications',
+                title: 'Member notifications',
+                description:
+                    'Choose which email notifications your members receive. Anything you set here they cannot change back themselves.',
+                component: <NotificationGovernanceSetting />,
+                flag: 'ORG_NOTIFICATION_GOVERNANCE',
+                allowForTeam: (t) => (t?.effective_membership_level ?? 0) >= OrganizationMembershipLevel.Admin,
+                keywords: ['notification', 'email', 'member', 'lock', 'digest', 'pipeline'],
+            },
+        ],
+    },
+    {
+        level: 'organization',
+        id: 'organization-oauth-apps',
+        title: 'OAuth applications',
+        settings: [
+            {
+                id: 'organization-oauth-apps-list',
+                title: 'OAuth applications',
+                description: 'View applications that have been authorized to connect to your organization.',
+                component: <OAuthApps />,
+                keywords: ['oauth', 'app', 'client', 'integration', 'api', 'authentication', 'third-party'],
             },
         ],
     },
@@ -1373,15 +2071,20 @@ export const SETTINGS_MAP: SettingSection[] = [
     },
     {
         level: 'organization',
-        id: 'organization-authentication',
-        title: 'Authentication domains & SSO',
+        id: 'organization-access-resolution',
+        title: 'Access resolution preview',
+        flag: 'ACCESS_CONTROL_RESOLUTION_PREVIEW',
+        // Temporary migration surface: reachable only from the access control
+        // settings banner, never from the settings navigation or search
+        hideFromNavigation: true,
         settings: [
             {
-                id: 'authentication-domains',
-                title: 'Authentication Domains',
-                docsUrl: 'https://posthog.com/docs/settings/sso',
-                component: <VerifiedDomains />,
-                keywords: ['sso', 'saml', 'single sign-on', 'domain verification', 'enforce'],
+                id: 'organization-access-resolution-preview',
+                title: 'Access resolution preview',
+                description:
+                    'PostHog is changing how access levels combine: the most specific rule will decide, instead of the highest one. Review what will be different for your organization before the change takes effect.',
+                component: <AccessResolutionPreview />,
+                keywords: ['access control', 'resolution', 'rbac', 'permission', 'override'],
             },
         ],
     },
@@ -1389,66 +2092,31 @@ export const SETTINGS_MAP: SettingSection[] = [
         level: 'organization',
         id: 'organization-security',
         title: 'Security',
+        minimumAccessLevel: OrganizationMembershipLevel.Admin,
         settings: [
             {
                 id: 'organization-security',
                 title: 'Security',
-                description:
-                    'Configure organization-wide security policies including public sharing, session timeouts, and password requirements.',
+                description: 'Configure organization-wide security policies.',
                 component: <OrganizationSecuritySettings />,
-                keywords: ['password', 'session', 'timeout', 'compliance', 'sharing', 'public'],
+                keywords: ['compliance', 'sharing', 'public'],
             },
-        ],
-    },
-    {
-        level: 'organization',
-        id: 'organization-integrations',
-        title: 'Integrations',
-        settings: [
             {
-                id: 'organization-integrations-list',
-                title: 'Connected integrations',
-                description: 'Manage integrations connected at the organization level.',
-                component: <OrganizationIntegrations />,
-                keywords: ['integration', 'connect', 'third-party', 'oauth'],
+                id: 'organization-mcp-access',
+                title: 'MCP access',
+                description: 'Control what the PostHog MCP can do in this organization.',
+                component: <OrganizationMCPAccess />,
+                keywords: ['mcp', 'ai', 'agent', 'read-only', 'model context protocol'],
             },
-        ],
-    },
-    {
-        level: 'organization',
-        id: 'organization-proxy',
-        title: 'Managed reverse proxy',
-        settings: [
             {
-                id: 'organization-proxy',
-                title: 'Managed reverse proxies',
-                docsUrl: 'https://posthog.com/docs/advanced/proxy',
-                component: <ManagedReverseProxy />,
-                keywords: ['custom domain', 'dns', 'cname', 'ad blocker', 'first party'],
+                id: 'organization-personal-api-keys',
+                title: 'Personal API key access',
+                description:
+                    "See which members' personal API keys can reach this organization or its projects, who owns them, and the scopes they grant.",
+                component: <OrganizationPersonalAPIKeys />,
+                keywords: ['api key', 'personal', 'token', 'access', 'audit'],
             },
         ],
-    },
-    {
-        level: 'organization',
-        id: 'organization-notifications',
-        title: 'Notifications',
-        settings: [
-            {
-                id: 'email-members',
-                title: 'Notification preferences',
-                description: 'Configure which emails your organization members receive from PostHog.',
-                component: <OrganizationEmailPreferences />,
-                keywords: ['email', 'notification', 'digest', 'unsubscribe'],
-            },
-        ],
-    },
-    {
-        level: 'organization',
-        id: 'organization-billing',
-        hideSelfHost: true,
-        title: 'Billing',
-        to: urls.organizationBilling(),
-        settings: [],
     },
     {
         level: 'organization',
@@ -1475,13 +2143,18 @@ export const SETTINGS_MAP: SettingSection[] = [
             },
         ],
     },
-
     // USER
     {
         level: 'user',
         id: 'user-profile',
         title: 'Profile',
         settings: [
+            {
+                id: 'profile-picture',
+                title: 'Profile picture',
+                component: <ProfilePictureSettings />,
+                keywords: ['avatar', 'gravatar', 'photo', 'picture', 'image', 'profile'],
+            },
             {
                 id: 'details',
                 title: 'Details',
@@ -1508,19 +2181,27 @@ export const SETTINGS_MAP: SettingSection[] = [
                 component: <PasskeySettings />,
                 keywords: ['webauthn', 'fido', 'biometric', 'passwordless'],
             },
+            {
+                id: 'login-sessions',
+                title: 'Web sessions',
+                description: 'Devices and browsers currently signed in to your PostHog account.',
+                component: <LoginSessions />,
+                keywords: ['sessions', 'devices', 'logins', 'sign out', 'log out', 'security', 'revoke'],
+            },
         ],
     },
     {
         level: 'user',
-        id: 'user-notifications',
-        title: 'Notifications',
+        id: 'user-connected-apps',
+        title: 'Connected applications',
         settings: [
             {
-                id: 'notifications',
-                title: 'Notifications',
-                description: 'Choose which email notifications you receive from PostHog.',
-                component: <UpdateEmailPreferences />,
-                keywords: ['email', 'notification', 'digest', 'unsubscribe'],
+                id: 'connected-apps',
+                title: 'Connected applications',
+                description:
+                    'Applications that have been granted access to your PostHog account via OAuth. You can revoke access at any time.',
+                component: <ConnectedApps />,
+                keywords: ['oauth', 'app', 'connected', 'authorized', 'revoke', 'access', 'token'],
             },
         ],
     },
@@ -1534,13 +2215,6 @@ export const SETTINGS_MAP: SettingSection[] = [
                 title: 'Theme',
                 component: <ThemeSwitcher onlyLabel />,
                 keywords: ['dark mode', 'light mode', 'appearance', 'color scheme'],
-            },
-            {
-                id: 'sql-editor-tab-preference',
-                title: 'SQL editor new tab behavior',
-                description: 'Configure whether new SQL queries open in new tabs or reuse existing ones.',
-                component: <SqlEditorTabPreference />,
-                keywords: ['sql', 'editor', 'tab', 'query'],
             },
             {
                 id: 'optout',
@@ -1557,6 +2231,31 @@ export const SETTINGS_MAP: SettingSection[] = [
                 component: <AllowImpersonation />,
                 flag: 'CONTROL_SUPPORT_LOGIN',
                 keywords: ['impersonation', 'support login', 'debug'],
+            },
+            {
+                id: 'sidebar-auto-suggest',
+                title: 'Automatically suggest new tools',
+                description:
+                    "When we detect you are using a new tool, we'll automatically add it to your sidebar as a suggestion. We might also suggest tools that are related to the ones you are using when we launch a new one.",
+                component: <SidebarAutoSuggestSetting />,
+                keywords: ['sidebar', 'suggest', 'products', 'apps', 'tools', 'auto'],
+            },
+            {
+                id: 'mcp-hints',
+                title: 'MCP hints',
+                description:
+                    'After you take an action in PostHog (creating a feature flag, building a dashboard, etc.), show a small hint that the same action can be done from your IDE via the PostHog MCP. Rate-limited to once a week.',
+                component: <MCPHintsSetting />,
+                keywords: ['mcp', 'claude', 'cursor', 'codex', 'ide', 'hints', 'wizard'],
+            },
+            {
+                id: 'web-analytics-achievements',
+                title: 'Web analytics achievements',
+                description:
+                    'Show playful achievement badges and streaks on the Web analytics dashboard. Applies to your current project.',
+                component: <WebAnalyticsAchievementsSetting />,
+                flag: 'WEB_ANALYTICS_ACHIEVEMENTS',
+                keywords: ['web analytics', 'achievements', 'gamification', 'badges', 'streak'],
             },
             {
                 id: 'hedgehog-mode',
@@ -1582,6 +2281,45 @@ export const SETTINGS_MAP: SettingSection[] = [
     },
     {
         level: 'user',
+        id: 'user-navigation',
+        title: 'Navigation',
+        flag: 'UI_CUSTOMIZATION',
+        settings: [
+            {
+                id: 'homepage',
+                title: 'Homepage',
+                description:
+                    'The page that opens when you open PostHog or select Home in the sidebar. This applies to the current project.',
+                component: <HomepageSetting />,
+                keywords: ['homepage', 'home', 'default page', 'landing page', 'launchpad', 'start'],
+            },
+            {
+                id: 'sidebar-layout',
+                title: 'Layout',
+                description: 'Control how dense the sidebar rows are.',
+                component: <SidebarLayoutSetting />,
+                keywords: ['sidebar', 'layout', 'density', 'compact', 'comfortable'],
+            },
+            {
+                id: 'sidebar-items',
+                title: 'Navigation items',
+                description:
+                    'Choose which items appear in your sidebar. These preferences only apply to you. Activity and Settings always stay visible.',
+                component: <SidebarItemsSetting />,
+                keywords: ['sidebar', 'navigation', 'navbar', 'menu', 'hide', 'show', 'customize', 'starred'],
+            },
+            {
+                id: 'sidebar-my-tools',
+                title: 'My Tools',
+                description:
+                    'Choose which tools appear in the My Tools section of your sidebar. This selection applies to the current project.',
+                component: <SidebarMyToolsSetting />,
+                keywords: ['sidebar', 'tools', 'products', 'apps', 'my tools', 'customize'],
+            },
+        ],
+    },
+    {
+        level: 'user',
         id: 'user-feature-previews',
         title: 'Feature previews',
         settings: [
@@ -1590,7 +2328,7 @@ export const SETTINGS_MAP: SettingSection[] = [
                 title: 'Feature previews',
                 description:
                     'Try out upcoming PostHog features before they are generally available. Toggling a preview enables it for your account only.',
-                component: <FeaturePreviewsSettings />,
+                component: <FeaturePreviews />,
                 keywords: ['beta', 'early access', 'preview', 'opt-in'],
             },
             {
@@ -1599,6 +2337,28 @@ export const SETTINGS_MAP: SettingSection[] = [
                 description: 'Get notified when upcoming features are ready for preview.',
                 component: <FeaturePreviewsComingSoon />,
                 keywords: ['upcoming', 'notify', 'concept', 'future'],
+            },
+        ],
+    },
+    {
+        level: 'user',
+        id: 'user-notifications',
+        title: 'Notifications',
+        settings: [
+            {
+                id: 'notifications',
+                title: 'Notifications',
+                description: 'Choose which email notifications you receive from PostHog.',
+                component: <UpdateEmailPreferences />,
+                keywords: ['email', 'notification', 'digest', 'unsubscribe'],
+            },
+            {
+                id: 'realtime-notifications',
+                title: 'In-app notifications',
+                description: 'Choose which real-time notifications you receive in the PostHog app, per project.',
+                component: <RealtimeNotificationPreferences />,
+                flag: 'REAL_TIME_NOTIFICATIONS',
+                keywords: ['notification', 'in-app', 'realtime', 'popover', 'mention'],
             },
         ],
     },
@@ -1615,6 +2375,52 @@ export const SETTINGS_MAP: SettingSection[] = [
                 docsUrl: 'https://posthog.com/docs/api',
                 component: <PersonalAPIKeys />,
                 keywords: ['token', 'api key', 'authentication', 'secret'],
+            },
+        ],
+    },
+    {
+        level: 'user',
+        id: 'user-personal-integrations',
+        title: 'Personal integrations',
+        settings: [
+            {
+                id: 'personal-integrations-github',
+                title: 'GitHub',
+                description:
+                    'Your personal GitHub integrations for repo access, code attribution, and pull request authorship. You can connect multiple GitHub accounts or organizations.',
+                component: <PersonalGitHubIntegrations />,
+                keywords: ['github', 'integration', 'repos', 'identity', 'link', 'code', 'personal'],
+            },
+            {
+                id: 'personal-integrations-slack',
+                title: 'Slack',
+                description:
+                    'Bind your Slack identity to this PostHog account so @PostHog mentions route to you even when your Slack email and PostHog email differ.',
+                component: <PersonalSlackIntegrations />,
+                keywords: ['slack', 'integration', 'identity', 'link', 'mention', 'personal'],
+            },
+            {
+                id: 'personal-integrations-posthog',
+                title: 'PostHog project',
+                description:
+                    'Connect another PostHog project (in another region or your own) to act in it through its API, for example to dispatch tasks that must run there.',
+                component: <PersonalPosthogConnections />,
+                keywords: ['posthog', 'integration', 'connect', 'region', 'cross-region', 'task', 'personal'],
+                flag: 'POSTHOG_CONNECT',
+            },
+        ],
+    },
+    {
+        level: 'user',
+        id: 'user-reminders',
+        title: 'Reminders',
+        settings: [
+            {
+                id: 'reminders',
+                title: 'Reminders',
+                description: 'Schedule one-off or recurring nudges that notify you in-app when they are due.',
+                component: <Reminders />,
+                keywords: ['reminder', 'notification', 'schedule', 'recurring', 'cron'],
             },
         ],
     },

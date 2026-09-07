@@ -2,29 +2,33 @@ import { useActions, useValues } from 'kea'
 import { useEffect, useRef } from 'react'
 
 import { getSeriesBackgroundColor } from 'lib/colors'
+import { captureLegendMenuAction } from 'lib/components/ChartLegendSeriesMenu/captureLegendMenuAction'
+import { ChartLegendSeriesMenu } from 'lib/components/ChartLegendSeriesMenu/ChartLegendSeriesMenu'
 import { InsightLabel } from 'lib/components/InsightLabel'
-import { parseAliasToReadable } from 'lib/components/PathCleanFilters/PathCleanFilterItem'
+import { PIE_DISPLAY_TYPES } from 'lib/constants'
 import { LemonCheckbox } from 'lib/lemon-ui/LemonCheckbox'
 import { formatAggregationAxisValue } from 'scenes/insights/aggregationAxisFormat'
 import { insightLogic } from 'scenes/insights/insightLogic'
 import { formatBreakdownLabel, getTrendResultCustomizationKey } from 'scenes/insights/utils'
 import { formatCompareLabel } from 'scenes/insights/views/InsightsTable/columns/SeriesColumn'
+import { teamLogic } from 'scenes/teamLogic'
 import { trendsDataLogic } from 'scenes/trends/trendsDataLogic'
 import { IndexedTrendResult } from 'scenes/trends/types'
 
 import { cohortsModel } from '~/models/cohortsModel'
 import { propertyDefinitionsModel } from '~/models/propertyDefinitionsModel'
-import { ChartDisplayType } from '~/types'
 
 type InsightLegendRowProps = {
     item: IndexedTrendResult
+    readOnly?: boolean
 }
 
-export function InsightLegendRow({ item }: InsightLegendRowProps): JSX.Element {
+export function InsightLegendRow({ item, readOnly = false }: InsightLegendRowProps): JSX.Element {
     const { allCohorts } = useValues(cohortsModel)
     const { formatPropertyValueForDisplay } = useValues(propertyDefinitionsModel)
+    const { baseCurrency } = useValues(teamLogic)
 
-    const { insightProps, highlightedSeries, editingDisabledReason } = useValues(insightLogic)
+    const { insightProps, highlightedSeries, canEditInsight } = useValues(insightLogic)
     const {
         display,
         trendsFilter,
@@ -33,8 +37,14 @@ export function InsightLegendRow({ item }: InsightLegendRowProps): JSX.Element {
         getTrendsColor,
         getTrendsHidden,
         resultCustomizationBy,
+        indexedResults,
+        areAllSeriesVisible,
+        legendSeriesIsolationMenuEligible,
+        getIsOnlyVisibleSeriesInLegend,
     } = useValues(trendsDataLogic(insightProps))
-    const { toggleResultHidden } = useActions(trendsDataLogic(insightProps))
+    const { toggleResultHidden, toggleOtherSeriesHidden, toggleAllResultsHidden } = useActions(
+        trendsDataLogic(insightProps)
+    )
 
     let highlighted = false
     if (highlightedSeries) {
@@ -70,8 +80,12 @@ export function InsightLegendRow({ item }: InsightLegendRowProps): JSX.Element {
     const isHidden = getTrendsHidden(item)
     const mainColor = isPrevious ? `${themeColor}80` : themeColor
 
-    return (
-        <div key={item.id} className="InsightLegendMenu-item p-2 flex flex-row" ref={rowRef} {...highlightStyle}>
+    const isOnlyThisVisible = getIsOnlyVisibleSeriesInLegend(item)
+
+    const showSeriesIsolationMenu = !readOnly && legendSeriesIsolationMenuEligible
+
+    const row = (
+        <div className="InsightLegendMenu-item p-2 flex flex-row" ref={rowRef} {...highlightStyle}>
             <div className="grow">
                 <LemonCheckbox
                     className="text-xs mr-4"
@@ -80,44 +94,74 @@ export function InsightLegendRow({ item }: InsightLegendRowProps): JSX.Element {
                     onChange={() => toggleResultHidden(item)}
                     fullWidth
                     label={
-                        showPathCleaningHighlight ? (
-                            <div className="flex items-center gap-2">
-                                <InsightLabel
-                                    key={item.id}
-                                    seriesColor={mainColor}
-                                    action={item.action}
-                                    fallbackName={item.breakdown_value === '' ? 'None' : item.label}
-                                    hasMultipleSeries={!isSingleSeriesDefinition}
-                                    hideBreakdown
-                                    compareValue={isPrevious ? formatCompareLabel(item) : undefined}
-                                    hideIcon
-                                    showSingleName
-                                />
-                                {parseAliasToReadable(formattedBreakdownValue)}
-                            </div>
-                        ) : (
-                            <InsightLabel
-                                key={item.id}
-                                seriesColor={mainColor}
-                                action={item.action}
-                                fallbackName={item.breakdown_value === '' ? 'None' : item.label}
-                                hasMultipleSeries={!isSingleSeriesDefinition}
-                                breakdownValue={formattedBreakdownValue}
-                                compareValue={isPrevious ? formatCompareLabel(item) : undefined}
-                                pillMidEllipsis={breakdownFilter?.breakdown === '$current_url'} // TODO: define set of breakdown values that would benefit from mid ellipsis truncation
-                                hideIcon
-                                showSingleName
-                            />
-                        )
+                        <InsightLabel
+                            key={item.id}
+                            seriesColor={mainColor}
+                            action={item.action}
+                            fallbackName={item.breakdown_value === '' ? 'None' : item.label}
+                            hasMultipleSeries={!isSingleSeriesDefinition}
+                            breakdownValue={formattedBreakdownValue}
+                            compareValue={isPrevious ? formatCompareLabel(item) : undefined}
+                            pillMidEllipsis={breakdownFilter?.breakdown === '$current_url'} // TODO: define set of breakdown values that would benefit from mid ellipsis truncation
+                            showPathCleaningHighlight={showPathCleaningHighlight}
+                            hideIcon
+                            showSingleName
+                            hideHogQLTagWhenCustomName
+                        />
                     }
-                    disabledReason={editingDisabledReason}
+                    disabledReason={!canEditInsight ? 'You need editor access to modify this insight.' : undefined}
                 />
             </div>
-            {display === ChartDisplayType.ActionsPie && (
+            {display && PIE_DISPLAY_TYPES.includes(display) && (
                 <div className="text-secondary grow-0">
-                    {formatAggregationAxisValue(trendsFilter, item.aggregated_value)}
+                    {formatAggregationAxisValue(trendsFilter, item.aggregated_value, baseCurrency)}
                 </div>
             )}
         </div>
+    )
+
+    if (!showSeriesIsolationMenu) {
+        return row
+    }
+
+    return (
+        <ChartLegendSeriesMenu
+            seriesLabel={item.label}
+            seriesColor={mainColor}
+            isHidden={isHidden}
+            isOnlyVisible={isOnlyThisVisible}
+            areAllVisible={areAllSeriesVisible}
+            canIsolate={legendSeriesIsolationMenuEligible}
+            showGestureHints={false}
+            onToggle={() => {
+                captureLegendMenuAction({
+                    action: isHidden ? 'show_series' : 'hide_series',
+                    source: 'toggle_row',
+                    surface: 'insight_legend_table',
+                    seriesCount: indexedResults.length,
+                })
+                toggleResultHidden(item)
+            }}
+            onIsolate={() => {
+                captureLegendMenuAction({
+                    action: isOnlyThisVisible ? 'show_all_series' : 'hide_other_series',
+                    source: 'isolate_row',
+                    surface: 'insight_legend_table',
+                    seriesCount: indexedResults.length,
+                })
+                toggleOtherSeriesHidden(item)
+            }}
+            onToggleAll={() => {
+                captureLegendMenuAction({
+                    action: areAllSeriesVisible ? 'hide_all_series' : 'show_all_series',
+                    source: 'toggle_all_row',
+                    surface: 'insight_legend_table',
+                    seriesCount: indexedResults.length,
+                })
+                toggleAllResultsHidden(indexedResults, areAllSeriesVisible)
+            }}
+        >
+            {row}
+        </ChartLegendSeriesMenu>
     )
 }

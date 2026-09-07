@@ -13,17 +13,29 @@ Proactively use list_data and search tools to find existing insights.
 If there are matching insights, read their insight schemas to understand whether they match the user's intent and have data.
 Next, read the data schema and data warehouse schema and create new insights or SQL queries.
 
+## Use dashboard templates as reference
+PostHog ships vetted dashboard templates for common topics (product analytics, retention, revenue, etc.).
+When they're available to you, browse the templates for one close to the user's topic and look at the insights it pairs together — they're a good signal of what a strong dashboard on that topic looks like.
+Treat templates as examples, not instructions: take inspiration from the insights and their groupings, but tailor every insight to the user's own events, properties, and intent rather than copying a template verbatim.
+
 ## Finalize
 Call this tool when you have enough information to create or update the dashboard.
 
 # Understanding dashboard update with insight_ids
 
 When `insight_ids` is provided, it replaces all dashboard insights with the provided insights.
-Layouts are preserved positionally: the first insight takes the first tile's position, etc.
 You can use insight_ids to add, replace, or remove insights.
+By default, keep existing insight tile layouts unchanged (`layout_mode="preserve_existing"`).
+Use `layout_mode="reflow_all"` whenever the user explicitly asks to change placement/order, including phrases like:
+- reorder/rearrange/reflow the dashboard
+- move an insight before/after another insight
+- insert an insight between two insights
+- place an insight first/last/at the top
+Keep `layout_mode="preserve_existing"` for plain add/remove/replace requests where layout should stay unchanged.
+When using `layout_mode="reflow_all"`, tile coordinates are recomputed in the order of `insight_ids`.
 
-Example: Dashboard has [A, B, C] (in layout order). Use `insight_ids=[A', C']`.
-Result: A' takes A's layout, C' takes B's layout, B is removed.
+Example: Dashboard has [A, B, C] (in layout order). Use `insight_ids=[A, C]` (same insight IDs, omitting B).
+Result: A and C keep their existing tile layouts, B's tile is soft-deleted, and no new tiles are created.
 
 # When to use this tool
 - The user asks to create or update a dashboard.
@@ -87,23 +99,25 @@ Note: The following insight IDs could not be added (not found or not saved): {mi
 """.strip()
 
 PERMISSION_REQUEST_PROMPT = """
-Updating dashboard: {{{dashboard_name}}}
+## Updating dashboard: {{{dashboard_name}}}
 {{#new_dashboard_name}}
 
-Renaming to: {{{new_dashboard_name}}}
+**Rename to:** {{{new_dashboard_name}}}
 {{/new_dashboard_name}}
 {{#new_dashboard_description}}
 
-Updating description to: {{{new_dashboard_description}}}
+**New description:** {{{new_dashboard_description}}}
 {{/new_dashboard_description}}
 {{#deleted_insights}}
 
-**Removing {{{deleted_count}}} from this dashboard:**
+## Removing {{{deleted_count}}}
+
 {{{deleted_insights}}}
 {{/deleted_insights}}
 {{#new_insights}}
 
-**Adding {{{added_count}}} to this dashboard:**
+## Adding {{{added_count}}}
+
 {{{new_insights}}}
 {{/new_insights}}
 """.strip()

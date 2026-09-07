@@ -3,13 +3,31 @@ from io import BytesIO
 
 from posthog.test.base import BaseTest
 
+from django.test import SimpleTestCase
+
 import fastavro
 
-from posthog.models import DataWarehouseTable
+from products.warehouse_sources.backend.facade.models import DataWarehouseCredential, DataWarehouseTable
 
-from products.data_warehouse.backend.models import DataWarehouseCredential
+from ee.hogai.eval.schema import DataWarehouseTableSnapshot, EvalsDockerImageConfig
 
-from ee.hogai.eval.schema import DataWarehouseTableSnapshot
+
+class TestEvalsDockerImageConfig(SimpleTestCase):
+    def test_dataset_revision_defaults_to_none_for_older_producers(self) -> None:
+        config = EvalsDockerImageConfig.model_validate(
+            {
+                "aws_bucket_name": "snapshots",
+                "aws_endpoint_url": "http://object-storage",
+                "team_snapshots": [],
+                "experiment_id": "experiment-id",
+                "experiment_name": "experiment-name",
+                "dataset_id": "dataset-id",
+                "dataset_name": "dataset-name",
+                "dataset_inputs": [],
+            }
+        )
+
+        self.assertIsNone(config.dataset_revision)
 
 
 class TestEvalSchema(BaseTest):

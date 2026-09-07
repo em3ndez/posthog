@@ -1,14 +1,29 @@
 # posthog/test/test_otel_instrumentation.py
 import os
 import logging
+from types import SimpleNamespace
+from typing import NoReturn
 
-from posthog.test.base import BaseTest
 from unittest import mock
 
-from posthog.otel_instrumentation import _otel_django_request_hook, _otel_django_response_hook, initialize_otel
+from django.test import SimpleTestCase
+
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+from opentelemetry.util.types import AttributeValue
+from parameterized import parameterized
+
+from posthog.otel_instrumentation import (
+    _otel_django_request_hook,
+    _otel_django_response_hook,
+    _otel_redis_request_hook,
+    initialize_otel,
+)
 
 
-class TestOtelInstrumentation(BaseTest):
+class TestOtelInstrumentation(SimpleTestCase):
     def setUp(self):
         super().setUp()
         # Store original levels to restore them after tests
@@ -32,12 +47,11 @@ class TestOtelInstrumentation(BaseTest):
 
         # Clear any potentially set OTel provider to avoid state leakage between tests
         # if initialize_otel was called and set a global provider.
-        from opentelemetry import trace
-
         trace._TRACER_PROVIDER = None
 
         super().tearDown()
 
+    @mock.patch("posthog.otel_instrumentation.CeleryInstrumentor")
     @mock.patch("posthog.otel_instrumentation.AIOKafkaInstrumentor")
     @mock.patch("posthog.otel_instrumentation.KafkaInstrumentor")
     @mock.patch("posthog.otel_instrumentation.PsycopgInstrumentor")
@@ -71,6 +85,7 @@ class TestOtelInstrumentation(BaseTest):
         mock_psycopg_instrumentor_cls,
         mock_kafka_instrumentor_cls,
         mock_aio_kafka_instrumentor_cls,
+        mock_celery_instrumentor_cls,
     ):
         # Arrange
         mock_resource_instance = mock.Mock()
@@ -115,6 +130,12 @@ class TestOtelInstrumentation(BaseTest):
         mock_django_instrumentor_cls.assert_called_once_with()
         mock_django_instrumentor_instance.instrument.assert_called_once()
 
+        # Assert CeleryInstrumentor call
+        mock_celery_instrumentor_cls.assert_called_once_with()
+        mock_celery_instrumentor_cls.return_value.instrument.assert_called_once_with(
+            tracer_provider=mock_provider_instance
+        )
+
         instrument_call_args = mock_django_instrumentor_instance.instrument.call_args
         self.assertEqual(instrument_call_args[1]["tracer_provider"], mock_provider_instance)
         self.assertEqual(instrument_call_args[1]["request_hook"], _otel_django_request_hook)
@@ -122,7 +143,9 @@ class TestOtelInstrumentation(BaseTest):
 
         # Assert RedisInstrumentor call
         mock_redis_instrumentor_cls.assert_called_once_with()
-        mock_redis_instrumentor_instance.instrument.assert_called_once_with(tracer_provider=mock_provider_instance)
+        mock_redis_instrumentor_instance.instrument.assert_called_once_with(
+            tracer_provider=mock_provider_instance, request_hook=_otel_redis_request_hook
+        )
 
         # Assert PsycopgInstrumentor call
         mock_psycopg_instrumentor_cls.assert_called_once_with()
@@ -166,6 +189,7 @@ class TestOtelInstrumentation(BaseTest):
         self.assertEqual(django_otel_lib_logger.level, logging.DEBUG)  # Always set to DEBUG
         self.assertTrue(django_otel_lib_logger.propagate)
 
+    @mock.patch("posthog.otel_instrumentation.CeleryInstrumentor")
     @mock.patch("posthog.otel_instrumentation.AIOKafkaInstrumentor")
     @mock.patch("posthog.otel_instrumentation.KafkaInstrumentor")
     @mock.patch("posthog.otel_instrumentation.PsycopgInstrumentor")
@@ -181,12 +205,14 @@ class TestOtelInstrumentation(BaseTest):
         mock_psycopg_instrumentor_cls,
         mock_kafka_instrumentor_cls,
         mock_aio_kafka_instrumentor_cls,
+        mock_celery_instrumentor_cls,
     ):
         # Act
         initialize_otel()
 
         # Assert
         mock_django_instrumentor_cls.return_value.instrument.assert_not_called()
+        mock_celery_instrumentor_cls.return_value.instrument.assert_not_called()
         mock_redis_instrumentor_cls.return_value.instrument.assert_not_called()
         mock_psycopg_instrumentor_cls.return_value.instrument.assert_not_called()
         mock_kafka_instrumentor_cls.return_value.instrument.assert_not_called()
@@ -230,16 +256,30 @@ class TestOtelInstrumentation(BaseTest):
 
         mock_span.set_attribute.assert_not_called()
 
-    def test_otel_django_response_hook(self):
+    @parameterized.expand([("GET", "GET api/projects/<int:team_id>/insights/"), ("CUSTOM", "HTTP")])
+    def test_otel_django_response_hook(self, request_method, expected_span_name):
         mock_span = mock.Mock()
         mock_span.is_recording.return_value = True
-        mock_request = mock.Mock()  # Not used by this hook's logic
+        mock_request = mock.Mock(method=request_method)
+        mock_request.resolver_match.route = "api/projects/<int:team_id>/insights/"
         mock_response = mock.Mock()
         mock_response.status_code = 200
 
         _otel_django_response_hook(mock_span, mock_request, mock_response)
 
         mock_span.set_attribute.assert_called_once_with("http.status_code", 200)
+        mock_span.update_name.assert_called_once_with(expected_span_name)
+
+    def test_otel_django_response_hook_without_resolved_route(self):
+        mock_span = mock.Mock()
+        mock_span.is_recording.return_value = True
+        mock_request = mock.Mock(method="GET", resolver_match=object())
+        mock_response = mock.Mock(status_code=404)
+
+        _otel_django_response_hook(mock_span, mock_request, mock_response)
+
+        mock_span.set_attribute.assert_called_once_with("http.status_code", 404)
+        mock_span.update_name.assert_not_called()
 
     def test_otel_django_response_hook_not_recording(self):
         mock_span = mock.Mock()
@@ -251,6 +291,7 @@ class TestOtelInstrumentation(BaseTest):
 
         mock_span.set_attribute.assert_not_called()
 
+    @mock.patch("posthog.otel_instrumentation.CeleryInstrumentor")
     @mock.patch("posthog.otel_instrumentation.AIOKafkaInstrumentor")
     @mock.patch("posthog.otel_instrumentation.KafkaInstrumentor")
     @mock.patch("posthog.otel_instrumentation.PsycopgInstrumentor")
@@ -286,6 +327,7 @@ class TestOtelInstrumentation(BaseTest):
         mock_psycopg_instrumentor_cls,
         mock_kafka_instrumentor_cls,
         mock_aio_kafka_instrumentor_cls,
+        mock_celery_instrumentor_cls,
     ):
         # Arrange
         mock_resource_instance = mock.Mock()
@@ -343,3 +385,43 @@ class TestOtelInstrumentation(BaseTest):
         # Assert AIOKafkaInstrumentor call
         mock_aio_kafka_instrumentor_cls.assert_called_once_with()
         mock_aio_kafka_instrumentor_instance.instrument.assert_called_once_with(tracer_provider=mock_provider_instance)
+
+
+class TestOtelRedisRequestHook(SimpleTestCase):
+    def _span_attributes_after_hook(self, instance: object) -> dict[str, AttributeValue]:
+        exporter = InMemorySpanExporter()
+        provider = TracerProvider()
+        provider.add_span_processor(SimpleSpanProcessor(exporter))
+
+        with provider.get_tracer(__name__).start_as_current_span("GET") as span:
+            _otel_redis_request_hook(span, instance, ("GET", "some-key"), {})
+
+        return dict(exporter.get_finished_spans()[0].attributes or {})
+
+    def test_cluster_client_command_is_attributed_to_a_backend(self) -> None:
+        node = SimpleNamespace(host="cache.example.com", port=6379)
+        instance = SimpleNamespace(nodes_manager=SimpleNamespace(startup_nodes={"cache.example.com:6379": node}))
+
+        self.assertEqual(
+            self._span_attributes_after_hook(instance),
+            {
+                "db.system": "redis",
+                "db.redis.cluster": True,
+                "net.transport": "ip_tcp",
+                "net.peer.name": "cache.example.com",
+                "net.peer.port": 6379,
+            },
+        )
+
+    def test_pooled_client_command_is_left_to_the_instrumentor(self) -> None:
+        instance = SimpleNamespace(connection_pool=SimpleNamespace(connection_kwargs={"host": "cache.example.com"}))
+
+        self.assertEqual(self._span_attributes_after_hook(instance), {})
+
+    def test_client_that_cannot_be_inspected_still_runs_its_command(self) -> None:
+        class ClientWithoutTopology:
+            @property
+            def nodes_manager(self) -> NoReturn:
+                raise RuntimeError("topology unavailable")
+
+        self.assertEqual(self._span_attributes_after_hook(ClientWithoutTopology()), {})

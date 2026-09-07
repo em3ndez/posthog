@@ -44,6 +44,7 @@ export function HogQLQueryEditor(props: HogQLQueryEditorProps): JSX.Element {
         if (router.values.location.pathname.includes(urls.sqlEditor())) {
             setKey(router.values.location.pathname)
         }
+        // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally re-run to reset the editor key when the SQL editor route changes
     }, [router.values.location.pathname])
 
     const [monacoAndEditor, setMonacoAndEditor] = useState(
@@ -61,7 +62,8 @@ export function HogQLQueryEditor(props: HogQLQueryEditorProps): JSX.Element {
     }
     const logic = hogQLQueryEditorLogic(hogQLQueryEditorLogicProps)
     const { queryInput, prompt, aiAvailable, promptError, promptLoading } = useValues(logic)
-    const { setQueryInput, saveQuery, setPrompt, draftFromPrompt, saveAsView, onUpdateView } = useActions(logic)
+    const { setQueryInput, saveQuery, setPrompt, draftFromPrompt, draftFromMetadataFix, saveAsView, onUpdateView } =
+        useActions(logic)
 
     const codeEditorKey = `hogQLQueryEditor/${key}`
 
@@ -143,6 +145,7 @@ export function HogQLQueryEditor(props: HogQLQueryEditorProps): JSX.Element {
                                 setQueryInput(v ?? '')
                             }}
                             height="100%"
+                            onFixWithAI={(prompt) => draftFromMetadataFix(prompt)}
                             onMount={(editor, monaco) => {
                                 setMonacoAndEditor([monaco, editor])
                             }}

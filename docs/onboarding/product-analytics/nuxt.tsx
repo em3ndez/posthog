@@ -1,6 +1,7 @@
-import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/OnboardingDocsContentWrapper'
+import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/shared/OnboardingDocsContentWrapper'
 
 import { StepDefinition } from '../steps'
+import { SDK_DEFAULTS_DATE } from './_snippets/sdkDefaults'
 
 export const getNuxtClientSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
     const { CodeBlock, Markdown, CalloutBox, dedent } = ctx
@@ -35,6 +36,13 @@ export const getNuxtClientSteps = (ctx: OnboardingComponentsContext): StepDefini
                                     pnpm add posthog-js
                                 `,
                             },
+                            {
+                                language: 'bash',
+                                file: 'bun',
+                                code: dedent`
+                                    bun add posthog-js
+                                `,
+                            },
                         ]}
                     />
                     <CalloutBox type="fyi" title="Nuxt version">
@@ -51,7 +59,7 @@ export const getNuxtClientSteps = (ctx: OnboardingComponentsContext): StepDefini
             badge: 'required',
             content: (
                 <>
-                    <Markdown>Add your PostHog API key and host to your `nuxt.config.js` file:</Markdown>
+                    <Markdown>Add your PostHog project token and host to your `nuxt.config.js` file:</Markdown>
                     <CodeBlock
                         blocks={[
                             {
@@ -61,9 +69,9 @@ export const getNuxtClientSteps = (ctx: OnboardingComponentsContext): StepDefini
                                     export default defineNuxtConfig({
                                       runtimeConfig: {
                                         public: {
-                                          posthogPublicKey: '<ph_project_api_key>',
+                                          posthogPublicKey: '<ph_project_token>',
                                           posthogHost: '<ph_client_api_host>',
-                                          posthogDefaults: '2026-01-30'
+                                          posthogDefaults: '${SDK_DEFAULTS_DATE}'
                                         }
                                       }
                                     })
@@ -153,6 +161,13 @@ export const getNuxtServerSteps = (ctx: OnboardingComponentsContext): StepDefini
                                     pnpm add posthog-node
                                 `,
                             },
+                            {
+                                language: 'bash',
+                                file: 'bun',
+                                code: dedent`
+                                    bun add posthog-node
+                                `,
+                            },
                         ]}
                     />
                     <CodeBlock
@@ -188,19 +203,24 @@ export const getNuxtServerSteps = (ctx: OnboardingComponentsContext): StepDefini
     ]
 }
 
-export const getNuxtSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
-    const { snippets } = ctx
-    const JSEventCapture = snippets?.JSEventCapture
+export const getNuxtInstallSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => [
+    ...getNuxtClientSteps(ctx),
+    ...getNuxtServerSteps(ctx),
+]
 
-    return [
-        ...getNuxtClientSteps(ctx),
-        ...getNuxtServerSteps(ctx),
-        {
-            title: 'Send events',
-            badge: undefined,
-            content: <>{JSEventCapture && <JSEventCapture />}</>,
-        },
-    ]
+export const getNuxtEventStep = (ctx: OnboardingComponentsContext): StepDefinition => {
+    const JSEventCapture = ctx.snippets?.JSEventCapture
+
+    return {
+        title: 'Send events',
+        badge: undefined,
+        content: <>{JSEventCapture && <JSEventCapture />}</>,
+    }
 }
+
+export const getNuxtSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => [
+    ...getNuxtInstallSteps(ctx),
+    getNuxtEventStep(ctx),
+]
 
 export const NuxtInstallation = createInstallation(getNuxtSteps)

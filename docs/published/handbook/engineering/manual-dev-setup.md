@@ -54,7 +54,7 @@ d22559261575   temporalio/auto-setup:1.20.0               "/etc/temporal/entry�
 c04358d8309f   zookeeper:3.7.0                            "/docker-entrypoint.…"   51 seconds ago   Up 50 seconds             2181/tcp, 2888/tcp, 3888/tcp, 8080/tcp                                                           posthog-zookeeper-1
 09add699866e   maildev/maildev:2.0.5                      "bin/maildev"            51 seconds ago   Up 50 seconds (healthy)   0.0.0.0:1025->1025/tcp, 0.0.0.0:1080->1080/tcp                                                   posthog-maildev-1
 61a44c094753   elasticsearch:7.16.2                       "/bin/tini -- /usr/l…"   51 seconds ago   Up 50 seconds             9200/tcp, 9300/tcp                                                                               posthog-elasticsearch-1
-a478cadf6911   minio/minio:RELEASE.2022-06-25T15-50-16Z   "sh -c 'mkdir -p /da…"   51 seconds ago   Up 50 seconds             9000/tcp, 0.0.0.0:19000-19001->19000-19001/tcp                                                   posthog-object_storage-1
+a478cadf6911   chrislusf/seaweedfs:4.29                   "/bin/sh -c '(while …"   51 seconds ago   Up 50 seconds             0.0.0.0:19000-19001->19000-19001/tcp                                                             posthog-objectstorage-1
 91f838afe40e   redis:6.2.7-alpine                         "docker-entrypoint.s…"   51 seconds ago   Up 50 seconds             0.0.0.0:6379->6379/tcp                                                                           posthog-redis-1
 
 # docker logs posthog-db-1 -n 1
@@ -124,13 +124,16 @@ On Linux you often have separate packages: `postgres` for the tools, `postgres-s
     <code>$PATH</code>. Otherwise the command line will use your system Node.js version instead.
 </blockquote>
 
-2. Install the latest Node.js 22 (the version used by PostHog in production) with `nvm install 22`. You can start using it in the current shell with `nvm use 22`.
+2. Install the Node.js version pinned in `.nvmrc` (the version used by PostHog in production) with `nvm install` (run from the repo root — nvm reads `.nvmrc`). Activate it in the current shell with `nvm use`.
 
-3. Install pnpm by running `corepack enable` and then running `corepack prepare pnpm@10 --activate`. Validate the installation with `pnpm --version`.
+3. Install pnpm by running `corepack enable`. Corepack will activate the version pinned in the root `package.json`'s `packageManager` field on the next `pnpm` invocation. Validate with `pnpm --version`.
 
 4. Install Node packages by running `pnpm i`.
 
 5. Run `pnpm --filter=@posthog/frontend typegen:write` to generate types for [Kea](https://keajs.org/) state management logics used all over the frontend.
+
+When iterating on one logic file, run `pnpm --filter=@posthog/frontend typegen:file <path-to-logic-file>` instead.
+The path can be absolute, repo-relative like `frontend/src/scenes/foo/fooLogic.ts`, or frontend-relative like `src/scenes/foo/fooLogic.ts`.
 
 > The first time you run typegen, it may get stuck in a loop. If so, cancel the process (`Ctrl+C`), discard all changes in the working directory (`git reset --hard`), and run `pnpm typegen:write` again. You may need to discard all changes once more when the second round of type generation completes.
 
@@ -196,18 +199,18 @@ pnpm i
      sudo apt install -y libxml2 libxmlsec1-dev libffi-dev pkg-config
      ```
 
-1. Install Python 3.12.
-   - On macOS, you can do so with Homebrew: `brew install python@3.12`.
+1. Install Python 3.13.
+   - On macOS, you can do so with Homebrew: `brew install python@3.13`.
 
    - On Debian-based Linux:
 
      ```bash
      sudo add-apt-repository ppa:deadsnakes/ppa -y
      sudo apt update
-     sudo apt install python3.12 python3.12-venv python3.12-dev -y
+     sudo apt install python3.13 python3.13-venv python3.13-dev -y
      ```
 
-Make sure when outside the venv to always use `python3` instead of `python`, as the latter may point to Python 2.x on some systems. If installing multiple versions of Python 3, such as by using the `deadsnakes` PPA, use `python3.12` instead of `python3`.
+Make sure when outside the venv to always use `python3` instead of `python`, as the latter may point to Python 2.x on some systems. If installing multiple versions of Python 3, such as by using the `deadsnakes` PPA, use `python3.13` instead of `python3`.
 
 You can also use [pyenv](https://github.com/pyenv/pyenv) if you wish to manage multiple versions of Python 3 on the same machine.
 
@@ -239,7 +242,7 @@ You can also use [pyenv](https://github.com/pyenv/pyenv) if you wish to manage m
 
    ```bash
    brew install openssl
-   CFLAGS="-I /opt/homebrew/opt/openssl/include $(python3.12-config --includes)" LDFLAGS="-L /opt/homebrew/opt/openssl/lib" GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1 GRPC_PYTHON_BUILD_SYSTEM_ZLIB=1 uv sync
+   CFLAGS="-I /opt/homebrew/opt/openssl/include $(python3.13-config --includes)" LDFLAGS="-L /opt/homebrew/opt/openssl/lib" GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1 GRPC_PYTHON_BUILD_SYSTEM_ZLIB=1 uv sync
    ```
 
    > **Friendly tip:** If you see `ERROR: Could not build wheels for xmlsec`, refer to this [issue](https://github.com/xmlsec/python-xmlsec/issues/254).
@@ -275,7 +278,7 @@ hogli start
 
 To customize which services to run, use `hogli dev:setup` to configure your dev environment interactively. This creates a profile that `hogli start` will use automatically.
 
-> **Note:** This command uses [mprocs](https://github.com/pvolok/mprocs) to run all development processes in a single terminal window. It will be installed automatically for macOS, while for Linux you can install it manually (`cargo` or `npm`) using the official repo guide.
+> **Note:** This command uses [phrocs](https://github.com/PostHog/posthog/blob/master/tools/phrocs/README.md) to run all development processes in a single terminal window. It will be installed automatically for macOS and Linux users (with [Homebrew](https://brew.sh/) installed and from our [Homebrew Tap](https://github.com/PostHog/homebrew-tap)) when running `hogli start`.
 
 > **Friendly tip:** If you get the error `Configuration property "enable.ssl.certificate.verification" not supported in this build: OpenSSL not available at build time`, make sure your environment is using the right `openssl` version by setting [those](https://github.com/xmlsec/python-xmlsec/issues/261#issuecomment-1630889826) environment variables, and then run `hogli start` again.
 

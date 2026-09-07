@@ -4,25 +4,29 @@ import { useMemo, useState } from 'react'
 import { IconCheck, IconPencil, IconPlusSmall, IconTrash, IconWarning, IconX } from '@posthog/icons'
 import { LemonButton, LemonInput } from '@posthog/lemon-ui'
 
+import { RestrictionScope, useRestrictedArea } from 'lib/components/RestrictedArea'
+import { TeamMembershipLevel } from 'lib/constants'
+import { LemonCheckbox } from 'lib/lemon-ui/LemonCheckbox'
 import { LemonTable } from 'lib/lemon-ui/LemonTable'
-import { uuid } from 'lib/utils'
+import { uuid } from 'lib/utils/dom'
 import { QUERY_TYPES_METADATA } from 'scenes/saved-insights/SavedInsights'
 
 import { SceneSection } from '~/layout/scenes/components/SceneSection'
 import { ConversionGoalFilter, NodeKind } from '~/queries/schema/schema-general'
 
 import { marketingAnalyticsSettingsLogic } from '../../logic/marketingAnalyticsSettingsLogic'
+import { ConversionGoalDropdown } from '../common/ConversionGoalDropdown'
 import {
     MarketingAnalyticsValidationWarningBanner,
     validateConversionGoals,
 } from '../MarketingAnalyticsValidationWarningBanner'
-import { ConversionGoalDropdown } from '../common/ConversionGoalDropdown'
 import {
     conversionGoalDescription,
     conversionGoalNamePlaceholder,
     defaultConversionGoalFilter,
     getConfiguredConversionGoalsLabel,
 } from './constants'
+import { revenueDisabledReason, withValidFlags } from './conversionGoalFlags'
 
 interface ConversionGoalFormState {
     filter: ConversionGoalFilter
@@ -33,6 +37,35 @@ const createEmptyFormState = (): ConversionGoalFormState => ({
     filter: defaultConversionGoalFilter,
     name: '',
 })
+
+function CountsAsToggles({
+    goal,
+    onChange,
+    disabledReason,
+}: {
+    goal: ConversionGoalFilter
+    onChange: (goal: ConversionGoalFilter) => void
+    disabledReason?: string | null
+}): JSX.Element {
+    return (
+        <div className="flex flex-col gap-1">
+            <LemonCheckbox
+                size="small"
+                label="Revenue"
+                checked={!!goal.counts_as_revenue}
+                onChange={(counts_as_revenue) => onChange({ ...goal, counts_as_revenue })}
+                disabledReason={disabledReason || revenueDisabledReason(goal)}
+            />
+            <LemonCheckbox
+                size="small"
+                label="Customer"
+                checked={!!goal.counts_as_customer}
+                onChange={(counts_as_customer) => onChange({ ...goal, counts_as_customer })}
+                disabledReason={disabledReason}
+            />
+        </div>
+    )
+}
 
 export function ConversionGoalsConfiguration({
     hideTitle = false,
@@ -46,6 +79,10 @@ export function ConversionGoalsConfiguration({
     const [formState, setFormState] = useState<ConversionGoalFormState>(createEmptyFormState)
     const [editingGoalId, setEditingGoalId] = useState<string | null>(null)
     const [editingGoal, setEditingGoal] = useState<ConversionGoalFilter | null>(null)
+    const restrictedReason = useRestrictedArea({
+        scope: RestrictionScope.Project,
+        minimumAccessLevel: TeamMembershipLevel.Admin,
+    })
 
     const validationWarnings = useMemo(() => validateConversionGoals(conversion_goals), [conversion_goals])
 
@@ -54,11 +91,11 @@ export function ConversionGoalsConfiguration({
         if (conversionGoalName === '') {
             conversionGoalName = formState.filter.custom_name || formState.filter.name || 'No name'
         }
-        const newGoal: ConversionGoalFilter = {
+        const newGoal: ConversionGoalFilter = withValidFlags({
             ...formState.filter,
             conversion_goal_id: formState.filter.conversion_goal_id || uuid(),
             conversion_goal_name: conversionGoalName,
-        }
+        })
 
         addOrUpdateConversionGoal(newGoal)
         setFormState(createEmptyFormState())
@@ -71,7 +108,7 @@ export function ConversionGoalsConfiguration({
 
     const handleSaveEdit = (): void => {
         if (editingGoal) {
-            addOrUpdateConversionGoal(editingGoal)
+            addOrUpdateConversionGoal(withValidFlags(editingGoal))
         }
         setEditingGoalId(null)
         setEditingGoal(null)
@@ -107,6 +144,7 @@ export function ConversionGoalsConfiguration({
                             value={formState.name}
                             onChange={(value) => setFormState((prev) => ({ ...prev, name: value }))}
                             placeholder={conversionGoalNamePlaceholder}
+                            disabledReason={restrictedReason}
                         />
                     </div>
 
@@ -123,8 +161,15 @@ export function ConversionGoalsConfiguration({
                                     },
                                 }))
                             }
+                            disabledReason={restrictedReason}
                         />
                     </div>
+
+                    <CountsAsToggles
+                        goal={formState.filter}
+                        onChange={(filter) => setFormState((prev) => ({ ...prev, filter }))}
+                        disabledReason={restrictedReason}
+                    />
 
                     <div className="flex gap-2">
                         <LemonButton
@@ -133,11 +178,17 @@ export function ConversionGoalsConfiguration({
                             disabled={!isFormValid}
                             size="small"
                             icon={<IconPlusSmall />}
+                            disabledReason={restrictedReason}
                         >
                             Add conversion goal
                         </LemonButton>
 
-                        <LemonButton onClick={() => setFormState(createEmptyFormState())}>Clear</LemonButton>
+                        <LemonButton
+                            onClick={() => setFormState(createEmptyFormState())}
+                            disabledReason={restrictedReason}
+                        >
+                            Clear
+                        </LemonButton>
                     </div>
                 </div>
             </div>
@@ -171,6 +222,7 @@ export function ConversionGoalsConfiguration({
                                                 )
                                             }
                                             size="small"
+                                            disabledReason={restrictedReason}
                                         />
                                     )
                                 }
@@ -206,6 +258,30 @@ export function ConversionGoalsConfiguration({
                             },
                         },
                         {
+                            key: 'counts_as',
+                            title: 'Counts as',
+                            render: (_, goal: ConversionGoalFilter) => {
+                                if (editingGoalId === goal.conversion_goal_id && editingGoal) {
+                                    return (
+                                        <CountsAsToggles
+                                            goal={editingGoal}
+                                            onChange={setEditingGoal}
+                                            disabledReason={restrictedReason}
+                                        />
+                                    )
+                                }
+                                const flags = [
+                                    goal.counts_as_revenue && 'Revenue',
+                                    goal.counts_as_customer && 'Customer',
+                                ].filter(Boolean)
+                                return flags.length ? (
+                                    <span className="text-xs">{flags.join(', ')}</span>
+                                ) : (
+                                    <span className="text-xs text-muted">Conversions only</span>
+                                )
+                            },
+                        },
+                        {
                             key: 'schema',
                             title: 'Schema mapping',
                             render: (_, goal: ConversionGoalFilter) =>
@@ -238,12 +314,14 @@ export function ConversionGoalsConfiguration({
                                                 type="primary"
                                                 onClick={handleSaveEdit}
                                                 tooltip="Save changes"
+                                                disabledReason={restrictedReason}
                                             />
                                             <LemonButton
                                                 icon={<IconX />}
                                                 size="small"
                                                 onClick={handleCancelEdit}
                                                 tooltip="Cancel"
+                                                disabledReason={restrictedReason}
                                             />
                                         </div>
                                     )
@@ -256,6 +334,7 @@ export function ConversionGoalsConfiguration({
                                             size="small"
                                             onClick={() => handleStartEdit(goal)}
                                             tooltip="Edit conversion goal"
+                                            disabledReason={restrictedReason}
                                         />
                                         <LemonButton
                                             icon={<IconTrash />}
@@ -263,6 +342,7 @@ export function ConversionGoalsConfiguration({
                                             status="danger"
                                             onClick={() => handleRemoveGoal(goal.conversion_goal_id)}
                                             tooltip="Remove conversion goal"
+                                            disabledReason={restrictedReason}
                                         />
                                     </div>
                                 )

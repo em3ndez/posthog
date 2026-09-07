@@ -5,22 +5,43 @@ import { useMocks } from '~/mocks/jest'
 import { initKeaTests } from '~/test/init'
 import { FilterLogicalOperator } from '~/types'
 
-import { LogsViewerFilters } from 'products/logs/frontend/components/LogsViewer/config/types'
+import {
+    SERVICE_NAME_FILTER,
+    SEVERITY_LEVEL_FILTER,
+    facetSelection,
+} from 'products/logs/frontend/components/LogsViewer/FacetRail/facetFilters'
 
 import { logsSceneLogic } from './logsSceneLogic'
 
 describe('logsSceneLogic', () => {
     let logic: ReturnType<typeof logsSceneLogic.build>
 
+    // The two legacy params fold into filterGroup, which is where the selection lives.
+    const selectedLevels = (): string[] =>
+        facetSelection(logic.values.filters.filterGroup, SEVERITY_LEVEL_FILTER).included
+    const selectedServices = (): string[] =>
+        facetSelection(logic.values.filters.filterGroup, SERVICE_NAME_FILTER).included
+
     beforeEach(async () => {
         useMocks({
             post: {
                 '/api/environments/:team_id/logs/query/': () => [200, { results: [], maxExportableLogs: 5000 }],
                 '/api/environments/:team_id/logs/sparkline/': () => [200, []],
+                '/api/projects/:team_id/logs/anomalies/series_bands/': () => [
+                    200,
+                    {
+                        service_name: 'checkout',
+                        window_start: '2026-08-10T10:00:00Z',
+                        window_end: '2026-08-17T10:00:00Z',
+                        interval_minutes: 60,
+                        series_truncated: false,
+                        series: [],
+                    },
+                ],
             },
         })
         initKeaTests()
-        logic = logsSceneLogic({ tabId: 'test-tab' })
+        logic = logsSceneLogic()
         logic.mount()
 
         await expectLogic(logic).toFinishAllListeners()
@@ -40,7 +61,7 @@ describe('logsSceneLogic', () => {
                 router.actions.push('/logs', { severityLevels: urlValue })
             }).toFinishAllListeners()
 
-            expect(logic.values.filters.severityLevels).toEqual(expected)
+            expect(selectedLevels()).toEqual(expected)
         })
 
         it.each([
@@ -51,7 +72,46 @@ describe('logsSceneLogic', () => {
                 router.actions.push('/logs', { serviceNames: urlValue })
             }).toFinishAllListeners()
 
-            expect(logic.values.filters.serviceNames).toEqual(expected)
+            expect(selectedServices()).toEqual(expected)
+        })
+
+        it.each<[string, string]>([
+            ['severityLevels', '["error"]'],
+            ['serviceNames', '["api"]'],
+        ])('drops the %s param once it has been applied', async (param, urlValue) => {
+            await expectLogic(logic, () => {
+                router.actions.push('/logs', { [param]: urlValue })
+            }).toFinishAllListeners()
+
+            // Left in place, the param is read again on every later URL change and folds its
+            // selection back in, contradicting whatever the rail did to it since.
+            expect(router.values.searchParams[param]).toBeUndefined()
+            expect(router.values.searchParams.filterGroup).not.toBeUndefined()
+        })
+
+        it.each<[string, string, string[], string[]]>([
+            [
+                'a group that already selects the facet wins over the param',
+                '["error"]',
+                ['error', 'warn'],
+                ['error', 'warn'],
+            ],
+            ['a group silent about the facet lets the param through', '["error"]', [], ['error']],
+        ])('%s', async (_, param, groupLevels, expected) => {
+            const values = groupLevels.length
+                ? [{ key: 'severity_level', type: 'log', operator: 'exact', value: groupLevels }]
+                : []
+            await expectLogic(logic, () => {
+                router.actions.push('/logs', {
+                    severityLevels: param,
+                    filterGroup: JSON.stringify({
+                        type: FilterLogicalOperator.And,
+                        values: [{ type: FilterLogicalOperator.And, values }],
+                    }),
+                })
+            }).toFinishAllListeners()
+
+            expect(selectedLevels()).toEqual(expected)
         })
 
         it('filters out malformed JSON as invalid severity level', async () => {
@@ -60,7 +120,7 @@ describe('logsSceneLogic', () => {
             }).toFinishAllListeners()
 
             // parseTagsFilter falls back to comma-separated parsing, then validation filters invalid levels
-            expect(logic.values.filters.severityLevels).toEqual([])
+            expect(selectedLevels()).toEqual([])
         })
 
         it('filters out non-array JSON as invalid severity level', async () => {
@@ -69,7 +129,7 @@ describe('logsSceneLogic', () => {
             }).toFinishAllListeners()
 
             // parseTagsFilter falls back to comma-separated parsing, then validation filters invalid levels
-            expect(logic.values.filters.severityLevels).toEqual([])
+            expect(selectedLevels()).toEqual([])
         })
 
         it('handles comma-separated values via parseTagsFilter', async () => {
@@ -77,7 +137,33 @@ describe('logsSceneLogic', () => {
                 router.actions.push('/logs', { severityLevels: 'error,warn,info' })
             }).toFinishAllListeners()
 
-            expect(logic.values.filters.severityLevels).toEqual(['error', 'warn', 'info'])
+            expect(selectedLevels()).toEqual(['error', 'warn', 'info'])
+        })
+
+        it.each([
+            ['a valid lens', 'patterns', 'patterns'],
+            ['an unrecognised lens falls back to the default', 'nonsense', 'logs'],
+        ])('applies viewMode from the URL: %s', async (_, urlValue, expected) => {
+            await expectLogic(logic, () => {
+                router.actions.push('/logs', { viewMode: urlValue })
+            }).toFinishAllListeners()
+
+            expect(logic.values.viewMode).toEqual(expected)
+        })
+
+        it('syncs lens switches back to the URL, dropping the param for the default lens', async () => {
+            // The round-trip contract for shareable lens links: switching to Patterns writes
+            // ?viewMode=patterns, and returning to Logs (the default) removes the param
+            // instead of pinning viewMode=logs into every copied URL.
+            await expectLogic(logic, () => {
+                logic.actions.setViewMode('patterns')
+            }).toFinishAllListeners()
+            expect(router.values.searchParams.viewMode).toEqual('patterns')
+
+            await expectLogic(logic, () => {
+                logic.actions.setViewMode('logs')
+            }).toFinishAllListeners()
+            expect(router.values.searchParams.viewMode).toBeUndefined()
         })
 
         it.each([
@@ -90,155 +176,240 @@ describe('logsSceneLogic', () => {
                 router.actions.push('/logs', { severityLevels: urlValue })
             }).toFinishAllListeners()
 
-            expect(logic.values.filters.severityLevels).toEqual(expected)
+            expect(selectedLevels()).toEqual(expected)
+        })
+
+        it('parses a stringified filterGroup from the URL (e.g. a cross-product session link)', async () => {
+            const filterGroup = {
+                type: 'AND',
+                values: [{ type: 'OR', values: [{ key: 'posthogSessionId', value: ['sess-1'], operator: 'exact' }] }],
+            }
+            await expectLogic(logic, () => {
+                router.actions.push('/logs', { filterGroup: JSON.stringify(filterGroup) })
+            }).toFinishAllListeners()
+
+            expect(logic.values.filters.filterGroup).toEqual(filterGroup)
+        })
+
+        it('ignores a malformed filterGroup in the URL', async () => {
+            const before = logic.values.filters.filterGroup
+            await expectLogic(logic, () => {
+                router.actions.push('/logs', { filterGroup: '{not valid json' })
+            }).toFinishAllListeners()
+
+            expect(logic.values.filters.filterGroup).toEqual(before)
         })
     })
 
-    describe('filter history', () => {
-        const createFilters = (searchTerm: string): LogsViewerFilters => ({
-            dateRange: { date_from: '-1h', date_to: null },
-            searchTerm,
-            severityLevels: [],
-            serviceNames: [],
-            filterGroup: { type: FilterLogicalOperator.And, values: [] },
+    describe('activeTab URL sync', () => {
+        it('defaults to viewer', () => {
+            expect(logic.values.activeTab).toEqual('viewer')
         })
 
-        beforeEach(async () => {
-            logic.actions.clearFilterHistory()
-            await expectLogic(logic).toFinishAllListeners()
+        it.each([
+            ['viewer', 'viewer'],
+            ['anomalies', 'anomalies'],
+            ['configuration', 'configuration'],
+        ])('parses valid activeTab "%s" from URL', async (urlValue, expected) => {
+            await expectLogic(logic, () => {
+                router.actions.push('/logs', { activeTab: urlValue })
+            }).toFinishAllListeners()
+
+            expect(logic.values.activeTab).toEqual(expected)
         })
 
-        describe('pushToFilterHistory', () => {
-            it('adds entry to empty history', async () => {
-                const filters = createFilters('test query')
+        it.each([
+            ['unknown string', 'invalid'],
+            ['array', ['viewer']],
+            ['object', { key: 'viewer' }],
+            ['number', 42],
+        ])('ignores invalid activeTab (%s)', async (_, urlValue) => {
+            await expectLogic(logic, () => {
+                router.actions.push('/logs', { activeTab: urlValue })
+            }).toFinishAllListeners()
 
-                await expectLogic(logic, () => {
-                    logic.actions.pushToFilterHistory(filters)
-                }).toMatchValues({
-                    filterHistory: [{ filters, timestamp: expect.any(Number) }],
-                })
-            })
-
-            it('prepends new entries to history', async () => {
-                const filters1 = createFilters('first')
-                const filters2 = createFilters('second')
-
-                logic.actions.pushToFilterHistory(filters1)
-                await expectLogic(logic).toFinishAllListeners()
-
-                await expectLogic(logic, () => {
-                    logic.actions.pushToFilterHistory(filters2)
-                }).toMatchValues({
-                    filterHistory: [
-                        { filters: filters2, timestamp: expect.any(Number) },
-                        { filters: filters1, timestamp: expect.any(Number) },
-                    ],
-                })
-            })
-
-            it('deduplicates consecutive identical filters', async () => {
-                const filters = createFilters('same query')
-
-                logic.actions.pushToFilterHistory(filters)
-                await expectLogic(logic).toFinishAllListeners()
-
-                await expectLogic(logic, () => {
-                    logic.actions.pushToFilterHistory(filters)
-                }).toMatchValues({
-                    filterHistory: [{ filters, timestamp: expect.any(Number) }],
-                })
-
-                expect(logic.values.filterHistory).toHaveLength(1)
-            })
-
-            it('limits history to 10 entries', async () => {
-                for (let i = 0; i < 15; i++) {
-                    logic.actions.pushToFilterHistory(createFilters(`query ${i}`))
-                }
-                await expectLogic(logic).toFinishAllListeners()
-
-                expect(logic.values.filterHistory).toHaveLength(10)
-                expect(logic.values.filterHistory[0].filters.searchTerm).toBe('query 14')
-                expect(logic.values.filterHistory[9].filters.searchTerm).toBe('query 5')
-            })
+            expect(logic.values.activeTab).toEqual('viewer')
         })
 
-        describe('clearFilterHistory', () => {
-            it('clears all history entries', async () => {
-                logic.actions.pushToFilterHistory(createFilters('query 1'))
-                logic.actions.pushToFilterHistory(createFilters('query 2'))
-                await expectLogic(logic).toFinishAllListeners()
+        it('syncs activeTab to URL on setActiveTab', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.setActiveTab('configuration')
+            }).toFinishAllListeners()
 
-                expect(logic.values.filterHistory).toHaveLength(2)
-
-                await expectLogic(logic, () => {
-                    logic.actions.clearFilterHistory()
-                }).toMatchValues({
-                    filterHistory: [],
-                })
-            })
+            expect(logic.values.activeTab).toEqual('configuration')
+            expect(router.values.searchParams).toHaveProperty('activeTab', 'configuration')
         })
 
-        describe('restoreFiltersFromHistory', () => {
-            it('restores filters from history entry', async () => {
-                const filters = createFilters('restored query')
-                filters.severityLevels = ['error', 'warn']
+        it('removes activeTab from URL when set to default', async () => {
+            // First set to non-default
+            await expectLogic(logic, () => {
+                logic.actions.setActiveTab('configuration')
+            }).toFinishAllListeners()
 
-                logic.actions.pushToFilterHistory(filters)
-                await expectLogic(logic).toFinishAllListeners()
+            // Then set back to default
+            await expectLogic(logic, () => {
+                logic.actions.setActiveTab('viewer')
+            }).toFinishAllListeners()
 
-                await expectLogic(logic, () => {
-                    logic.actions.restoreFiltersFromHistory(0)
-                })
-                    .toDispatchActions(['restoreFiltersFromHistory', 'setFilters'])
-                    .toMatchValues({
-                        filters: expect.objectContaining({
-                            searchTerm: 'restored query',
-                            severityLevels: ['error', 'warn'],
-                        }),
-                    })
-            })
+            expect(logic.values.activeTab).toEqual('viewer')
+            expect(router.values.searchParams).not.toHaveProperty('activeTab')
+        })
+    })
 
-            it('does not push to history when restoring', async () => {
-                const filters1 = createFilters('first')
-                const filters2 = createFilters('second')
+    describe('facetNameSearch URL sync', () => {
+        it('parses facetNameSearch from URL', async () => {
+            await expectLogic(logic, () => {
+                router.actions.push('/logs', { facetNameSearch: 'namespace' })
+            }).toFinishAllListeners()
 
-                logic.actions.pushToFilterHistory(filters1)
-                logic.actions.pushToFilterHistory(filters2)
-                await expectLogic(logic).toFinishAllListeners()
-
-                const historyLengthBefore = logic.values.filterHistory.length
-
-                await expectLogic(logic, () => {
-                    logic.actions.restoreFiltersFromHistory(1)
-                }).toFinishAllListeners()
-
-                expect(logic.values.filterHistory).toHaveLength(historyLengthBefore)
-            })
-
-            it('does nothing for invalid index', async () => {
-                logic.actions.pushToFilterHistory(createFilters('test'))
-                await expectLogic(logic).toFinishAllListeners()
-
-                await expectLogic(logic, () => {
-                    logic.actions.restoreFiltersFromHistory(99)
-                })
-                    .toDispatchActions(['restoreFiltersFromHistory'])
-                    .toNotHaveDispatchedActions(['setFilters'])
-            })
+            expect(logic.values.facetNameSearch).toEqual('namespace')
         })
 
-        describe('hasFilterHistory selector', () => {
-            it('returns false when history is empty', () => {
-                expect(logic.values.hasFilterHistory).toBe(false)
-            })
+        it('syncs facetNameSearch to URL on setFacetNameSearch', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.setFacetNameSearch('kube')
+            }).toFinishAllListeners()
 
-            it('returns true when history has entries', async () => {
-                logic.actions.pushToFilterHistory(createFilters('test'))
-                await expectLogic(logic).toFinishAllListeners()
+            expect(logic.values.facetNameSearch).toEqual('kube')
+            expect(router.values.searchParams).toHaveProperty('facetNameSearch', 'kube')
+        })
 
-                expect(logic.values.hasFilterHistory).toBe(true)
-            })
+        it('removes facetNameSearch from URL when cleared', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.setFacetNameSearch('kube')
+            }).toFinishAllListeners()
+
+            await expectLogic(logic, () => {
+                logic.actions.setFacetNameSearch('')
+            }).toFinishAllListeners()
+
+            expect(logic.values.facetNameSearch).toEqual('')
+            expect(router.values.searchParams).not.toHaveProperty('facetNameSearch')
+        })
+    })
+
+    describe('anomalies tab URL sync', () => {
+        // A write arms the sync guard, which clears on a macrotask that `toFinishAllListeners`
+        // does not flush. A real back-navigation lands long after that tick.
+        const flushUrlSyncGuard = async (): Promise<void> => {
+            await new Promise((resolve) => setTimeout(resolve, 0))
+        }
+
+        const onAnomaliesTab = async (): Promise<void> => {
+            await expectLogic(logic, () => {
+                logic.actions.setActiveTab('anomalies')
+            }).toFinishAllListeners()
+        }
+
+        it('reads the service and the window off the URL', async () => {
+            await expectLogic(logic, () => {
+                router.actions.push('/logs', {
+                    activeTab: 'anomalies',
+                    anomaliesService: 'checkout',
+                    anomaliesDateRange: { date_from: '-24h' },
+                })
+            }).toFinishAllListeners()
+
+            expect(logic.values.anomaliesService).toEqual('checkout')
+            expect(logic.values.anomaliesDateRange).toEqual({ date_from: '-24h' })
+        })
+
+        it('ignores the params while another tab is shown', async () => {
+            // Reading a service fetches its band charts, so an ungated read would fire that
+            // request from any URL change made on the viewer.
+            await expectLogic(logic, () => {
+                router.actions.push('/logs', { anomaliesService: 'checkout' })
+            }).toFinishAllListeners()
+
+            expect(logic.values.anomaliesService).toBeNull()
+        })
+
+        it('returns the picker to the default window when the param goes', async () => {
+            // This is the Back case: stepping past the change that wrote the param has to
+            // return the default week, not keep the older pick.
+            await expectLogic(logic, () => {
+                router.actions.push('/logs', {
+                    activeTab: 'anomalies',
+                    anomaliesDateRange: { date_from: '-24h' },
+                })
+            }).toFinishAllListeners()
+            await flushUrlSyncGuard()
+
+            await expectLogic(logic, () => {
+                router.actions.push('/logs', { activeTab: 'anomalies' })
+            }).toFinishAllListeners()
+
+            expect(logic.values.anomaliesDateRange).toEqual({ date_from: '-7d' })
+        })
+
+        it('falls back to the default window when the param is not a date range', async () => {
+            // A hand-edited or stale URL must not push a shape the picker and the band request
+            // cannot read.
+            await expectLogic(logic, () => {
+                router.actions.push('/logs', {
+                    activeTab: 'anomalies',
+                    anomaliesDateRange: ['-24h'],
+                })
+            }).toFinishAllListeners()
+
+            expect(logic.values.anomaliesDateRange).toEqual({ date_from: '-7d' })
+        })
+
+        it('writes both params, and drops each one at its default', async () => {
+            await onAnomaliesTab()
+
+            await expectLogic(logic, () => {
+                logic.actions.setAnomaliesService('checkout')
+                logic.actions.setAnomaliesDateRange({ date_from: '-24h' })
+            }).toFinishAllListeners()
+
+            expect(router.values.searchParams).toHaveProperty('anomaliesService', 'checkout')
+            expect(router.values.searchParams.anomaliesDateRange).toEqual({ date_from: '-24h' })
+
+            // Left in the URL, the default week would ride along in every link from this tab.
+            await expectLogic(logic, () => {
+                logic.actions.setAnomaliesService(null)
+                logic.actions.setAnomaliesDateRange({ date_from: '-7d' })
+            }).toFinishAllListeners()
+
+            expect(router.values.searchParams).not.toHaveProperty('anomaliesService')
+            expect(router.values.searchParams).not.toHaveProperty('anomaliesDateRange')
+        })
+
+        it('leaves the viewer own service and window params alone', async () => {
+            // Both tabs live under one URL. Sharing `dateRange` would move the viewer window,
+            // and `serviceNames` is deleted by the viewer writer, so the pick would not survive.
+            await expectLogic(logic, () => {
+                router.actions.push('/logs', {
+                    activeTab: 'anomalies',
+                    dateRange: { date_from: '-1h' },
+                })
+            }).toFinishAllListeners()
+
+            await expectLogic(logic, () => {
+                logic.actions.setAnomaliesService('checkout')
+                logic.actions.setAnomaliesDateRange({ date_from: '-24h' })
+            }).toFinishAllListeners()
+
+            expect(logic.values.filters.dateRange).toEqual({ date_from: '-1h' })
+            expect(router.values.searchParams.dateRange).toEqual({ date_from: '-1h' })
+        })
+
+        it('carries the params in and out of the URL with the tab', async () => {
+            // A clicked bucket sends the user to the viewer on a URL that has neither param, so
+            // the selection has to go back into the URL when the tab comes back.
+            await onAnomaliesTab()
+            await expectLogic(logic, () => {
+                logic.actions.setAnomaliesService('checkout')
+            }).toFinishAllListeners()
+
+            await expectLogic(logic, () => {
+                logic.actions.setActiveTab('viewer')
+            }).toFinishAllListeners()
+            expect(router.values.searchParams).not.toHaveProperty('anomaliesService')
+
+            await onAnomaliesTab()
+            expect(router.values.searchParams).toHaveProperty('anomaliesService', 'checkout')
         })
     })
 })

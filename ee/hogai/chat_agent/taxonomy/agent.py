@@ -1,4 +1,4 @@
-from typing import Generic, Literal
+from typing import Generic, Literal, cast
 
 from posthog.models import Team, User
 
@@ -33,8 +33,8 @@ class TaxonomyAgent(
     @property
     def state_type(self) -> type[StateType]:
         # Extract the State type from the generic parameter
-        state_type, _ = self._get_state_class(TaxonomyAgent)
-        return state_type
+        state_type = self._get_state_class(TaxonomyAgent).state_class
+        return cast("type[StateType]", state_type)
 
     @property
     def graph_name(self) -> AssistantGraphName:

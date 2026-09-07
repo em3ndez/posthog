@@ -1,3 +1,4 @@
+import re
 import json
 
 # nosemgrep: python.lang.security.use-defused-xml.use-defused-xml (XML generation only, no parsing - no XXE risk)
@@ -36,17 +37,65 @@ from posthog.schema import (
     TrendsQuery,
 )
 
+from posthog.event_usage import EventSource
 from posthog.hogql_queries.ai.team_taxonomy_query_runner import TeamTaxonomyQueryRunner
 from posthog.hogql_queries.query_runner import ExecutionMode
-from posthog.models import Team
-from posthog.taxonomy.taxonomy import CORE_FILTER_DEFINITIONS_BY_GROUP
+from posthog.models import Team, User
+from posthog.settings import EE_AVAILABLE
+from posthog.taxonomy.taxonomy import CORE_FILTER_DEFINITIONS_BY_GROUP, is_hidden_from_assistant
 
 from ee.hogai.utils.anthropic import SUPPORTED_ANTHROPIC_BLOCKS
-from ee.hogai.utils.types.base import ArtifactRefMessage, AssistantDispatcherEvent, AssistantMessageUnion
+from ee.hogai.utils.types.base import (
+    ArtifactRefMessage,
+    AssistantDispatcherEvent,
+    AssistantMessageUnion,
+    ConversationTitleAction,
+)
+
+
+def sanitize_for_system_reminder(text: str) -> str:
+    """Neutralize system_reminder tags to prevent framing spoofs in user-provided content."""
+    return re.sub(r"<(\s*/?\s*system_reminder\b[^>]*)>", r"&lt;\1&gt;", text, flags=re.IGNORECASE)
+
+
+BK_DRILLDOWN_HANDLE_RE = re.compile(r"`?\[bk-doc=[^\]]*\]`?")
+
+
+def strip_bk_drilldown_handles(text: str) -> str:
+    """Remove BK drill-down handles from text. No-op when absent."""
+    result = BK_DRILLDOWN_HANDLE_RE.sub("", text)
+    return re.sub(r"  +", " ", result)
 
 
 def remove_line_breaks(line: str) -> str:
     return line.replace("\n", " ")
+
+
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+# Descriptions are an unbounded TextField; cap each one so a single oversized description can't
+# blow up every team member's prompt. The taxonomy already bounds the number of events per prompt.
+MAX_EVENT_DESCRIPTION_LENGTH = 500
+
+NOT_SEEN_RECENTLY_MARKER = "(not seen in the last 30 days)"
+NOT_SEEN_RECENTLY_LEGEND = (
+    f"Events marked {NOT_SEEN_RECENTLY_MARKER} are listed for reference only. This project has sent none of them "
+    "recently, so never present them as data it is collecting."
+)
+
+
+def sanitize_event_description(text: str) -> str:
+    """Neutralize an untrusted event description before it goes into the model's context.
+
+    Event definition descriptions (and per-conversation context descriptions) are user-controlled
+    project metadata, so they're treated as untrusted data: an editor could embed instructions that
+    reach another user's agent session verbatim. Collapse control characters and whitespace so the
+    text can't break out of its line, cap the length, and neutralize system_reminder framing.
+    """
+    collapsed = re.sub(r"\s+", " ", _CONTROL_CHARS_RE.sub(" ", text)).strip()
+    if len(collapsed) > MAX_EVENT_DESCRIPTION_LENGTH:
+        collapsed = collapsed[:MAX_EVENT_DESCRIPTION_LENGTH].rstrip() + "…"
+    return sanitize_for_system_reminder(collapsed)
 
 
 def filter_and_merge_messages(
@@ -149,25 +198,39 @@ def convert_tool_messages_to_dict(messages: Sequence[AssistantMessageUnion]) -> 
     return {message.tool_call_id: message for message in messages if isinstance(message, AssistantToolCallMessage)}
 
 
-def _process_events_data(events_in_context: list[MaxEventContext], team: Team) -> tuple[list[dict], dict[str, str]]:
+def _process_events_data(
+    events_in_context: list[MaxEventContext],
+    team: Team,
+    user: User,
+    limit: int | None = None,
+    offset: int | None = None,
+    event_source: EventSource = EventSource.POSTHOG_AI,
+) -> tuple[list[dict], dict[str, str], bool]:
     """Common logic for processing events and building event data."""
-    response = TeamTaxonomyQueryRunner(TeamTaxonomyQuery(), team).run(
-        ExecutionMode.RECENT_CACHE_CALCULATE_ASYNC_IF_STALE_AND_BLOCKING_ON_MISS
+    query = TeamTaxonomyQuery(limit=limit, offset=offset)
+    response = TeamTaxonomyQueryRunner(query, team, user=user).run(
+        ExecutionMode.RECENT_CACHE_CALCULATE_ASYNC_IF_STALE_AND_BLOCKING_ON_MISS,
+        user=user,
+        analytics_props={"source": event_source},
     )
 
     if not isinstance(response, CachedTeamTaxonomyQueryResponse):
         raise ValueError("Failed to generate events prompt.")
+
+    has_more = bool(response.hasMore)
+
+    # The runner pads its results with well-known event names at count 0, so a zero count means the
+    # project has no such event in the query window — not that the event is merely rare.
+    not_seen_recently = {item.event for item in response.results if item.count == 0}
 
     events: list[str] = [
         # Add "All events" to the mapping
         "All events",
     ]
     for item in response.results:
-        if len(response.results) > 25 and item.count <= 3:
-            continue
-        if event_core_definition := CORE_FILTER_DEFINITIONS_BY_GROUP["events"].get(item.event):
-            if event_core_definition.get("system") or event_core_definition.get("ignored_in_assistant"):
-                continue  # Skip system or ignored events
+        event_def = CORE_FILTER_DEFINITIONS_BY_GROUP.get("events", {}).get(item.event)
+        if event_def and is_hidden_from_assistant(event_def):
+            continue  # Skip system or ignored events (safety net, already filtered in SQL)
         events.append(item.event)
 
     event_to_description: dict[str, str] = {}
@@ -180,32 +243,94 @@ def _process_events_data(events_in_context: list[MaxEventContext], team: Team) -
     # Create a set of event names from context for efficient lookup
     context_event_names = {event.name for event in events_in_context if event.name}
 
+    # Fall back to the user-authored descriptions stored on event definitions for any custom
+    # events that aren't covered by the core taxonomy or the conversation context.
+    db_event_descriptions = _get_event_definition_descriptions(team, events, event_to_description)
+
     processed_events = []
     for event_name in events:
-        event_data = {"name": event_name}
+        event_data: dict[str, Any] = {"name": event_name}
+        if event_name in not_seen_recently:
+            event_data["not_seen_recently"] = True
 
         if event_core_definition := CORE_FILTER_DEFINITIONS_BY_GROUP["events"].get(event_name):
             # Only skip if it's not in context (context events should always be included)
-            if event_name not in context_event_names and (
-                event_core_definition.get("system") or event_core_definition.get("ignored_in_assistant")
-            ):
+            if event_name not in context_event_names and is_hidden_from_assistant(event_core_definition):
                 continue  # Skip irrelevant events but keep events the user has added to the context
-            if description := event_core_definition.get("description"):
-                if label := event_core_definition.get("label_llm") or event_core_definition.get("label"):
-                    event_data["description"] = f"{label}. {description}"
-                else:
-                    event_data["description"] = description
-                event_data["description"] = remove_line_breaks(event_data["description"])
+            if core_description := _format_core_event_description(event_core_definition):
+                event_data["description"] = core_description
         elif event_name in event_to_description:
-            event_data["description"] = remove_line_breaks(event_to_description[event_name])
+            event_data["description"] = sanitize_event_description(event_to_description[event_name])
+        elif event_name in db_event_descriptions:
+            event_data["description"] = sanitize_event_description(db_event_descriptions[event_name])
 
         processed_events.append(event_data)
 
-    return processed_events, event_to_description
+    return processed_events, event_to_description, has_more
 
 
-def format_events_xml(events_in_context: list[MaxEventContext], team: Team) -> str:
-    processed_events, _ = _process_events_data(events_in_context, team)
+def _format_core_event_description(event_core_definition: Mapping[str, Any]) -> str | None:
+    """Build a single-line description for a core taxonomy event, prefixed with its label."""
+    description = event_core_definition.get("description")
+    if not description:
+        return None
+    if label := event_core_definition.get("label_llm") or event_core_definition.get("label"):
+        description = f"{label}. {description}"
+    return remove_line_breaks(description)
+
+
+def get_event_description(team: Team, event_name: str) -> str | None:
+    """Return a human-readable description for a single event, or None if none is known.
+
+    Mirrors the precedence used when listing events: the built-in core taxonomy description wins,
+    otherwise fall back to the user-authored description stored on the event definition (EE only).
+    Used to surface a description on the single-event properties path so the agent doesn't have to
+    list every event to learn what one event means.
+    """
+    if event_core_definition := CORE_FILTER_DEFINITIONS_BY_GROUP["events"].get(event_name):
+        return _format_core_event_description(event_core_definition)
+    if description := _get_event_definition_descriptions(team, [event_name], {}).get(event_name):
+        return sanitize_event_description(description)
+    return None
+
+
+def _get_event_definition_descriptions(
+    team: Team, event_names: list[str], already_described: dict[str, str]
+) -> dict[str, str]:
+    """Map event name -> user-authored description from the team's event definitions.
+
+    Only the enterprise `EventDefinition` model carries a `description` field, so this is a no-op
+    on non-EE builds. Skips core taxonomy events and events already described via context, and
+    runs a single batched query rather than one per event.
+    """
+    if not EE_AVAILABLE:
+        return {}
+
+    from ee.models.event_definition import (
+        EnterpriseEventDefinition,  # noqa: PLC0415 — EE-only model, keep off the OSS import path
+    )
+
+    names_to_fetch = [
+        name
+        for name in event_names
+        if name not in already_described
+        and name != "All events"
+        and name not in CORE_FILTER_DEFINITIONS_BY_GROUP["events"]
+    ]
+    if not names_to_fetch:
+        return {}
+
+    rows = (
+        EnterpriseEventDefinition.objects.filter(team_id=team.pk, name__in=names_to_fetch)
+        .exclude(description__isnull=True)
+        .exclude(description="")
+        .values_list("name", "description")
+    )
+    return {name: description for name, description in rows if description}
+
+
+def format_events_xml(events_in_context: list[MaxEventContext], team: Team, user: User) -> str:
+    processed_events, _, _ = _process_events_data(events_in_context, team, user)
 
     root = ET.Element("defined_events")
     for event_data in processed_events:
@@ -215,18 +340,41 @@ def format_events_xml(events_in_context: list[MaxEventContext], team: Team) -> s
         if "description" in event_data:
             desc_tag = ET.SubElement(event_tag, "description")
             desc_tag.text = event_data["description"]
+        if event_data.get("not_seen_recently"):
+            ET.SubElement(event_tag, "not_seen_recently").text = "true"
 
     return ET.tostring(root, encoding="unicode")
 
 
-def format_events_yaml(events_in_context: list[MaxEventContext], team: Team) -> str:
-    processed_events, _ = _process_events_data(events_in_context, team)
+def format_events_yaml(
+    events_in_context: list[MaxEventContext],
+    team: Team,
+    user: User,
+    limit: int | None = None,
+    offset: int | None = None,
+    event_source: EventSource = EventSource.POSTHOG_AI,
+) -> str:
+    processed_events, _, has_more = _process_events_data(
+        events_in_context, team, user, limit=limit, offset=offset, event_source=event_source
+    )
 
     formatted_events = ["events:"]
+    any_not_seen_recently = False
     for event_data in processed_events:
         name = event_data["name"]
         description = event_data.get("description", "")
-        formatted_events.append(f"- `{name}` - {description}" if description else f"- `{name}`")
+        line = f"- `{name}` - {description}" if description else f"- `{name}`"
+        if event_data.get("not_seen_recently"):
+            any_not_seen_recently = True
+            line += f" {NOT_SEEN_RECENTLY_MARKER}"
+        formatted_events.append(line)
+
+    if any_not_seen_recently:
+        formatted_events.append(f"\n# {NOT_SEEN_RECENTLY_LEGEND}")
+
+    if has_more:
+        next_offset = (offset or 0) + (limit or 500)
+        formatted_events.append(f"\n# More events available. To fetch the next page, use offset={next_offset}")
 
     return "\n".join(formatted_events)
 
@@ -334,6 +482,10 @@ def normalize_ai_message(message: AIMessage | AIMessageChunk) -> list[AssistantM
         for i, final_message in enumerate(messages):
             final_message.id = f"temp-{i}"  # Assign each ephemeral message an index-based temp ID
 
+    for msg in messages:
+        if msg.content:
+            msg.content = strip_bk_drilldown_handles(msg.content)
+
     return messages
 
 
@@ -355,14 +507,18 @@ def cast_assistant_query(
         raise ValueError(f"Unsupported query type: {query.kind}")
 
 
-def build_insight_url(team: Team, id: str) -> str:
-    """Build the URL for an insight."""
-    return f"/project/{team.id}/insights/{id}"
+def build_insight_url(id: str) -> str:
+    """Build the URL for an insight.
+
+    Unprefixed by `/project/<id>`: these URLs are handed to the model, which is instructed to omit
+    that prefix, and the app resolves them against the project the user is already in.
+    """
+    return f"/insights/{id}"
 
 
-def build_dashboard_url(team: Team, id: int) -> str:
-    """Build the URL for a dashboard."""
-    return f"/project/{team.id}/dashboard/{id}"
+def build_dashboard_url(id: int) -> str:
+    """Build the URL for a dashboard. Unprefixed, for the same reason as `build_insight_url`."""
+    return f"/dashboard/{id}"
 
 
 def extract_stream_update(update: Any) -> Any:
@@ -372,7 +528,7 @@ def extract_stream_update(update: Any) -> Any:
         # If it's a LangGraph-based chunk, we remove the first two elements, which are "custom" and the parent graph namespace
         update = update[2]
 
-    if isinstance(update, AssistantDispatcherEvent):
+    if isinstance(update, (AssistantDispatcherEvent, ConversationTitleAction)):
         return update
 
     update = update[1:]  # we remove the first element, which is the node/subgraph node name

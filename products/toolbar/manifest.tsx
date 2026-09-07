@@ -1,6 +1,6 @@
 import { urls } from 'scenes/urls'
 
-import { ProductKey } from '~/queries/schema/schema-general'
+import { ProductItemCategory, ProductKey } from '~/queries/schema/schema-general'
 
 import { ProductManifest } from '../../frontend/src/types'
 
@@ -12,6 +12,7 @@ export const manifest: ProductManifest = {
             projectBased: true,
             description: 'PostHog toolbar launches PostHog right in your app or website.',
             iconType: 'toolbar',
+            docsHref: 'https://posthog.com/docs/toolbar',
         },
     },
     urls: {
@@ -23,7 +24,7 @@ export const manifest: ProductManifest = {
             intents: [ProductKey.TOOLBAR],
             href: urls.toolbarLaunch(),
             type: 'toolbar',
-            category: 'Tools',
+            category: ProductItemCategory.TOOLS,
             iconType: 'toolbar',
             sceneKey: 'Toolbar',
         },

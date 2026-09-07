@@ -3,8 +3,6 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Optional
 
-from django.db.models import Prefetch
-
 from posthog.schema import DatabaseSchemaManagedViewTableKind
 
 from posthog.hogql.timings import HogQLTimings
@@ -12,37 +10,30 @@ from posthog.hogql.timings import HogQLTimings
 from posthog.exceptions_capture import capture_exception
 from posthog.models.team.team import Team
 
-from products.data_warehouse.backend.models.external_data_schema import ExternalDataSchema
-from products.data_warehouse.backend.models.external_data_source import ExternalDataSource
-from products.data_warehouse.backend.types import ExternalDataSourceType
 from products.revenue_analytics.backend.views import KIND_TO_CLASS, RevenueAnalyticsBaseView
 from products.revenue_analytics.backend.views.core import BuiltQuery, SourceHandle
 from products.revenue_analytics.backend.views.schemas import SCHEMAS
 from products.revenue_analytics.backend.views.sources.registry import BUILDERS
+from products.warehouse_sources.backend.facade.api import list_revenue_sources
+from products.warehouse_sources.backend.facade.types import ExternalDataSourceType
 
 SUPPORTED_SOURCES: list[ExternalDataSourceType] = [ExternalDataSourceType.STRIPE]
 
 
 def _iter_source_handles(team: Team, timings: HogQLTimings) -> Iterable[SourceHandle]:
-    with timings.measure("for_events"):
+    with timings.measure("for_events", emit_span=True):
         for event in team.revenue_analytics_config.events:
             yield SourceHandle(type="events", team=team, event=event)
 
-    with timings.measure("for_schema_sources"):
-        queryset = (
-            ExternalDataSource.objects.filter(
-                team_id=team.pk,
-                source_type__in=SUPPORTED_SOURCES,
-            )
-            .exclude(deleted=True)
-            .prefetch_related(Prefetch("schemas", queryset=ExternalDataSchema.objects.prefetch_related("table")))
-            .prefetch_related(Prefetch("revenue_analytics_config"))
-        )
-
-        for source in queryset:
-            if source.revenue_analytics_config_safe.enabled:
-                with timings.measure(f"source.{source.pk}"):
-                    yield SourceHandle(type=source.source_type.lower(), team=team, source=source)  # type: ignore
+    with timings.measure("for_schema_sources", emit_span=True):
+        for source in list_revenue_sources(team.pk, source_types=SUPPORTED_SOURCES):
+            if source.enabled:
+                with timings.measure(f"source.{source.id}"):
+                    yield SourceHandle(
+                        type=source.source_type.lower(),  # type: ignore[arg-type]
+                        team=team,
+                        source=source,
+                    )
 
 
 def _query_to_view(

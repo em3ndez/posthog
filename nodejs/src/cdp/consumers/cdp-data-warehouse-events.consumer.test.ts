@@ -1,12 +1,24 @@
+import '../../../tests/helpers/mocks/consumer.mock'
+import { createMockJobQueue } from '../../../tests/helpers/mocks/job-queue.mock'
 import { mockProducerObserver } from '../../../tests/helpers/mocks/producer.mock'
 
-import { createOrganization, createTeam, getFirstTeam, getTeam, resetTestDatabase } from '../../../tests/helpers/sql'
+import { HogFlow } from '~/cdp/schema/hogflow'
+import { closeHub, createHub } from '~/common/utils/db/hub'
+
+import { createCdpConsumerDeps } from '../../../tests/helpers/cdp'
+import {
+    createOrganization,
+    createTeam,
+    createTestTeamFixture,
+    getTeam,
+    updateOrganizationAvailableFeatures,
+} from '../../../tests/helpers/sql'
 import { Hub, Team } from '../../types'
-import { closeHub, createHub } from '../../utils/db/hub'
+import { FixtureHogFlowBuilder } from '../_tests/builders/hogflow.builder'
 import { HOG_EXAMPLES, HOG_FILTERS_EXAMPLES, HOG_INPUTS_EXAMPLES } from '../_tests/examples'
 import { insertHogFunction as _insertHogFunction, createKafkaMessage } from '../_tests/fixtures'
+import { insertHogFlow as _insertHogFlow } from '../_tests/fixtures-hogflows'
 import { CdpDataWarehouseEvent } from '../schema'
-import { CyclotronJobQueue } from '../services/job-queue/job-queue'
 import { HogWatcherState } from '../services/monitoring/hog-watcher.service'
 import { HogFunctionInvocationGlobals, HogFunctionType } from '../types'
 import { CdpDatawarehouseEventsConsumer } from './cdp-data-warehouse-events.consumer'
@@ -18,11 +30,19 @@ describe('CdpDatawarehouseEventsConsumer', () => {
     let hub: Hub
     let team: Team
     let team2: Team
-    let mockQueueInvocations: jest.Mock
+    let mockQueueInvocations: jest.MockedFunction<any>
 
-    const createDataWarehouseEvent = (teamId: number, properties: Record<string, any> = {}): CdpDataWarehouseEvent => {
+    const createDataWarehouseEvent = (
+        teamId: number,
+        properties: Record<string, any> = {},
+        tableName?: string,
+        tableType?: 'source' | 'view'
+    ): CdpDataWarehouseEvent => {
         return {
             team_id: teamId,
+            table_name: tableName,
+            table_type: tableType,
+            event_id: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
             properties: {
                 column1: 'value1',
                 column2: 123,
@@ -42,35 +62,34 @@ describe('CdpDatawarehouseEventsConsumer', () => {
         return item
     }
 
+    const insertHogFlow = async (hogFlow: HogFlow): Promise<HogFlow> => {
+        return await _insertHogFlow(hub.postgres, hogFlow)
+    }
+
     beforeEach(async () => {
-        await resetTestDatabase()
         hub = await createHub()
-        team = await getFirstTeam(hub) // This team has data_pipelines feature by default (legacy addon)
+        const { organizationId, team: fixtureTeam } = await createTestTeamFixture(hub.postgres)
+        team = fixtureTeam
+        await updateOrganizationAvailableFeatures(hub.postgres, organizationId, [
+            { key: 'data_pipelines', name: 'Data Pipelines' },
+        ])
 
         // Create second organization without data_pipelines for testing quota limiting
         const otherOrganizationId = await createOrganization(hub.postgres)
         const team2Id = await createTeam(hub.postgres, otherOrganizationId)
-        team2 = (await getTeam(hub, team2Id))! // This team does NOT have data_pipelines
+        team2 = (await getTeam(hub.postgres, team2Id))! // This team does NOT have data_pipelines
 
         // Set up default quota limiting mock - not limited by default
         jest.spyOn(hub.quotaLimiting, 'isTeamQuotaLimited').mockResolvedValue(false)
 
-        processor = new CdpDatawarehouseEventsConsumer(hub)
+        const mockJobQueue = createMockJobQueue()
 
-        // NOTE: We don't want to actually connect to Kafka for these tests as it is slow and we are testing the core logic only
-        processor['kafkaConsumer'] = {
-            connect: jest.fn(),
-            disconnect: jest.fn(),
-            isHealthy: jest.fn(() => ({ status: 'healthy' })),
-        } as any
+        processor = new CdpDatawarehouseEventsConsumer(hub, createCdpConsumerDeps(hub), {
+            hogQueue: mockJobQueue,
+            hogflowQueue: mockJobQueue,
+        })
 
-        processor['cyclotronJobQueue'] = {
-            queueInvocations: jest.fn(),
-            startAsProducer: jest.fn(() => Promise.resolve()),
-            stop: jest.fn(),
-        } as unknown as jest.Mocked<CyclotronJobQueue>
-
-        mockQueueInvocations = jest.mocked(processor['cyclotronJobQueue']['queueInvocations'])
+        mockQueueInvocations = mockJobQueue.queueInvocations
 
         await processor.start()
     })
@@ -106,8 +125,9 @@ describe('CdpDatawarehouseEventsConsumer', () => {
                 column2: 123,
                 test_prop: 'test_value',
             })
-            expect(invocations[0].event.uuid).toBe('data-warehouse-table-uuid-do-not-use')
-            expect(invocations[0].event.event).toBe('data-warehouse-table-event-do-not-use')
+            // Deterministic per-row id from the producer, surfaced as event.uuid for stable billing dedup.
+            expect(invocations[0].event.uuid).toBe('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee')
+            expect(invocations[0].event.event).toBe('$warehouse_source_row')
         })
 
         it('should not parse events for teams without hog functions or flows', async () => {
@@ -205,6 +225,36 @@ describe('CdpDatawarehouseEventsConsumer', () => {
             expect(invocations).toHaveLength(1)
             expect(invocations[0].teamId).toBe(fnWithDataWarehouseFilter.team_id)
         })
+
+        it("should only invoke destinations subscribed to the row's table", async () => {
+            const fnForOrders = await insertHogFunction({
+                ...HOG_EXAMPLES.simple_fetch,
+                ...HOG_INPUTS_EXAMPLES.simple_fetch_data_warehouse_table,
+                filters: {
+                    source: 'data-warehouse-table',
+                    bytecode: ['_h', 29],
+                    data_warehouse: [{ table_name: 'postgres.orders' }],
+                },
+            })
+
+            await insertHogFunction({
+                ...HOG_EXAMPLES.simple_fetch,
+                ...HOG_INPUTS_EXAMPLES.simple_fetch_data_warehouse_table,
+                filters: {
+                    source: 'data-warehouse-table',
+                    bytecode: ['_h', 29],
+                    data_warehouse: [{ table_name: 'stripe.charge' }],
+                },
+            })
+
+            const messages = [createKafkaMessage(createDataWarehouseEvent(team.id, {}, 'postgres.orders'))]
+            const globals = await processor._parseKafkaBatch(messages)
+
+            const { invocations } = await processor.processBatch(globals)
+
+            expect(invocations).toHaveLength(1)
+            expect((invocations[0] as any).hogFunction.id).toBe(fnForOrders.id)
+        })
     })
 
     describe('processBatch', () => {
@@ -284,7 +334,7 @@ describe('CdpDatawarehouseEventsConsumer', () => {
             expect(mockProducerObserver.getProducedKafkaMessagesForTopic('clickhouse_app_metrics2_test')).toMatchObject(
                 [
                     {
-                        key: expect.any(String),
+                        key: null,
                         topic: 'clickhouse_app_metrics2_test',
                         value: {
                             app_source: 'hog_function',
@@ -298,7 +348,7 @@ describe('CdpDatawarehouseEventsConsumer', () => {
                     },
                     // Billing is per-event, not per-destination
                     {
-                        key: expect.any(String),
+                        key: null,
                         topic: 'clickhouse_app_metrics2_test',
                         value: {
                             app_source: 'hog_function',
@@ -313,6 +363,19 @@ describe('CdpDatawarehouseEventsConsumer', () => {
                     },
                 ]
             )
+        })
+
+        it('should queue a running lifecycle row for each invocation so the runs UI shows in-flight work', async () => {
+            const queueLifecycleRowSpy = jest.spyOn(
+                processor['invocationResultsService']['invocationResultsRowsService'],
+                'queueLifecycleRow'
+            )
+
+            const { invocations } = await processor.processBatch([globals])
+
+            expect(invocations).toHaveLength(1)
+            expect(queueLifecycleRowSpy).toHaveBeenCalledTimes(1)
+            expect(queueLifecycleRowSpy).toHaveBeenCalledWith(invocations[0], 'running')
         })
 
         it('should bill once per event when multiple destinations match', async () => {
@@ -343,6 +406,98 @@ describe('CdpDatawarehouseEventsConsumer', () => {
                 metric_name: 'billable_invocation',
             })
         })
+    })
+
+    describe('hog flow invocations', () => {
+        const buildDataWarehouseHogFlow = (
+            teamId: number,
+            tableName: string,
+            triggerType: 'data-warehouse-table' | 'data-warehouse-view' = 'data-warehouse-table'
+        ): HogFlow =>
+            new FixtureHogFlowBuilder()
+                .withTeamId(teamId)
+                .withSimpleWorkflow({
+                    trigger: {
+                        type: triggerType,
+                        table_name: tableName,
+                        // Always-true bytecode (return true)
+                        filters: { properties: [], bytecode: ['_h', 29] } as any,
+                    },
+                })
+                .build()
+
+        it('should build a hog flow invocation when the row table matches the trigger', async () => {
+            const hogFlow = await insertHogFlow(buildDataWarehouseHogFlow(team.id, 'postgres.table_1'))
+
+            const event = createDataWarehouseEvent(team.id, { test_prop: 'test_value' }, 'postgres.table_1')
+            const globals = await processor._parseKafkaBatch([createKafkaMessage(event)])
+            expect(globals).toHaveLength(1)
+
+            const { invocations } = await processor.processBatch(globals)
+
+            const hogFlowInvocations = invocations.filter((i: any) => i.hogFlow)
+            expect(hogFlowInvocations).toHaveLength(1)
+            expect(hogFlowInvocations[0].functionId).toBe(hogFlow.id)
+        })
+
+        it('should not build a hog flow invocation when the row table does not match', async () => {
+            await insertHogFlow(buildDataWarehouseHogFlow(team.id, 'postgres.table_1'))
+
+            const event = createDataWarehouseEvent(team.id, {}, 'postgres.other_table')
+            const globals = await processor._parseKafkaBatch([createKafkaMessage(event)])
+
+            const { invocations } = await processor.processBatch(globals)
+
+            const hogFlowInvocations = invocations.filter((i: any) => i.hogFlow)
+            expect(hogFlowInvocations).toHaveLength(0)
+        })
+
+        it('should parse rows for workflow-only teams (no hog functions)', async () => {
+            await insertHogFlow(buildDataWarehouseHogFlow(team.id, 'postgres.table_1'))
+
+            const event = createDataWarehouseEvent(team.id, {}, 'postgres.table_1')
+            const globals = await processor._parseKafkaBatch([createKafkaMessage(event)])
+
+            // Team has a workflow but no hog functions - the row must not be dropped.
+            // The source table is exposed via event.properties.$source_table so the pipeline's
+            // eligibilityFn can match warehouse-table triggers without a top-level globals field.
+            expect(globals).toHaveLength(1)
+            expect(globals[0].event?.event).toBe('$warehouse_source_row')
+            expect(globals[0].event?.properties?.$source_table).toBe('postgres.table_1')
+        })
+
+        it('should build a hog flow invocation for a materialized view row', async () => {
+            const hogFlow = await insertHogFlow(
+                buildDataWarehouseHogFlow(team.id, 'daily_revenue', 'data-warehouse-view')
+            )
+
+            const event = createDataWarehouseEvent(team.id, {}, 'daily_revenue', 'view')
+            const globals = await processor._parseKafkaBatch([createKafkaMessage(event)])
+            expect(globals[0].event?.event).toBe('$warehouse_view_row')
+
+            const { invocations } = await processor.processBatch(globals)
+
+            const hogFlowInvocations = invocations.filter((i: any) => i.hogFlow)
+            expect(hogFlowInvocations).toHaveLength(1)
+            expect(hogFlowInvocations[0].functionId).toBe(hogFlow.id)
+        })
+
+        it.each([
+            ['view', 'data-warehouse-table'],
+            ['source', 'data-warehouse-view'],
+        ] as const)(
+            'should not invoke a %s row against a %s trigger of the same name',
+            async (tableType, triggerType) => {
+                await insertHogFlow(buildDataWarehouseHogFlow(team.id, 'same_name', triggerType))
+
+                const event = createDataWarehouseEvent(team.id, {}, 'same_name', tableType)
+                const globals = await processor._parseKafkaBatch([createKafkaMessage(event)])
+
+                const { invocations } = await processor.processBatch(globals)
+
+                expect(invocations.filter((i: any) => i.hogFlow)).toHaveLength(0)
+            }
+        )
     })
 
     describe('quota limiting', () => {

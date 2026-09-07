@@ -1,14 +1,25 @@
+import { MOCK_TEAM_ID } from 'lib/api.mock'
+
 import { router } from 'kea-router'
 import { expectLogic, partial } from 'kea-test-utils'
+import posthog from 'posthog-js'
 
 import { lemonToast } from 'lib/lemon-ui/LemonToast/LemonToast'
 
 import { refreshTreeItem } from '~/layout/panel-layout/ProjectTree/projectTreeLogic'
 import { useMocks } from '~/mocks/jest'
+import {
+    type ExperimentExposureCriteria,
+    NodeKind,
+    ProductIntentContext,
+    ProductKey,
+} from '~/queries/schema/schema-general'
 import { initKeaTests } from '~/test/init'
 import type { Experiment } from '~/types'
 
-import { NEW_EXPERIMENT } from '../constants'
+import { NEW_EXPERIMENT } from 'products/experiments/frontend/constants'
+import { DEFAULT_MODEL, DEFAULT_PROVIDER } from 'products/replay_vision/frontend/replay_scanners/types'
+
 import { createExperimentLogic } from './createExperimentLogic'
 
 jest.mock('lib/lemon-ui/LemonToast/LemonToast', () => ({
@@ -25,34 +36,62 @@ jest.mock('~/layout/panel-layout/ProjectTree/projectTreeLogic', () => ({
 describe('createExperimentLogic', () => {
     let logic: ReturnType<typeof createExperimentLogic.build>
     let routerPushSpy: jest.SpyInstance
+    let scannerCreateSpy: jest.Mock
+    let scannerRequestBody: Record<string, unknown> | null
+    let productIntentBodies: Record<string, unknown>[]
+    let exposureEventSeenWithSessionId: boolean
 
     beforeEach(() => {
-        // Clear localStorage to prevent persisted state from affecting tests
+        // Clear persisted state to prevent it from affecting tests
         localStorage.clear()
+        sessionStorage.clear()
+        scannerRequestBody = null
+        productIntentBodies = []
+        exposureEventSeenWithSessionId = true
+        scannerCreateSpy = jest.fn(async ({ request }: { request: Request }) => {
+            scannerRequestBody = (await request.json()) as Record<string, unknown>
+            return [200, { id: 'scanner-123' }]
+        })
 
         useMocks({
+            get: {
+                // saveExperiment verifies flag-key availability before building the payload
+                '/api/projects/:team_id/feature_flags/': () => [200, { results: [], count: 0 }],
+                '/api/projects/:team_id/experiments': () => [200, { results: [], count: 0 }],
+                '/api/projects/:team_id/property_definitions/seen_together': ({ request }) => {
+                    const eventNames = new URL(request.url).searchParams.getAll('event_names')
+                    return [200, Object.fromEntries(eventNames.map((name) => [name, exposureEventSeenWithSessionId]))]
+                },
+            },
             post: {
-                '/api/projects/@current/experiments': async (req) => {
-                    const body = (await req.json()) as Experiment
+                [`/api/projects/${MOCK_TEAM_ID}/experiments`]: async ({ request }) => {
+                    const body = (await request.json()) as Experiment
                     if (!body.name || !body.description) {
                         return [400, { detail: 'Validation error' }]
                     }
                     return [
                         200,
                         {
+                            ...body,
                             id: 123,
                             name: body.name,
                             description: body.description,
                             type: body.type || 'product',
                             feature_flag: {
+                                ...body.feature_flag,
                                 id: 456,
+                                key: body.feature_flag_key,
                             },
                         },
                     ]
                 },
+                '/api/projects/:team_id/vision/scanners/': scannerCreateSpy,
             },
             patch: {
-                '/api/environments/@current/add_product_intent/': () => [200, {}],
+                '/api/environments/:team_id/add_product_intent/': async ({ request }) => {
+                    productIntentBodies.push((await request.json()) as Record<string, unknown>)
+                    return [200, {}]
+                },
             },
         })
         initKeaTests()
@@ -63,7 +102,9 @@ describe('createExperimentLogic', () => {
     })
 
     afterEach(() => {
-        logic.unmount()
+        if (logic.isMounted()) {
+            logic.unmount()
+        }
         routerPushSpy.mockRestore()
     })
 
@@ -114,6 +155,171 @@ describe('createExperimentLogic', () => {
                 .toMatchValues({
                     experimentErrors: {},
                 })
+
+            expect(scannerCreateSpy).not.toHaveBeenCalled()
+        })
+
+        it('creates a scanner scoped to enrolled experiment sessions when selected', async () => {
+            await expectLogic(logic, () => {
+                logic.actions.setCreateReplayVisionScanner(true)
+                logic.actions.setExperiment({
+                    ...NEW_EXPERIMENT,
+                    name: 'Checkout flow',
+                    description: 'Test hypothesis',
+                    feature_flag_key: 'checkout-flow',
+                    feature_flag_config: {
+                        filters: {
+                            multivariate: {
+                                variants: [
+                                    { key: 'control', rollout_percentage: 50 },
+                                    { key: 'new-checkout', rollout_percentage: 50 },
+                                ],
+                            },
+                        },
+                    },
+                    exposure_criteria: {
+                        filterTestAccounts: true,
+                    },
+                })
+                logic.actions.saveExperiment()
+            })
+                .toDispatchActions(['saveExperiment', 'createExperimentSuccess'])
+                .toFinishAllListeners()
+
+            expect(scannerCreateSpy).toHaveBeenCalledTimes(1)
+            expect(scannerRequestBody).toMatchObject({
+                name: 'Checkout flow (#123)',
+                scanner_type: 'classifier',
+                // Enabling starts credit spend, so a created scanner must never arrive switched on
+                enabled: false,
+                // `model` is required by the create serializer — omitting it 400s every create
+                provider: DEFAULT_PROVIDER,
+                model: DEFAULT_MODEL,
+                query: {
+                    filter_test_accounts: true,
+                    events: [
+                        {
+                            id: '$feature_flag_called',
+                            properties: expect.arrayContaining([
+                                expect.objectContaining({
+                                    key: '$feature_flag_response',
+                                    value: ['control', 'new-checkout'],
+                                }),
+                                expect.objectContaining({
+                                    key: '$feature_flag',
+                                    value: ['checkout-flow'],
+                                }),
+                            ]),
+                        },
+                    ],
+                },
+            })
+            // A plain product intent is indistinguishable from someone reaching Replay Vision on their
+            // own, so the cross-sell metadata is the only thing that attributes the scanner to experiments
+            expect(productIntentBodies).toContainEqual(
+                expect.objectContaining({
+                    product_type: ProductKey.REPLAY_VISION,
+                    intent_context: ProductIntentContext.EXPERIMENT_REPLAY_VISION_SCANNER_CREATED,
+                    metadata: expect.objectContaining({
+                        from: ProductKey.EXPERIMENTS,
+                        to: ProductKey.REPLAY_VISION,
+                        type: 'cross_sell',
+                    }),
+                })
+            )
+            expect(lemonToast.success).toHaveBeenCalledWith(
+                'Experiment created. The Replay Vision scanner is off until you turn it on.',
+                expect.objectContaining({
+                    button: expect.objectContaining({ label: 'View scanner' }),
+                })
+            )
+        })
+
+        it.each([
+            {
+                name: 'falls back to the flag-value filter for a default exposure event',
+                exposure_criteria: undefined,
+                expectedQuery: {
+                    properties: [expect.objectContaining({ key: '$feature/server-side-exposure', type: 'event' })],
+                },
+            },
+            {
+                name: 'keeps the custom exposure filter, never an unfiltered query',
+                exposure_criteria: {
+                    exposure_config: {
+                        kind: NodeKind.ExperimentEventExposureConfig,
+                        event: 'backend_assigned',
+                        properties: [],
+                    },
+                } satisfies ExperimentExposureCriteria as ExperimentExposureCriteria,
+                expectedQuery: {
+                    events: [expect.objectContaining({ id: 'backend_assigned' })],
+                },
+            },
+        ])(
+            // The check reports "never seen with a session ID", which for a minutes-old flag is
+            // mostly "never seen at all" — so it must never refuse, and must never leave the query
+            // empty, which would scan every recording in the project.
+            'creates a scoped scanner anyway when the exposure event looks unlinkable: $name',
+            async ({ exposure_criteria, expectedQuery }) => {
+                exposureEventSeenWithSessionId = false
+                await expectLogic(logic, () => {
+                    logic.actions.setCreateReplayVisionScanner(true)
+                    logic.actions.setExperiment({
+                        ...NEW_EXPERIMENT,
+                        name: 'Server-side exposure',
+                        description: 'Test hypothesis',
+                        feature_flag_key: 'server-side-exposure',
+                        ...(exposure_criteria ? { exposure_criteria } : {}),
+                    })
+                    logic.actions.saveExperiment()
+                })
+                    .toDispatchActions(['saveExperiment', 'createExperimentSuccess', 'saveExperimentSuccess'])
+                    .toFinishAllListeners()
+
+                expect(scannerCreateSpy).toHaveBeenCalledTimes(1)
+                expect(scannerRequestBody).toMatchObject({ query: expect.objectContaining(expectedQuery) })
+            }
+        )
+
+        it.each([
+            {
+                name: 'a generic failure is reported to error tracking',
+                response: [500, { detail: 'Scanner unavailable' }] as [number, Record<string, unknown>],
+                shouldCapture: true,
+            },
+            {
+                // Missing org AI consent is user-correctable config, not a defect: keep it out of error
+                // tracking so it stops reopening the issue that flagged this path.
+                name: 'a missing AI consent 400 is not reported to error tracking',
+                response: [400, { code: 'ai_data_processing_not_approved' }] as [number, Record<string, unknown>],
+                shouldCapture: false,
+            },
+        ])('keeps the created experiment when scanner creation fails: $name', async ({ response, shouldCapture }) => {
+            const captureExceptionSpy = jest.spyOn(posthog, 'captureException').mockImplementation(() => undefined)
+            scannerCreateSpy.mockResolvedValueOnce(response)
+            await expectLogic(logic, () => {
+                logic.actions.setCreateReplayVisionScanner(true)
+                logic.actions.setExperiment({
+                    ...NEW_EXPERIMENT,
+                    name: 'Test Experiment',
+                    description: 'Test hypothesis',
+                    feature_flag_key: 'test-experiment',
+                })
+                logic.actions.saveExperiment()
+            })
+                .toDispatchActions(['saveExperiment', 'createExperimentSuccess', 'saveExperimentSuccess'])
+                .toFinishAllListeners()
+
+            expect(routerPushSpy).toHaveBeenCalledWith('/experiments/123')
+            expect(lemonToast.error).toHaveBeenCalledWith(
+                "Experiment created, but the Replay Vision scanner wasn't.",
+                expect.objectContaining({
+                    button: expect.objectContaining({ label: 'Set up scanner' }),
+                })
+            )
+            expect(captureExceptionSpy).toHaveBeenCalledTimes(shouldCapture ? 1 : 0)
+            captureExceptionSpy.mockRestore()
         })
 
         it('refreshes tree items for experiment and feature flag after creation', async () => {
@@ -133,7 +339,7 @@ describe('createExperimentLogic', () => {
             expect(refreshTreeItem).toHaveBeenCalledWith('feature_flag', '456')
         })
 
-        it('navigates to experiment page after creation', async () => {
+        it('navigates to experiment view page after creating a draft', async () => {
             await expectLogic(logic, () => {
                 logic.actions.setExperiment({
                     ...NEW_EXPERIMENT,
@@ -227,62 +433,43 @@ describe('createExperimentLogic', () => {
                 })
         })
 
-        it('setExperimentValue updates parameters object', async () => {
-            const parameters = {
-                feature_flag_variants: [
-                    { key: 'control', rollout_percentage: 50 },
-                    { key: 'test', rollout_percentage: 50 },
-                ],
-                ensure_experience_continuity: true,
-            }
-
+        it('setFeatureFlagConfig writes variants, rollout, and continuity into the draft flag config', async () => {
             await expectLogic(logic, () => {
-                logic.actions.setExperimentValue('parameters', parameters)
-            })
-                .toDispatchActions(['setExperimentValue'])
-                .toMatchValues({
-                    experiment: partial({
-                        parameters: partial({
-                            feature_flag_variants: expect.arrayContaining([
-                                partial({ key: 'control', rollout_percentage: 50 }),
-                                partial({ key: 'test', rollout_percentage: 50 }),
-                            ]),
-                            ensure_experience_continuity: true,
-                        }),
-                    }),
-                })
-        })
-
-        it('merges parameters when updating variants', async () => {
-            await expectLogic(logic, () => {
-                logic.actions.setExperimentValue('parameters', {
-                    feature_flag_variants: [
+                logic.actions.setFeatureFlagConfig({
+                    variants: [
                         { key: 'control', rollout_percentage: 33 },
                         { key: 'test', rollout_percentage: 33 },
                         { key: 'test-2', rollout_percentage: 34 },
                     ],
+                    rollout_percentage: 80,
+                    ensure_experience_continuity: true,
                 })
             })
-                .toDispatchActions(['setExperimentValue'])
+                .toDispatchActions(['setFeatureFlagConfig'])
                 .toMatchValues({
                     experiment: partial({
-                        parameters: partial({
-                            feature_flag_variants: expect.arrayContaining([
-                                partial({ key: 'control' }),
-                                partial({ key: 'test' }),
-                                partial({ key: 'test-2' }),
-                            ]),
-                        }),
+                        feature_flag_config: {
+                            filters: {
+                                multivariate: {
+                                    variants: [
+                                        { key: 'control', rollout_percentage: 33 },
+                                        { key: 'test', rollout_percentage: 33 },
+                                        { key: 'test-2', rollout_percentage: 34 },
+                                    ],
+                                },
+                                groups: [{ properties: [], rollout_percentage: 80 }],
+                            },
+                            ensure_experience_continuity: true,
+                        },
                     }),
                 })
 
-            // Verify we have exactly 3 variants
-            expect(logic.values.experiment.parameters?.feature_flag_variants).toHaveLength(3)
+            expect(logic.values.experiment.feature_flag_config?.filters?.multivariate?.variants).toHaveLength(3)
         })
     })
 
-    describe('experiment prop initialization', () => {
-        it('defaults to NEW_EXPERIMENT when no prop is provided', async () => {
+    describe('initialization', () => {
+        it('defaults to NEW_EXPERIMENT', async () => {
             const defaultLogic = createExperimentLogic()
             defaultLogic.mount()
 
@@ -298,33 +485,7 @@ describe('createExperimentLogic', () => {
             defaultLogic.unmount()
         })
 
-        it('uses provided experiment prop as default', async () => {
-            const existingExperiment: Experiment = {
-                ...NEW_EXPERIMENT,
-                id: 123,
-                name: 'Existing Experiment',
-                description: 'Existing hypothesis',
-                type: 'web',
-                feature_flag_key: 'existing-flag',
-            }
-
-            const propsLogic = createExperimentLogic({ experiment: existingExperiment })
-            propsLogic.mount()
-
-            await expectLogic(propsLogic).toMatchValues({
-                experiment: partial({
-                    id: 123,
-                    name: 'Existing Experiment',
-                    description: 'Existing hypothesis',
-                    type: 'web',
-                    feature_flag_key: 'existing-flag',
-                }),
-            })
-
-            propsLogic.unmount()
-        })
-
-        it('resetExperiment resets to NEW_EXPERIMENT when no prop provided', async () => {
+        it('resetExperiment resets to NEW_EXPERIMENT', async () => {
             const defaultLogic = createExperimentLogic()
             defaultLogic.mount()
 
@@ -357,70 +518,86 @@ describe('createExperimentLogic', () => {
 
             defaultLogic.unmount()
         })
+    })
 
-        it('resetExperiment resets to provided experiment prop', async () => {
-            const existingExperiment: Experiment = {
-                ...NEW_EXPERIMENT,
-                id: 456,
-                name: 'Original Experiment',
-                description: 'Original hypothesis',
-                type: 'web',
-            }
+    describe('form navigation scenarios', () => {
+        beforeEach(() => {
+            sessionStorage.clear()
+            // Fully unmount the shared singleton so each test controls the
+            // mount lifecycle and afterMount/beforeUnmount fire as expected.
+            logic.unmount()
+        })
 
-            const propsLogic = createExperimentLogic({ experiment: existingExperiment })
-            propsLogic.mount()
+        it('abandoning the form and coming back starts fresh', async () => {
+            const firstNew = createExperimentLogic()
+            firstNew.mount()
 
-            await expectLogic(propsLogic, () => {
-                propsLogic.actions.setExperiment({
-                    ...existingExperiment,
-                    name: 'Modified Name',
-                    description: 'Modified Description',
-                })
+            firstNew.actions.setExperimentValue('name', 'First Attempt')
+            firstNew.actions.setExperimentValue('feature_flag_key', 'first-attempt')
+            firstNew.actions.setCreateReplayVisionScanner(true)
+
+            await expectLogic(firstNew).toMatchValues({
+                experiment: partial({ name: 'First Attempt', feature_flag_key: 'first-attempt' }),
+                createReplayVisionScanner: true,
             })
-                .toDispatchActions(['setExperiment'])
-                .toMatchValues({
-                    experiment: partial({
-                        name: 'Modified Name',
-                        description: 'Modified Description',
-                    }),
-                })
 
-            await expectLogic(propsLogic, () => {
-                propsLogic.actions.resetExperiment()
+            // User navigates away — no save
+            firstNew.unmount()
+
+            const secondNew = createExperimentLogic()
+            secondNew.mount()
+
+            await expectLogic(secondNew).toMatchValues({
+                experiment: partial({ id: 'new', name: '', feature_flag_key: '' }),
+                createReplayVisionScanner: false,
             })
-                .toDispatchActions(['resetExperiment'])
-                .toMatchValues({
-                    experiment: partial({
-                        id: 456,
-                        name: 'Original Experiment',
-                        description: 'Original hypothesis',
-                        type: 'web',
-                    }),
-                })
 
-            propsLogic.unmount()
+            secondNew.unmount()
         })
     })
 
-    describe('unmount/remount resets stale state', () => {
-        it('starts fresh after unmount and remount with no draft', async () => {
-            logic.actions.setExperiment({
-                ...NEW_EXPERIMENT,
-                id: 123,
-                name: 'Saved Experiment',
-                description: 'Already saved',
-            })
-
+    describe('post-save state reset', () => {
+        beforeEach(() => {
+            sessionStorage.clear()
+            // Fully unmount the shared singleton so each test controls the
+            // mount lifecycle and afterMount/beforeUnmount fire as expected.
             logic.unmount()
+        })
 
-            const freshLogic = createExperimentLogic()
-            freshLogic.mount()
+        it('form resets to NEW_EXPERIMENT after saving and re-entering create mode', async () => {
+            const firstLogic = createExperimentLogic()
+            firstLogic.mount()
 
-            await expectLogic(freshLogic).toMatchValues({
-                experiment: partial({ id: 'new', name: '', description: '' }),
+            await expectLogic(firstLogic).toMatchValues({
+                experiment: partial({ id: 'new', name: '' }),
             })
 
-            freshLogic.unmount()
+            // Simulate what saveExperiment does on success:
+            // the server response replaces the form state
+            firstLogic.actions.setExperiment({
+                ...NEW_EXPERIMENT,
+                id: 999,
+                name: 'Saved Experiment',
+                description: 'Already persisted',
+                feature_flag_key: 'saved-experiment',
+            })
+
+            await expectLogic(firstLogic).toMatchValues({
+                experiment: partial({ id: 999, name: 'Saved Experiment' }),
+            })
+
+            // Scene transitions away from create mode — component unmounts the logic
+            firstLogic.unmount()
+
+            // User navigates back to /experiments/new — component remounts the logic
+            const secondLogic = createExperimentLogic()
+            secondLogic.mount()
+
+            await expectLogic(secondLogic).toMatchValues({
+                experiment: partial({ id: 'new', name: '', feature_flag_key: '' }),
+            })
+
+            secondLogic.unmount()
         })
     })
 
@@ -459,11 +636,15 @@ describe('createExperimentLogic', () => {
                     name: 'Test Experiment',
                     description: 'Test hypothesis',
                     feature_flag_key: 'test-flag',
-                    parameters: {
-                        feature_flag_variants: [
-                            { key: 'control', rollout_percentage: 50 },
-                            { key: 'treatment', rollout_percentage: 50 },
-                        ],
+                    feature_flag_config: {
+                        filters: {
+                            multivariate: {
+                                variants: [
+                                    { key: 'control', rollout_percentage: 50 },
+                                    { key: 'treatment', rollout_percentage: 50 },
+                                ],
+                            },
+                        },
                     },
                 })
                 logic.actions.saveExperiment()
@@ -477,11 +658,16 @@ describe('createExperimentLogic', () => {
                     name: 'Test Experiment',
                     description: 'Test hypothesis',
                     feature_flag_key: 'test-experiment',
-                    parameters: {
-                        feature_flag_variants: [
-                            { key: 'control', rollout_percentage: 50 },
-                            { key: 'test', rollout_percentage: 50 },
-                        ],
+                    feature_flag_config: {
+                        filters: {
+                            multivariate: {
+                                variants: [
+                                    { key: 'control', rollout_percentage: 50 },
+                                    { key: 'test', rollout_percentage: 50 },
+                                ],
+                            },
+                        },
+                        ensure_experience_continuity: true,
                     },
                 })
                 logic.actions.saveExperiment()

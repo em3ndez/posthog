@@ -1,21 +1,19 @@
 import os
 import json
-import asyncio
 import datetime as dt
 import operator
 import collections.abc
 
-import aioboto3
-import botocore.exceptions
 from psycopg import sql
 
-from posthog.batch_exports.service import BackfillDetails, BatchExportModel, BatchExportSchema
 from posthog.temporal.common.clickhouse import ClickHouseClient
 
+from products.batch_exports.backend.service import BackfillDetails, BatchExportModel, BatchExportSchema
 from products.batch_exports.backend.temporal.destinations.redshift_batch_export import redshift_default_fields
+from products.batch_exports.backend.temporal.queue import RecordBatchQueue
 from products.batch_exports.backend.temporal.record_batch_model import SessionsRecordBatchModel
-from products.batch_exports.backend.temporal.spmc import Producer, RecordBatchQueue
 from products.batch_exports.backend.temporal.temporary_file import remove_escaped_whitespace_recursive
+from products.batch_exports.backend.tests.temporal.utils.clickhouse_test_producer import ClickHouseTestProducer
 from products.batch_exports.backend.tests.temporal.utils.records import (
     get_record_batch_from_queue,
     remove_duplicates_from_records,
@@ -178,9 +176,9 @@ async def assert_clickhouse_records_in_redshift(
     expected_records = []
     queue = RecordBatchQueue()
     if model_name == "sessions":
-        producer = Producer(model=SessionsRecordBatchModel(team_id))
+        producer = ClickHouseTestProducer(model=SessionsRecordBatchModel(team_id))
     else:
-        producer = Producer()
+        producer = ClickHouseTestProducer()
 
     for data_interval_start, data_interval_end in date_ranges:
         producer_task = await producer.start(
@@ -188,7 +186,6 @@ async def assert_clickhouse_records_in_redshift(
             model_name=model_name,
             team_id=team_id,
             full_range=(data_interval_start, data_interval_end),
-            done_ranges=[],
             fields=fields,
             filters=filters,
             destination_default_fields=redshift_default_fields(),
@@ -248,21 +245,3 @@ async def assert_clickhouse_records_in_redshift(
     assert inserted_records[0] == expected_records[0]
     assert inserted_records == expected_records
     assert len(inserted_records) == len(expected_records)
-
-
-async def check_valid_credentials() -> bool:
-    """Check if there are valid AWS credentials in the environment."""
-    session = aioboto3.Session()
-    async with session.client("sts") as sts:
-        try:
-            await sts.get_caller_identity()
-        except botocore.exceptions.ClientError:
-            return False
-        else:
-            return True
-
-
-def has_valid_credentials() -> bool:
-    """Synchronous wrapper around check_valid_credentials."""
-    loop = asyncio.get_event_loop()
-    return loop.run_until_complete(check_valid_credentials())

@@ -1,8 +1,9 @@
-import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/OnboardingDocsContentWrapper'
+import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/shared/OnboardingDocsContentWrapper'
 
 import { StepDefinition } from '../steps'
+import { SDK_DEFAULTS_DATE } from './_snippets/sdkDefaults'
 
-export const getNextJSClientSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
+export const getNextJSSetupSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
     const { CodeBlock, Markdown, CalloutBox, Tab, dedent } = ctx
 
     return [
@@ -35,6 +36,13 @@ export const getNextJSClientSteps = (ctx: OnboardingComponentsContext): StepDefi
                                     pnpm add posthog-js
                                 `,
                             },
+                            {
+                                language: 'bash',
+                                file: 'bun',
+                                code: dedent`
+                                    bun add posthog-js
+                                `,
+                            },
                         ]}
                     />
                 </>
@@ -46,8 +54,8 @@ export const getNextJSClientSteps = (ctx: OnboardingComponentsContext): StepDefi
             content: (
                 <>
                     <Markdown>
-                        Add your PostHog API key and host to your `.env.local` file and to your hosting provider (e.g.
-                        Vercel, Netlify). These values need to start with `NEXT_PUBLIC_` to be accessible on the
+                        Add your PostHog project token and host to your `.env.local` file and to your hosting provider
+                        (e.g. Vercel, Netlify). These values need to start with `NEXT_PUBLIC_` to be accessible on the
                         client-side.
                     </Markdown>
                     <CodeBlock
@@ -56,7 +64,7 @@ export const getNextJSClientSteps = (ctx: OnboardingComponentsContext): StepDefi
                                 language: 'bash',
                                 file: '.env.local',
                                 code: dedent`
-                                    NEXT_PUBLIC_POSTHOG_KEY=<ph_project_api_key>
+                                    NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN=<ph_project_token>
                                     NEXT_PUBLIC_POSTHOG_HOST=<ph_client_api_host>
                                 `,
                             },
@@ -92,9 +100,9 @@ export const getNextJSClientSteps = (ctx: OnboardingComponentsContext): StepDefi
                                             code: dedent`
                                                 import posthog from 'posthog-js'
 
-                                                posthog.init(process.env.NEXT_PUBLIC_POSTHOG_KEY!, {
+                                                posthog.init(process.env.NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN!, {
                                                     api_host: process.env.NEXT_PUBLIC_POSTHOG_HOST,
-                                                    defaults: '2026-01-30'
+                                                    defaults: '${SDK_DEFAULTS_DATE}'
                                                 })
                                             `,
                                         },
@@ -119,13 +127,13 @@ export const getNextJSClientSteps = (ctx: OnboardingComponentsContext): StepDefi
                                                 import { useEffect } from "react"
 
                                                 import posthog from 'posthog-js'
-                                                import { PostHogProvider as PHProvider } from 'posthog-js/react'
+                                                import { PostHogProvider as PHProvider } from '@posthog/react'
 
                                                 export function PostHogProvider({ children }: { children: React.ReactNode }) {
                                                   useEffect(() => {
-                                                    posthog.init(process.env.NEXT_PUBLIC_POSTHOG_KEY as string, {
+                                                    posthog.init(process.env.NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN as string, {
                                                       api_host: process.env.NEXT_PUBLIC_POSTHOG_HOST,
-                                                      defaults: '2026-01-30'
+                                                      defaults: '${SDK_DEFAULTS_DATE}'
                                                     })
                                                   }, [])
 
@@ -181,15 +189,15 @@ export const getNextJSClientSteps = (ctx: OnboardingComponentsContext): StepDefi
                                                 import { useEffect } from 'react'
                                                 import { Router } from 'next/router'
                                                 import posthog from 'posthog-js'
-                                                import { PostHogProvider } from 'posthog-js/react'
+                                                import { PostHogProvider } from '@posthog/react'
                                                 import type { AppProps } from 'next/app'
 
                                                 export default function App({ Component, pageProps }: AppProps) {
 
                                                   useEffect(() => {
-                                                    posthog.init(process.env.NEXT_PUBLIC_POSTHOG_KEY as string, {
+                                                    posthog.init(process.env.NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN as string, {
                                                       api_host: process.env.NEXT_PUBLIC_POSTHOG_HOST,
-                                                      defaults: '2026-01-30',
+                                                      defaults: '${SDK_DEFAULTS_DATE}',
                                                       loaded: (posthog) => {
                                                         if (process.env.NODE_ENV === 'development') posthog.debug()
                                                       }
@@ -220,28 +228,34 @@ export const getNextJSClientSteps = (ctx: OnboardingComponentsContext): StepDefi
                 </>
             ),
         },
-        {
-            title: 'Accessing PostHog on the client',
-            badge: 'recommended',
-            content: (
-                <>
-                    <Tab.Group tabs={['Next.js 15.3+', 'App/Pages router']}>
-                        <Tab.List>
-                            <Tab>Next.js 15.3+</Tab>
-                            <Tab>App/Pages router</Tab>
-                        </Tab.List>
-                        <Tab.Panels>
-                            <Tab.Panel>
-                                <Markdown>
-                                    Once initialized in `instrumentation-client.ts`, import `posthog` from `posthog-js`
-                                    anywhere and call the methods you need:
-                                </Markdown>
-                                <CodeBlock
-                                    blocks={[
-                                        {
-                                            language: 'typescript',
-                                            file: 'app/checkout/page.tsx',
-                                            code: dedent`
+    ]
+}
+
+export const getNextJSClientAccessStep = (ctx: OnboardingComponentsContext): StepDefinition => {
+    const { CodeBlock, Markdown, Tab, dedent } = ctx
+
+    return {
+        title: 'Accessing PostHog on the client',
+        badge: 'recommended',
+        content: (
+            <>
+                <Tab.Group tabs={['Next.js 15.3+', 'App/Pages router']}>
+                    <Tab.List>
+                        <Tab>Next.js 15.3+</Tab>
+                        <Tab>App/Pages router</Tab>
+                    </Tab.List>
+                    <Tab.Panels>
+                        <Tab.Panel>
+                            <Markdown>
+                                Once initialized in `instrumentation-client.ts`, import `posthog` from `posthog-js`
+                                anywhere and call the methods you need:
+                            </Markdown>
+                            <CodeBlock
+                                blocks={[
+                                    {
+                                        language: 'typescript',
+                                        file: 'app/checkout/page.tsx',
+                                        code: dedent`
                                                 'use client'
 
                                                 import posthog from 'posthog-js'
@@ -254,21 +268,21 @@ export const getNextJSClientSteps = (ctx: OnboardingComponentsContext): StepDefi
                                                     return <button onClick={handlePurchase}>Complete purchase</button>
                                                 }
                                             `,
-                                        },
-                                    ]}
-                                />
-                            </Tab.Panel>
-                            <Tab.Panel>
-                                <Markdown>Use the `usePostHog` hook to access PostHog in client components:</Markdown>
-                                <CodeBlock
-                                    blocks={[
-                                        {
-                                            language: 'typescript',
-                                            file: 'app/checkout/page.tsx',
-                                            code: dedent`
+                                    },
+                                ]}
+                            />
+                        </Tab.Panel>
+                        <Tab.Panel>
+                            <Markdown>Use the `usePostHog` hook to access PostHog in client components:</Markdown>
+                            <CodeBlock
+                                blocks={[
+                                    {
+                                        language: 'typescript',
+                                        file: 'app/checkout/page.tsx',
+                                        code: dedent`
                                                 'use client'
 
-                                                import { usePostHog } from 'posthog-js/react'
+                                                import { usePostHog } from '@posthog/react'
 
                                                 export default function CheckoutPage() {
                                                     const posthog = usePostHog()
@@ -280,17 +294,21 @@ export const getNextJSClientSteps = (ctx: OnboardingComponentsContext): StepDefi
                                                     return <button onClick={handlePurchase}>Complete purchase</button>
                                                 }
                                             `,
-                                        },
-                                    ]}
-                                />
-                            </Tab.Panel>
-                        </Tab.Panels>
-                    </Tab.Group>
-                </>
-            ),
-        },
-    ]
+                                    },
+                                ]}
+                            />
+                        </Tab.Panel>
+                    </Tab.Panels>
+                </Tab.Group>
+            </>
+        ),
+    }
 }
+
+export const getNextJSClientSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => [
+    ...getNextJSSetupSteps(ctx),
+    getNextJSClientAccessStep(ctx),
+]
 
 export const getNextJSServerSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
     const { CodeBlock, Markdown, CalloutBox, Tab, dedent } = ctx
@@ -325,6 +343,13 @@ export const getNextJSServerSteps = (ctx: OnboardingComponentsContext): StepDefi
                                     pnpm add posthog-node
                                 `,
                             },
+                            {
+                                language: 'bash',
+                                file: 'bun',
+                                code: dedent`
+                                    bun add posthog-node
+                                `,
+                            },
                         ]}
                     />
                     <Markdown>
@@ -353,7 +378,7 @@ export const getNextJSServerSteps = (ctx: OnboardingComponentsContext): StepDefi
                                                 import { PostHog } from 'posthog-node'
 
                                                 export async function POST(request: Request) {
-                                                    const posthog = new PostHog(process.env.NEXT_PUBLIC_POSTHOG_KEY!, {
+                                                    const posthog = new PostHog(process.env.NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN!, {
                                                         host: process.env.NEXT_PUBLIC_POSTHOG_HOST
                                                     })
 
@@ -380,7 +405,7 @@ export const getNextJSServerSteps = (ctx: OnboardingComponentsContext): StepDefi
                                                 import { PostHog } from 'posthog-node'
 
                                                 export async function myServerAction() {
-                                                    const posthog = new PostHog(process.env.NEXT_PUBLIC_POSTHOG_KEY!, {
+                                                    const posthog = new PostHog(process.env.NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN!, {
                                                         host: process.env.NEXT_PUBLIC_POSTHOG_HOST
                                                     })
 
@@ -411,7 +436,7 @@ export const getNextJSServerSteps = (ctx: OnboardingComponentsContext): StepDefi
                                                     req: NextApiRequest,
                                                     res: NextApiResponse
                                                 ) {
-                                                    const posthog = new PostHog(process.env.NEXT_PUBLIC_POSTHOG_KEY!, {
+                                                    const posthog = new PostHog(process.env.NEXT_PUBLIC_POSTHOG_PROJECT_TOKEN!, {
                                                         host: process.env.NEXT_PUBLIC_POSTHOG_HOST
                                                     })
 
@@ -445,19 +470,24 @@ export const getNextJSServerSteps = (ctx: OnboardingComponentsContext): StepDefi
     ]
 }
 
-export const getNextJSSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
-    const { snippets } = ctx
-    const JSEventCapture = snippets?.JSEventCapture
+export const getNextJSInstallSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => [
+    ...getNextJSClientSteps(ctx),
+    ...getNextJSServerSteps(ctx),
+]
 
-    return [
-        ...getNextJSClientSteps(ctx),
-        ...getNextJSServerSteps(ctx),
-        {
-            title: 'Send events',
-            badge: 'recommended',
-            content: <>{JSEventCapture && <JSEventCapture />}</>,
-        },
-    ]
+export const getNextJSEventStep = (ctx: OnboardingComponentsContext): StepDefinition => {
+    const JSEventCapture = ctx.snippets?.JSEventCapture
+
+    return {
+        title: 'Send events',
+        badge: 'recommended',
+        content: <>{JSEventCapture && <JSEventCapture />}</>,
+    }
 }
+
+export const getNextJSSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => [
+    ...getNextJSInstallSteps(ctx),
+    getNextJSEventStep(ctx),
+]
 
 export const NextJSInstallation = createInstallation(getNextJSSteps)

@@ -1,23 +1,27 @@
 import { useActions, useValues } from 'kea'
 import { useEffect } from 'react'
 
+import * as moneyPng from '@posthog/brand/hoggies/png/money'
 import { IconArrowRight } from '@posthog/icons'
 import { LemonButton, LemonCard, Link } from '@posthog/lemon-ui'
 
+import { pngHoggie } from 'lib/brand/hoggies'
 import { ProductIntroduction } from 'lib/components/ProductIntroduction/ProductIntroduction'
-import { FilmCameraHog } from 'lib/components/hedgehogs'
 import { useOnMountEffect } from 'lib/hooks/useOnMountEffect'
 import { eventUsageLogic } from 'lib/utils/eventUsageLogic'
 import { teamLogic } from 'scenes/teamLogic'
 
 import { ProductIntentContext, ProductKey } from '~/queries/schema/schema-general'
 
+import { MarketingAnalyticsSourceStatusBanner } from '../../web-analytics/tabs/marketing-analytics/frontend/components/MarketingAnalyticsSourceStatusBanner'
 import { ConversionGoalsConfiguration } from '../../web-analytics/tabs/marketing-analytics/frontend/components/settings/ConversionGoalsConfiguration'
 import { marketingAnalyticsLogic } from '../../web-analytics/tabs/marketing-analytics/frontend/logic/marketingAnalyticsLogic'
 import { marketingAnalyticsSettingsLogic } from '../../web-analytics/tabs/marketing-analytics/frontend/logic/marketingAnalyticsSettingsLogic'
 import { AddSourceStep } from './AddSourceStep'
-import { MarketingWizardStepper } from './MarketingWizardStepper'
 import { MarketingOnboardingStep, marketingOnboardingLogic } from './marketingOnboardingLogic'
+import { MarketingWizardStepper } from './MarketingWizardStepper'
+
+const HedgehogMoney = pngHoggie(moneyPng)
 
 interface OnboardingProps {
     completeOnboarding: () => void
@@ -74,7 +78,12 @@ export function Onboarding({ completeOnboarding }: OnboardingProps): JSX.Element
 
             {currentStep === 'welcome' && <WelcomeStep onContinue={() => setStep('add-source')} />}
 
-            {currentStep === 'add-source' && <AddSourceStep onContinue={handleNextStep} hasSources={hasSources} />}
+            {currentStep === 'add-source' && (
+                <>
+                    <MarketingAnalyticsSourceStatusBanner />
+                    <AddSourceStep onContinue={handleNextStep} hasSources={hasSources} />
+                </>
+            )}
 
             {currentStep === 'conversion-goals' && (
                 <ConversionGoalsStep onContinue={handleComplete} onSkip={handleComplete} />
@@ -99,7 +108,7 @@ function WelcomeStep({ onContinue }: { onContinue: () => void }): JSX.Element {
             }
             isEmpty={true}
             docsURL="https://posthog.com/docs/web-analytics/marketing-analytics"
-            customHog={FilmCameraHog}
+            customHog={HedgehogMoney}
         />
     )
 }

@@ -60,7 +60,7 @@ class VercelProxyRequestSerializer(serializers.Serializer):
 
 
 def _extract_access_token(integration: OrganizationIntegration) -> str:
-    token = integration.config.get("credentials", {}).get("access_token")
+    token = integration.sensitive_config.get("credentials", {}).get("access_token")
     if not token:
         raise ValueError(f"No access token found for integration {integration.integration_id}")
     return token
@@ -139,11 +139,7 @@ class VercelProxyViewSet(viewsets.ViewSet):
                 return None
             return integration
         except OrganizationIntegration.DoesNotExist:
-            capture_exception(
-                ValueError("Vercel integration not found"),
-                {"organization_id": organization_id},
-            )
-            logger.warning("Vercel integration not found", organization_id=organization_id)
+            logger.warning("Vercel integration not found locally", organization_id=organization_id)
             return None
 
     def _get_access_token(self, integration: OrganizationIntegration, organization_id: str) -> str | None:

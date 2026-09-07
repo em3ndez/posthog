@@ -46,12 +46,20 @@ export interface LemonTableColumn<T extends Record<string, any>, D extends keyof
               record: T,
               recordIndex: number
           ) => CSSProperties | undefined)
+    /** Initial sort direction when clicking an unsorted column. Defaults to ascending (1). Use -1 for columns like dates where descending is more natural. */
+    defaultSortOrder?: 1 | -1
     /** Column content alignment. Left by default. Set to right for numerical values (amounts, days ago etc.) */
     align?: 'left' | 'right' | 'center'
     /** TODO: Whether the column should be sticky when scrolling */
     sticky?: boolean
     /** Set width. */
     width?: string | number
+    /** Allow people to resize this column from its header. */
+    resizable?: boolean
+    /** Called while a person resizes this column. */
+    onResize?: (width: number) => void
+    /** Called after a person finishes resizing this column. */
+    onResizeEnd?: () => void
     /** Whether the column's contents should expand to the size of the column. */
     fullWidth?: boolean
     /** Cell actions to display in a "More" menu for each cell. Return null to hide actions for specific cells. */

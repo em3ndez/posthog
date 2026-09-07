@@ -74,7 +74,8 @@ def snowflake_config(database, schema) -> dict[str, str]:
     }
     if private_key:
         config["private_key"] = private_key
-        config["private_key_passphrase"] = private_key_passphrase
+        if private_key_passphrase is not None:
+            config["private_key_passphrase"] = private_key_passphrase
         config["authentication_type"] = "keypair"
     elif password:
         config["password"] = password
@@ -93,7 +94,7 @@ def snowflake_cursor(snowflake_config):
         if snowflake_config.get("private_key") is None:
             raise ValueError("Private key is required for keypair authentication")
 
-        private_key = load_private_key(snowflake_config["private_key"], snowflake_config["private_key_passphrase"])
+        private_key = load_private_key(snowflake_config["private_key"], snowflake_config.get("private_key_passphrase"))
     else:
         password = snowflake_config["password"]
 
@@ -167,7 +168,11 @@ async def test_snowflake_establish_connection_with_wrong_user(snowflake_config):
 
     assert result.status == Status.FAILED
     assert result.message is not None
-    assert "Incorrect username or password was specified." in result.message
+    # error depends on whether we're using password or keypair auth
+    if snowflake_config.get("password", None) is not None:
+        assert "Incorrect username or password was specified." in result.message
+    else:
+        assert "JWT token is invalid" in result.message
 
 
 async def test_snowflake_establish_connection_with_invalid_private_key(snowflake_config):
@@ -307,7 +312,8 @@ def user(snowflake_cursor, password):
     test_user = "EMPTY_TEST_USER"
     snowflake_cursor.execute(f"DROP USER IF EXISTS {test_user}")
 
-    snowflake_cursor.execute(f"CREATE USER {test_user} PASSWORD = '{password}'")
+    # Snowflake now enforces 2FA on many accounts so we need to bypass this for this new user
+    snowflake_cursor.execute(f"CREATE USER {test_user} PASSWORD = '{password}' MINS_TO_BYPASS_MFA = 30")
 
     yield test_user
 

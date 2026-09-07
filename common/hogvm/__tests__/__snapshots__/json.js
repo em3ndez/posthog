@@ -85,7 +85,7 @@ function __escapeString(value) {
     return `'${value.split('').map((c) => singlequoteEscapeCharsMap[c] || c).join('')}'`;
 }
 function __escapeIdentifier(identifier) {
-    const backquoteEscapeCharsMap = { '\b': '\\b', '\f': '\\f', '\r': '\\r', '\n': '\\n', '\t': '\\t', '\0': '\\0', '\v': '\\v', '\\': '\\\\', '`': '\\`' }
+    const backquoteEscapeCharsMap = { '\b': '\\b', '\f': '\\f', '\r': '\\r', '\n': '\\n', '\t': '\\t', '\0': '\\0', '\v': '\\v', '\\': '\\\\', '`': '``' }
     if (typeof identifier === 'number') return identifier.toString();
     if (/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(identifier)) return identifier;
     return `\`${identifier.split('').map((c) => backquoteEscapeCharsMap[c] || c).join('')}\``;
@@ -138,6 +138,14 @@ function JSONExtractBool (obj, ...path) {
         return obj
     }
     return false
+}
+function JSONExtract(obj, ...args) {
+    if (args.length < 1) { return null; }
+    try {
+        if (typeof obj === 'string') { obj = JSON.parse(obj); }
+    } catch (e) { return null; }
+    const path = args.length > 1 ? args.slice(0, -1) : [];
+    return __getNestedValue(obj, path, true) ?? null;
 }
 function __getNestedValue(obj, path, allowNull = false) {
     let current = obj
@@ -195,3 +203,11 @@ print(JSONExtractBool(1));
 print(JSONExtractBool(0));
 print(JSONExtractBool("true"));
 print(JSONExtractBool("false"));
+print("-- JSONExtract --");
+print(JSONExtract("{\"name\": \"John\", \"age\": 30}", "name", "String"));
+print(JSONExtract("{\"name\": \"John\", \"age\": 30}", "age", "Int"));
+print(JSONExtract("{\"name\": \"John\", \"age\": 30}", "unknown", "String"));
+print(JSONExtract("{\"a\": {\"b\": \"nested\"}}", "a", "b", "String"));
+print(JSONExtract({"key": "value"}, "key", "String"));
+print(JSONExtract("not valid json", "key", "String"));
+print(JSONExtract("{\"a\": 1}", "String"));

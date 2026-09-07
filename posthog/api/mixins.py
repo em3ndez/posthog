@@ -1,6 +1,6 @@
 from collections.abc import Callable
 from functools import wraps
-from typing import Any, TypeVar, cast
+from typing import Any, Generic, TypeVar, cast
 
 from django.conf import settings
 
@@ -30,6 +30,25 @@ class ValidatedRequest(Request):
     validated_query_data: dict[str, Any]
 
 
+_VT = TypeVar("_VT")
+
+
+class TypedRequest(ValidatedRequest, Generic[_VT]):
+    """ValidatedRequest with a typed validated_data field.
+
+    DataclassSerializer.validated_data returns a dataclass instance, but
+    ValidatedRequest annotates it as dict[str, Any].  This subclass lets
+    view methods declare the actual type so the type checker can follow along.
+
+    Usage::
+
+        def create(self, request: TypedRequest[CreateRepoInput], **kwargs) -> Response:
+            data = request.validated_data  # type checker knows this is CreateRepoInput
+    """
+
+    validated_data: _VT  # type: ignore[assignment]
+
+
 # Generic Pydantic model mixin for validating the response data
 class PydanticModelMixin:
     def get_model(self, data: dict, model: type[T]) -> T:
@@ -51,6 +70,7 @@ def validated_request(
     deprecated: bool = False,
     strict_request_validation: bool = True,
     strict_response_validation: bool = False,
+    include_serializer_context: bool = False,
     **extend_schema_kwargs,
 ) -> Callable:
     """
@@ -70,10 +90,16 @@ def validated_request(
             # request.validated_query_data contains validated query params (if query_serializer provided)
             body_field = request.validated_data["field"]
             query_param = request.validated_query_data["param"]
+
+    By default the request/query serializers are constructed with no context, unlike DRF's
+    own `get_serializer()` (which always includes `request`/`view`/`format`). Pass
+    `include_serializer_context=True` to opt a view into the standard context — needed when a
+    serializer's `validate()` reads `self.context["request"]` or `self.context["team"]` (e.g. to
+    attribute a rejected request to the calling user/team).
     """
 
     def decorator(view_func: Callable) -> Callable:
-        parameters = []
+        parameters: list = list(extend_schema_kwargs.pop("parameters", None) or [])
         if query_serializer is not None:
             parameters.append(query_serializer)
 
@@ -92,13 +118,19 @@ def validated_request(
             validated_request = cast(ValidatedRequest, request)
             validated_request.validated_query_data = {}
 
+            serializer_context = (
+                {"request": request, "view": self, "team": getattr(self, "team", None)}
+                if include_serializer_context
+                else {}
+            )
+
             if query_serializer is not None:
-                query_serializer_instance = query_serializer(data=request.query_params)
+                query_serializer_instance = query_serializer(data=request.query_params, context=serializer_context)
                 query_serializer_instance.is_valid(raise_exception=True)
                 validated_request.validated_query_data = query_serializer_instance.validated_data
 
             if request_serializer is not None:
-                serializer = request_serializer(data=request.data)
+                serializer = request_serializer(data=request.data, context=serializer_context)
                 req_validation_result = serializer.is_valid(raise_exception=strict_request_validation)
 
                 if not req_validation_result and settings.DEBUG:
@@ -190,21 +222,42 @@ def validated_request(
                     return result
 
                 context: dict[str, Any] = getattr(self, "get_serializer_context", lambda: {})()
+                serialized: serializers.BaseSerializer[Any]
+
+                serializer_class: type[serializers.BaseSerializer[Any]]
 
                 # Handle both class and instance to match DRF Spectacular's behavior
                 if isinstance(response_serializer, serializers.ListSerializer):
                     # ListSerializer wraps the real serializer - reconstruct with child
-                    child_class = type(response_serializer.child)
+                    child = cast(serializers.Serializer, response_serializer.child)
                     serializer_class = type(response_serializer)
-                    serialized = serializer_class(data=data, child=child_class(), context=context)
+                    serialized = type(response_serializer)(data=data, child=type(child)(), context=context)
                 elif isinstance(response_serializer, serializers.Serializer):
                     serializer_class = type(response_serializer)
-                    serialized = serializer_class(data=data, context=context)
+                    serialized = type(response_serializer)(data=data, context=context)
                 else:
                     serializer_class = response_serializer
                     serialized = response_serializer(data=data, context=context)
 
-                if not serialized.is_valid(raise_exception=strict_response_validation):
+                try:
+                    response_matches_serializer = serialized.is_valid(raise_exception=strict_response_validation)
+                except Exception as exc:
+                    # `is_valid` only handles DRF's ValidationError. A DataclassSerializer can raise other
+                    # errors for a valid response, and this check is advisory under DEBUG, so warn instead.
+                    if strict_response_validation:
+                        raise
+                    logger.warning(
+                        "Response serializer could not parse the response it declared for status code "
+                        f"{status_code} in the responses parameter of the @validated_request decorator. "
+                        "The response was returned unchanged; check the declared serializer.",
+                        view_func=view_func.__name__,
+                        status_code=status_code,
+                        serializer_class=serializer_class.__name__,
+                        error=str(exc),
+                    )
+                    return result
+
+                if not response_matches_serializer:
                     logger.warning(
                         f"Response data does not match declared serializer for status code {status_code} declared in responses parameter of the @validated_request decorator. Please update the provided API schema to ensure API docs remain up to date",
                         view_func=view_func.__name__,

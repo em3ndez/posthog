@@ -1,8 +1,14 @@
 from typing import Optional
 
 from posthog.test.base import APIBaseTest, ClickhouseTestMixin
+from unittest.mock import patch
 
+from django.conf import settings
+from django.db import DatabaseError, connection
 from django.test import override_settings
+from django.test.utils import CaptureQueriesContext
+
+from parameterized import parameterized
 
 from posthog.schema import (
     HogLanguage,
@@ -13,15 +19,25 @@ from posthog.schema import (
     SessionTableVersion,
 )
 
+from posthog.hogql.direct_connection import INVALID_CONNECTION_ID_ERROR
 from posthog.hogql.metadata import get_hogql_metadata
+from posthog.hogql.parser import parse_select
+from posthog.hogql.taxonomy_validation import MAX_SUGGESTED_NAMES
 
-from posthog.models import Cohort, PropertyDefinition
+from posthog.models import EventDefinition, PropertyDefinition, Team
 
-from products.data_warehouse.backend.models import ExternalDataSource, ExternalDataSourceType
+from products.cohorts.backend.models.cohort import Cohort
+from products.product_analytics.backend.facade.models import InsightVariable
+from products.warehouse_sources.backend.facade.models import DataWarehouseTable, ExternalDataSchema, ExternalDataSource
+from products.warehouse_sources.backend.facade.types import ExternalDataSourceType
 
 
 class TestMetadata(ClickhouseTestMixin, APIBaseTest):
     maxDiff = None
+    # No test here writes per-team ClickHouse data, so the per-test team isolation
+    # that ClickhouseTestMixin defaults to (CLASS_DATA_LEVEL_SETUP = False) only adds
+    # ~100ms of org/team/user creation to every test.
+    CLASS_DATA_LEVEL_SETUP = True
 
     def _expr(self, query: str, table: str = "events", debug=True) -> HogQLMetadataResponse:
         return get_hogql_metadata(
@@ -40,6 +56,21 @@ class TestMetadata(ClickhouseTestMixin, APIBaseTest):
         return get_hogql_metadata(
             query=HogQLMetadata(
                 kind="HogQLMetadata", language=HogLanguage.HOG_QL, query=query, response=None, modifiers=modifiers
+            ),
+            team=self.team,
+        )
+
+    def _select_with_variables(
+        self, query: str, variables: Optional[dict[str, dict]] = None, globals: Optional[dict] = None
+    ) -> HogQLMetadataResponse:
+        return get_hogql_metadata(
+            query=HogQLMetadata(
+                kind="HogQLMetadata",
+                language=HogLanguage.HOG_QL,
+                query=query,
+                response=None,
+                variables=variables,
+                globals=globals,
             ),
             team=self.team,
         )
@@ -68,7 +99,7 @@ class TestMetadata(ClickhouseTestMixin, APIBaseTest):
                 "query": "select 1",
                 "errors": [
                     {
-                        "message": "extraneous input '1' expecting <EOF>",
+                        "message": "trailing tokens after expression: '1' (Number)",
                         "start": 7,
                         "end": 8,
                         "fix": None,
@@ -155,6 +186,274 @@ class TestMetadata(ClickhouseTestMixin, APIBaseTest):
             },
         )
 
+    @parameterized.expand(
+        [
+            ("SELECT tiemstamp FROM events", "tiemstamp", "timestamp"),
+            ("SELECT distnct_id FROM events", "distnct_id", "distinct_id"),
+        ]
+    )
+    def test_metadata_offers_a_quick_fix_for_a_misspelled_field(self, query: str, misspelling: str, expected_fix: str):
+        metadata = self._select(query)
+
+        self.assertFalse(metadata.isValid)
+        self.assertEqual(len(metadata.errors), 1)
+        error = metadata.errors[0]
+        self.assertIn(f"Did you mean: {expected_fix}", error.message)
+        self.assertEqual(error.fix, expected_fix)
+        # The editor substitutes `fix` for the marked range, so the range has to cover the
+        # misspelling and nothing else. A span of None marks the whole query.
+        self.assertEqual(query[error.start : error.end], misspelling)
+
+    def test_metadata_offers_no_quick_fix_when_the_misspelling_heads_a_chain(self):
+        metadata = self._select("SELECT evnt.foo FROM events")
+
+        self.assertFalse(metadata.isValid)
+        self.assertEqual(len(metadata.errors), 1)
+        # Asserting the suggestion is present keeps this pinned on the chain rule: the marked range
+        # covers `evnt.foo`, so substituting `event` for it would drop the rest of the chain.
+        self.assertIn("Did you mean: event", metadata.errors[0].message)
+        self.assertIsNone(metadata.errors[0].fix)
+
+    def test_metadata_warns_for_unknown_event_literal(self):
+        EventDefinition.objects.create(team=self.team, name="paid_bill")
+
+        metadata = self._select("SELECT count() FROM events WHERE event = 'purchase'")
+
+        self.assertTrue(metadata.isValid)
+        self.assertEqual(len(metadata.errors), 0)
+        self.assertEqual(len(metadata.warnings), 1)
+        self.assertEqual(
+            metadata.warnings[0].message,
+            "Event 'purchase' was not found in this project taxonomy.",
+        )
+        self.assertIsNone(metadata.warnings[0].fix)
+
+    def test_metadata_suggests_similar_event_literal(self):
+        EventDefinition.objects.create(team=self.team, name="$pageview")
+
+        metadata = self._select("SELECT count() FROM events WHERE event = 'pageview'")
+
+        self.assertTrue(metadata.isValid)
+        self.assertEqual(len(metadata.warnings), 1)
+        self.assertEqual(
+            metadata.warnings[0].message,
+            "Event 'pageview' was not found in this project taxonomy. Did you mean '$pageview'?",
+        )
+        self.assertEqual(metadata.warnings[0].fix, "'$pageview'")
+
+    def test_metadata_does_not_warn_for_known_event_literal(self):
+        EventDefinition.objects.create(team=self.team, name="paid_bill")
+
+        metadata = self._select("SELECT count() FROM events WHERE event = 'paid_bill'")
+
+        self.assertTrue(metadata.isValid)
+        self.assertEqual(metadata.warnings, [])
+
+    def test_metadata_warns_for_unknown_event_in_literal(self):
+        EventDefinition.objects.create(team=self.team, name="signed_up")
+
+        metadata = self._select("SELECT count() FROM events WHERE event IN ('signed_up', 'signup')")
+
+        self.assertTrue(metadata.isValid)
+        warning_messages = [warning.message for warning in metadata.warnings]
+        self.assertIn(
+            "Event 'signup' was not found in this project taxonomy. Did you mean 'signed_up'?", warning_messages
+        )
+        self.assertNotIn("Event 'signed_up' was not found in this project taxonomy.", warning_messages)
+
+    def test_metadata_warns_for_unknown_property_field_access(self):
+        PropertyDefinition.objects.create(team=self.team, name="$geoip_country_code")
+
+        metadata = self._select("SELECT properties.country_code, count() FROM events GROUP BY properties.country_code")
+
+        self.assertTrue(metadata.isValid)
+        self.assertEqual(len(metadata.errors), 0)
+        self.assertEqual(len(metadata.warnings), 1)
+        self.assertEqual(
+            metadata.warnings[0].message,
+            "Property 'country_code' was not found in this project taxonomy. Did you mean '$geoip_country_code'?",
+        )
+        self.assertEqual(metadata.warnings[0].fix, "properties.$geoip_country_code")
+
+    def test_metadata_warns_for_unknown_property_array_access(self):
+        PropertyDefinition.objects.create(team=self.team, name="$geoip_country_code")
+
+        metadata = self._select("SELECT properties['country_code'] FROM events")
+
+        self.assertTrue(metadata.isValid)
+        self.assertEqual(len(metadata.errors), 0)
+        self.assertEqual(len(metadata.warnings), 1)
+        self.assertEqual(metadata.warnings[0].fix, "'$geoip_country_code'")
+
+    def test_metadata_does_not_warn_for_known_property_access(self):
+        PropertyDefinition.objects.create(team=self.team, name="country_code")
+
+        metadata = self._select("SELECT properties.country_code FROM events")
+
+        self.assertTrue(metadata.isValid)
+        self.assertEqual(metadata.warnings, [])
+
+    @parameterized.expand([("event",), ("property",)])
+    def test_metadata_scopes_taxonomy_to_the_project(self, kind: str) -> None:
+        # Definitions are project-scoped, and so is the taxonomic filter that lists them. A
+        # team-scoped lookup here reports a name as unknown that the filter offers, for every
+        # definition ingested through a sibling environment of the same project.
+        sibling = Team.objects.create(
+            organization=self.organization, project_id=self.team.project_id, name="sibling environment"
+        )
+        other_project = Team.objects.create(organization=self.organization, name="unrelated project")
+        model = EventDefinition if kind == "event" else PropertyDefinition
+        # Without a definition owned by this team the taxonomy reads as empty under a team-scoped
+        # lookup, and the empty-taxonomy early return would satisfy the first assertion for free.
+        model.objects.create(team=self.team, name="owned_by_this_team")
+        model.objects.create(team=sibling, project_id=self.team.project_id, name="in_this_project")
+        model.objects.create(team=other_project, project_id=other_project.project_id, name="in_another_project")
+
+        def taxonomy_warnings(name: str) -> list[str]:
+            query = (
+                f"SELECT count() FROM events WHERE event = '{name}'"
+                if kind == "event"
+                else f"SELECT properties.{name} FROM events"
+            )
+            return [w.message for w in self._select(query).warnings if "project taxonomy" in w.message]
+
+        self.assertEqual(taxonomy_warnings("in_this_project"), [])
+        self.assertEqual(len(taxonomy_warnings("in_another_project")), 1)
+
+    def _select_with_unknown_properties(self, count: int) -> HogQLMetadataResponse:
+        for index in range(count):
+            PropertyDefinition.objects.create(team=self.team, name=f"suggestable_{index}")
+
+        conditions = " OR ".join(f"properties.sugestable_{index} = '1'" for index in range(count))
+        return self._select(f"SELECT count() FROM events WHERE {conditions}")
+
+    def test_metadata_caps_how_many_unknown_names_get_a_suggestion(self) -> None:
+        # One query can carry any number of unknown names. Every unknown name still warns, so only
+        # the "Did you mean" half is capped.
+        unknown_count = MAX_SUGGESTED_NAMES + 3
+
+        metadata = self._select_with_unknown_properties(unknown_count)
+
+        taxonomy_warnings = [w.message for w in metadata.warnings if "project taxonomy" in w.message]
+        self.assertEqual(len(taxonomy_warnings), unknown_count)
+        self.assertEqual(
+            len([message for message in taxonomy_warnings if "Did you mean" in message]),
+            MAX_SUGGESTED_NAMES,
+        )
+
+    def test_metadata_reads_suggestion_candidates_in_one_query(self) -> None:
+        # A candidate read per unknown name costs a round trip per name. A typical project holds a
+        # few hundred definitions, where those round trips cost more than the comparison they save.
+        with CaptureQueriesContext(connection) as captured:
+            metadata = self._select_with_unknown_properties(MAX_SUGGESTED_NAMES)
+
+        self.assertTrue(metadata.isValid)
+        candidate_reads = [q["sql"] for q in captured.captured_queries if "SIMILARITY" in q["sql"].upper()]
+        self.assertEqual(len(candidate_reads), 1, candidate_reads)
+
+    def test_metadata_does_not_warn_for_dynamic_event_expression(self):
+        EventDefinition.objects.create(team=self.team, name="paid_bill")
+
+        metadata = self._select("SELECT count() FROM events WHERE event = concat('paid_', 'bill')")
+
+        taxonomy_warnings = [warning for warning in metadata.warnings if "project taxonomy" in warning.message]
+        self.assertEqual(taxonomy_warnings, [])
+
+    def test_metadata_does_not_warn_for_dynamic_property_access(self):
+        metadata = self._select("SELECT properties[key] FROM events")
+
+        taxonomy_warnings = [warning for warning in metadata.warnings if "project taxonomy" in warning.message]
+        self.assertEqual(taxonomy_warnings, [])
+
+    def test_metadata_does_not_warn_for_allowlisted_dynamic_property(self):
+        PropertyDefinition.objects.create(team=self.team, name="$geoip_country_code")
+
+        metadata = self._select("SELECT properties['$feature/my-flag'] FROM events")
+
+        taxonomy_warnings = [warning for warning in metadata.warnings if "project taxonomy" in warning.message]
+        self.assertEqual(taxonomy_warnings, [])
+
+    def test_metadata_skips_suggestion_lookup_for_known_event(self):
+        EventDefinition.objects.create(team=self.team, name="paid_bill")
+
+        with patch("posthog.hogql.taxonomy_validation._similar_names") as similar_names:
+            metadata = self._select("SELECT count() FROM events WHERE event = 'paid_bill'")
+
+        self.assertTrue(metadata.isValid)
+        similar_names.assert_not_called()
+
+    def test_metadata_event_literal_fix_preserves_quotes(self):
+        EventDefinition.objects.create(team=self.team, name="$pageview")
+
+        query = "SELECT count() FROM events WHERE event = 'pagevisit'"
+        warning = self._select(query).warnings[0]
+
+        # Apply the fix exactly as the editor quick-fix does: replace [start, end] with fix.
+        replaced = query[: warning.start] + (warning.fix or "") + query[warning.end :]
+        self.assertEqual(replaced, "SELECT count() FROM events WHERE event = '$pageview'")
+
+    def test_metadata_property_field_fix_preserves_prefix(self):
+        PropertyDefinition.objects.create(team=self.team, name="$geoip_country_code")
+
+        query = "SELECT properties.country_code FROM events"
+        warning = self._select(query).warnings[0]
+
+        replaced = query[: warning.start] + (warning.fix or "") + query[warning.end :]
+        self.assertEqual(replaced, "SELECT properties.$geoip_country_code FROM events")
+
+    def test_metadata_event_literal_fix_escapes_quote_in_suggestion(self):
+        EventDefinition.objects.create(team=self.team, name="o'brien")
+
+        query = "SELECT count() FROM events WHERE event = 'obrien'"
+        warning = self._select(query).warnings[0]
+
+        # A suggested name containing a quote must be escaped so the quick-fix stays valid HogQL.
+        replaced = query[: warning.start] + (warning.fix or "") + query[warning.end :]
+        self.assertEqual(replaced, "SELECT count() FROM events WHERE event = 'o\\'brien'")
+        parse_select(replaced)  # round-trips to a parseable query
+
+    def test_metadata_property_field_fix_quotes_suggestion_needing_backticks(self):
+        PropertyDefinition.objects.create(team=self.team, name="my prop")
+
+        query = "SELECT properties.myprop FROM events"
+        warning = self._select(query).warnings[0]
+
+        replaced = query[: warning.start] + (warning.fix or "") + query[warning.end :]
+        self.assertEqual(replaced, "SELECT properties.`my prop` FROM events")
+        parse_select(replaced)
+
+    def test_metadata_taxonomy_db_error_fails_open(self):
+        EventDefinition.objects.create(team=self.team, name="paid_bill")
+
+        with patch(
+            "posthog.hogql.taxonomy_validation.EventDefinition.objects.alias",
+            side_effect=DatabaseError("boom"),
+        ):
+            metadata = self._select("SELECT count() FROM events WHERE event = 'purchase'")
+
+        # A DB error during the advisory taxonomy lookup must not invalidate a valid query.
+        self.assertTrue(metadata.isValid)
+        self.assertEqual([w for w in metadata.warnings if "project taxonomy" in w.message], [])
+
+    def test_metadata_does_not_query_taxonomy_without_taxonomy_references(self):
+        with (
+            patch("posthog.hogql.taxonomy_validation.EventDefinition.objects.alias") as event_alias,
+            patch("posthog.hogql.taxonomy_validation.PropertyDefinition.objects.alias") as property_alias,
+        ):
+            metadata = self._select("SELECT count() FROM events")
+
+        self.assertTrue(metadata.isValid)
+        event_alias.assert_not_called()
+        property_alias.assert_not_called()
+
+    def test_metadata_does_not_warn_for_event_column_outside_events_table(self):
+        EventDefinition.objects.create(team=self.team, name="paid_bill")
+
+        metadata = self._select("SELECT count() FROM (SELECT 'signup' AS event) WHERE event = 'signup'")
+
+        taxonomy_warnings = [warning for warning in metadata.warnings if "project taxonomy" in warning.message]
+        self.assertEqual(taxonomy_warnings, [])
+
     def test_metadata_table(self):
         metadata = self._expr("timestamp", "events")
         self.assertEqual(metadata.isValid, True)
@@ -167,6 +466,288 @@ class TestMetadata(ClickhouseTestMixin, APIBaseTest):
 
         metadata = self._expr("is_identified", "persons")
         self.assertEqual(metadata.isValid, True)
+
+    @patch("posthog.hogql.metadata.Database.create_for")
+    def test_metadata_resolves_database_from_connection_id(self, mock_create_for):
+        source = ExternalDataSource.objects.create(
+            source_id="selected-upstream-source",
+            connection_id="selected-connection",
+            destination_id="destination-1",
+            team=self.team,
+            status=ExternalDataSource.Status.COMPLETED,
+            source_type=ExternalDataSourceType.POSTGRES,
+            access_method=ExternalDataSource.AccessMethod.DIRECT,
+        )
+
+        get_hogql_metadata(
+            query=HogQLMetadata(
+                kind="HogQLMetadata",
+                language=HogLanguage.HOG_QL,
+                query="SELECT 1",
+                response=None,
+                connectionId=str(source.id),
+            ),
+            team=self.team,
+            user=self.user,
+        )
+
+        self.assertEqual(mock_create_for.call_count, 1)
+        self.assertEqual(mock_create_for.call_args.kwargs["team"], self.team)
+        self.assertEqual(mock_create_for.call_args.kwargs["user"], self.user)
+        self.assertEqual(mock_create_for.call_args.kwargs["connection_id"], str(source.id))
+        self.assertIn("modifiers", mock_create_for.call_args.kwargs)
+
+    def test_metadata_rejects_soft_deleted_connection_id(self):
+        source = ExternalDataSource.objects.create(
+            source_id="selected-upstream-source",
+            connection_id="selected-connection",
+            destination_id="destination-1",
+            team=self.team,
+            status=ExternalDataSource.Status.COMPLETED,
+            source_type=ExternalDataSourceType.POSTGRES,
+            access_method=ExternalDataSource.AccessMethod.DIRECT,
+            deleted=True,
+        )
+
+        metadata = get_hogql_metadata(
+            query=HogQLMetadata(
+                kind="HogQLMetadata",
+                language=HogLanguage.HOG_QL,
+                query="SELECT 1",
+                response=None,
+                connectionId=str(source.id),
+            ),
+            team=self.team,
+        )
+
+        self.assertFalse(metadata.isValid)
+        self.assertEqual([error.message for error in metadata.errors], [INVALID_CONNECTION_ID_ERROR])
+
+    def test_metadata_with_direct_connection_does_not_allow_posthog_tables(self):
+        source = ExternalDataSource.objects.create(
+            source_id="selected-upstream-source",
+            connection_id="selected-connection",
+            destination_id="destination-1",
+            team=self.team,
+            status=ExternalDataSource.Status.COMPLETED,
+            source_type=ExternalDataSourceType.POSTGRES,
+            access_method=ExternalDataSource.AccessMethod.DIRECT,
+            prefix="ph3",
+        )
+        DataWarehouseTable.objects.create(
+            name="posthog_user",
+            format="Parquet",
+            team=self.team,
+            external_data_source=source,
+            url_pattern="direct://postgres",
+            columns={"id": {"hogql": "IntegerDatabaseField", "clickhouse": "Int64", "valid": True}},
+        )
+
+        metadata = get_hogql_metadata(
+            query=HogQLMetadata(
+                kind="HogQLMetadata",
+                language=HogLanguage.HOG_QL,
+                query="SELECT * FROM persons LIMIT 1",
+                response=None,
+                connectionId=str(source.id),
+            ),
+            team=self.team,
+        )
+
+        self.assertFalse(metadata.isValid)
+        self.assertTrue(any("persons" in (error.message or "") for error in metadata.errors))
+
+    def test_metadata_with_direct_connection_allows_canonical_direct_table_names(self):
+        source = ExternalDataSource.objects.create(
+            source_id="selected-upstream-source",
+            connection_id="selected-connection",
+            destination_id="destination-1",
+            team=self.team,
+            status=ExternalDataSource.Status.COMPLETED,
+            source_type=ExternalDataSourceType.POSTGRES,
+            access_method=ExternalDataSource.AccessMethod.DIRECT,
+            prefix="ph3",
+        )
+        table = DataWarehouseTable.objects.create(
+            name="posthog_user",
+            format="Parquet",
+            team=self.team,
+            external_data_source=source,
+            url_pattern="direct://postgres",
+            columns={"id": {"hogql": "IntegerDatabaseField", "clickhouse": "Int64", "valid": True}},
+        )
+        ExternalDataSchema.objects.create(
+            name="posthog_user",
+            team=self.team,
+            source=source,
+            table=table,
+        )
+
+        metadata = get_hogql_metadata(
+            query=HogQLMetadata(
+                kind="HogQLMetadata",
+                language=HogLanguage.HOG_QL,
+                query="SELECT * FROM posthog_user LIMIT 1",
+                response=None,
+                connectionId=str(source.id),
+            ),
+            team=self.team,
+        )
+
+        self.assertTrue(metadata.isValid)
+        self.assertEqual(metadata.errors, [])
+
+    def test_metadata_with_clickhouse_direct_connection_does_not_report_direct_only_error(self):
+        # Regression: ClickHouse direct sources print through the native ClickHouse printer, whose
+        # direct-table guard raises "can only be queried through its direct connection" unless the
+        # context is marked direct. The metadata path did not set is_direct_query, so it reported a
+        # false error for a query that actually runs. (Postgres/MySQL direct printers lack the guard,
+        # so this only regressed for ClickHouse.)
+        source = ExternalDataSource.objects.create(
+            source_id="ch-source",
+            connection_id="ch-connection",
+            destination_id="ch-destination",
+            team=self.team,
+            status=ExternalDataSource.Status.COMPLETED,
+            source_type=ExternalDataSourceType.CLICKHOUSE,
+            access_method=ExternalDataSource.AccessMethod.DIRECT,
+            prefix="ch",
+            job_inputs={"host": "localhost", "database": "posthog"},
+        )
+        table = DataWarehouseTable.objects.create(
+            name="events",
+            format="Parquet",
+            team=self.team,
+            external_data_source=source,
+            url_pattern="direct://clickhouse",
+            columns={
+                "uuid": {"hogql": "StringDatabaseField", "clickhouse": "String", "valid": True},
+                "team_id": {"hogql": "IntegerDatabaseField", "clickhouse": "Int64", "valid": True},
+            },
+        )
+        ExternalDataSchema.objects.create(name="events", team=self.team, source=source, table=table)
+
+        metadata = get_hogql_metadata(
+            query=HogQLMetadata(
+                kind="HogQLMetadata",
+                language=HogLanguage.HOG_QL,
+                query="SELECT * FROM events LIMIT 1",
+                response=None,
+                connectionId=str(source.id),
+            ),
+            team=self.team,
+        )
+
+        self.assertTrue(metadata.isValid)
+        self.assertEqual(metadata.errors, [])
+
+    def test_metadata_with_direct_connection_allows_connection_metadata_function_in_expr(self):
+        source = ExternalDataSource.objects.create(
+            source_id="selected-upstream-source",
+            connection_id="selected-connection",
+            destination_id="destination-1",
+            team=self.team,
+            status=ExternalDataSource.Status.COMPLETED,
+            source_type=ExternalDataSourceType.POSTGRES,
+            access_method=ExternalDataSource.AccessMethod.DIRECT,
+            prefix="ph3",
+            connection_metadata={"available_functions": ["icu_collate_nl"]},
+        )
+        table = DataWarehouseTable.objects.create(
+            name="posthog_user",
+            format="Parquet",
+            team=self.team,
+            external_data_source=source,
+            url_pattern="direct://postgres",
+            columns={"name": {"hogql": "StringDatabaseField", "clickhouse": "String", "valid": True}},
+        )
+        ExternalDataSchema.objects.create(
+            name="posthog_user",
+            team=self.team,
+            source=source,
+            table=table,
+        )
+
+        metadata = get_hogql_metadata(
+            query=HogQLMetadata(
+                kind="HogQLMetadata",
+                language=HogLanguage.HOG_QL_EXPR,
+                query="icu_collate_nl(name, 'nl')",
+                sourceQuery=HogQLQuery(query="select * from posthog_user"),
+                response=None,
+                connectionId=str(source.id),
+            ),
+            team=self.team,
+        )
+
+        self.assertTrue(metadata.isValid)
+        self.assertEqual(metadata.errors, [])
+
+    def test_metadata_with_direct_connection_does_not_allow_disabled_tables(self):
+        source = ExternalDataSource.objects.create(
+            source_id="selected-upstream-source",
+            connection_id="selected-connection",
+            destination_id="destination-1",
+            team=self.team,
+            status=ExternalDataSource.Status.COMPLETED,
+            source_type=ExternalDataSourceType.POSTGRES,
+            access_method=ExternalDataSource.AccessMethod.DIRECT,
+            prefix="ph3",
+        )
+        table = DataWarehouseTable.objects.create(
+            name="posthog_user",
+            format="Parquet",
+            team=self.team,
+            external_data_source=source,
+            url_pattern="direct://postgres",
+            columns={"id": {"hogql": "IntegerDatabaseField", "clickhouse": "Int64", "valid": True}},
+        )
+        ExternalDataSchema.objects.create(
+            name="posthog_user",
+            team=self.team,
+            source=source,
+            table=table,
+            should_sync=False,
+        )
+
+        metadata = get_hogql_metadata(
+            query=HogQLMetadata(
+                kind="HogQLMetadata",
+                language=HogLanguage.HOG_QL,
+                query="SELECT * FROM posthog_user LIMIT 1",
+                response=None,
+                connectionId=str(source.id),
+            ),
+            team=self.team,
+        )
+
+        self.assertFalse(metadata.isValid)
+        self.assertTrue(any("posthog_user" in (error.message or "") for error in metadata.errors))
+
+    def test_metadata_rejects_non_direct_connection_id(self):
+        selected_source = ExternalDataSource.objects.create(
+            source_id="selected-upstream-source",
+            connection_id="selected-connection",
+            destination_id="destination-1",
+            team=self.team,
+            status=ExternalDataSource.Status.COMPLETED,
+            source_type=ExternalDataSourceType.STRIPE,
+            access_method=ExternalDataSource.AccessMethod.WAREHOUSE,
+            prefix="stripe",
+        )
+        metadata = get_hogql_metadata(
+            query=HogQLMetadata(
+                kind="HogQLMetadata",
+                language=HogLanguage.HOG_QL,
+                query="SELECT 1",
+                response=None,
+                connectionId=str(selected_source.id),
+            ),
+            team=self.team,
+        )
+
+        self.assertFalse(metadata.isValid)
+        self.assertEqual([error.message for error in metadata.errors], [INVALID_CONNECTION_ID_ERROR])
 
     @override_settings(PERSON_ON_EVENTS_OVERRIDE=True, PERSON_ON_EVENTS_V2_OVERRIDE=False)
     def test_metadata_in_cohort(self):
@@ -183,7 +764,7 @@ class TestMetadata(ClickhouseTestMixin, APIBaseTest):
                 "query": query,
                 "notices": [
                     {
-                        "message": "Field 'person_id' is of type 'String'",
+                        "message": "Field 'person_id' is of type 'UUID'",
                         "start": 7,
                         "end": 16,
                         "fix": None,
@@ -195,7 +776,7 @@ class TestMetadata(ClickhouseTestMixin, APIBaseTest):
                         "fix": f"'{cohort.name}'",
                     },
                     {
-                        "message": "Field 'person_id' is of type 'String'",
+                        "message": "Field 'person_id' is of type 'UUID'",
                         "start": 35,
                         "end": 44,
                         "fix": None,
@@ -207,7 +788,7 @@ class TestMetadata(ClickhouseTestMixin, APIBaseTest):
                         "fix": str(cohort.pk),
                     },
                     {
-                        "message": "Field 'person_id' is of type 'String'",
+                        "message": "Field 'person_id' is of type 'UUID'",
                         "start": 59 + len(str(cohort.pk)),
                         "end": 68 + len(str(cohort.pk)),
                         "fix": None,
@@ -228,6 +809,9 @@ class TestMetadata(ClickhouseTestMixin, APIBaseTest):
         PropertyDefinition.objects.create(team=self.team, name="string", property_type="String")
         PropertyDefinition.objects.create(team=self.team, name="number", property_type="Numeric")
         metadata = self._expr("properties.string || properties.number")
+        materialized_notice = (
+            "not materialized 🐢." if settings.CLICKHOUSE_HOGQL_USE_NEW_EVENTS_SCHEMA else "materialized (mat_*) ⚡️."
+        )
         self.assertEqual(
             metadata.dict(),
             metadata.dict()
@@ -242,7 +826,7 @@ class TestMetadata(ClickhouseTestMixin, APIBaseTest):
                         "fix": None,
                     },
                     {
-                        "message": "Event property 'number' is of type 'Float'. This property is materialized (mat_*) ⚡️.",
+                        "message": f"Event property 'number' is of type 'Float'. This property is {materialized_notice}",
                         "start": 32,
                         "end": 38,
                         "fix": None,
@@ -250,6 +834,34 @@ class TestMetadata(ClickhouseTestMixin, APIBaseTest):
                 ],
             },
         )
+
+    def test_metadata_replaces_variable_placeholders(self):
+        insight_variable = InsightVariable.objects.create(
+            team=self.team,
+            name="Company",
+            code_name="company_name",
+            type=InsightVariable.Type.STRING,
+        )
+        metadata = self._select_with_variables(
+            "SELECT {variables.company_name}",
+            variables={
+                "company_name": {
+                    "code_name": "company_name",
+                    "value": "Acme",
+                    "variableId": str(insight_variable.id),
+                }
+            },
+        )
+
+        self.assertTrue(metadata.isValid)
+        self.assertEqual(metadata.errors, [])
+
+    def test_metadata_variable_placeholder_without_variables(self):
+        metadata = self._select_with_variables("SELECT {variables.company_name}")
+
+        self.assertFalse(metadata.isValid)
+        self.assertEqual(len(metadata.errors), 1)
+        self.assertIn("company_name", metadata.errors[0].message)
 
     def test_metadata_property_type_notice_no_debug(self):
         try:
@@ -563,3 +1175,66 @@ class TestMetadata(ClickhouseTestMixin, APIBaseTest):
         # Doesn't include `name` because it's a property access and not a field
         # TODO: Should *probably* update the code to resolve that type as well
         self.assertEqual([notice.message for notice in metadata.notices or []], ["Field 'metadata' is of type 'JSON'"])
+
+    def test_metadata_warns_about_similar_subquery_in_singular(self):
+        metadata = self._select(
+            """
+            SELECT *
+            FROM (
+                SELECT person_id, count() AS total
+                FROM events
+                GROUP BY person_id
+            ) a
+            JOIN (
+                SELECT person_id, max(timestamp) AS last_seen
+                FROM events
+                GROUP BY person_id
+            ) b ON a.person_id = b.person_id
+            """
+        )
+
+        self.assertTrue(any("very similar to 1 other subquery" in warning.message for warning in metadata.warnings))
+        self.assertTrue(all(warning.fix is None for warning in metadata.warnings))
+
+    def test_metadata_warns_about_similar_subquery_in_plural(self):
+        metadata = self._select(
+            """
+            SELECT *
+            FROM (
+                SELECT person_id, count() AS total
+                FROM events
+                GROUP BY person_id
+            ) a
+            JOIN (
+                SELECT person_id, max(timestamp) AS last_seen
+                FROM events
+                GROUP BY person_id
+            ) b ON a.person_id = b.person_id
+            JOIN (
+                SELECT person_id, min(timestamp) AS first_seen
+                FROM events
+                GROUP BY person_id
+            ) c ON a.person_id = c.person_id
+            """
+        )
+
+        self.assertTrue(any("very similar to 2 other subqueries" in warning.message for warning in metadata.warnings))
+        self.assertTrue(all(warning.fix is None for warning in metadata.warnings))
+
+    def test_metadata_does_not_warn_for_distinct_subquery_sources(self):
+        metadata = self._select(
+            """
+            SELECT *
+            FROM (
+                SELECT person_id, count() AS total
+                FROM events
+                GROUP BY person_id
+            ) a
+            JOIN (
+                SELECT id, created_at
+                FROM persons
+            ) b ON a.person_id = b.id
+            """
+        )
+
+        self.assertFalse(any("very similar" in warning.message for warning in metadata.warnings))

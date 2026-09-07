@@ -4,18 +4,19 @@ from django.db.models import Count, Q, QuerySet
 
 from posthog.helpers.session_recording_playlist_templates import DEFAULT_PLAYLIST_NAMES
 from posthog.models import Organization
-from posthog.models.dashboard import Dashboard
-from posthog.models.event_definition import EventDefinition
-from posthog.models.experiment import Experiment
-from posthog.models.feature_flag import FeatureFlag
-from posthog.models.file_system.user_product_list import UserProductList
 from posthog.models.organization import OrganizationMembership
-from posthog.models.surveys.survey import Survey
 from posthog.models.team import Team
 from posthog.session_recordings.models.session_recording_playlist import SessionRecordingPlaylist
 from posthog.sync import database_sync_to_async
 
-from products.data_warehouse.backend.models.external_data_source import ExternalDataSource
+from products.dashboards.backend.models.dashboard import Dashboard
+from products.error_tracking.backend.facade.api import query_new_error_issues as query_new_error_issues
+from products.event_definitions.backend.models.event_definition import EventDefinition
+from products.experiments.backend.models.experiment import Experiment
+from products.feature_flags.backend.models.feature_flag import FeatureFlag
+from products.growth.backend.models import ProductPushCampaign
+from products.surveys.backend.models import Survey
+from products.warehouse_sources.backend.facade.models import ExternalDataSource
 
 
 def query_teams_for_digest() -> QuerySet:
@@ -25,6 +26,8 @@ def query_teams_for_digest() -> QuerySet:
         .only(
             "id",
             "name",
+            "project_id",
+            "organization_id",
             "organization__id",
             "organization__name",
             "organization__created_at",
@@ -101,7 +104,6 @@ def query_new_feature_flags(period_start: datetime, period_end: datetime) -> Que
         FeatureFlag.objects.filter(
             created_at__gt=period_start,
             created_at__lte=period_end,
-            deleted=False,
         )
         .exclude(name__contains="Feature Flag for Experiment")
         .exclude(name__contains="Targeting flag for survey")
@@ -138,17 +140,21 @@ def query_saved_filters(period_start: datetime, period_end: datetime) -> QuerySe
     )
 
 
-def query_user_product_suggestions(
-    user_id: int, team_id: int, period_start: datetime, period_end: datetime
-) -> QuerySet:
-    return UserProductList.objects.filter(
-        user_id=user_id,
-        team_id=team_id,
-        enabled=True,
-        reason__in=[UserProductList.Reason.SALES_LED, UserProductList.Reason.NEW_PRODUCT],
-        created_at__gt=period_start,
-        created_at__lte=period_end,
-    ).values("product_path", "reason", "reason_text")
+def query_org_product_push_campaigns(organization_id: str, period_end: datetime) -> QuerySet:
+    """Product push campaigns still running at the end of the digest period.
+
+    Only ACTIVE campaigns qualify. A campaign that closed mid-period did so because the org
+    either adopted the product or moved on from it, and neither is worth an email nudge.
+    """
+    return (
+        ProductPushCampaign.objects.filter(
+            organization_id=organization_id,
+            status=ProductPushCampaign.Status.ACTIVE,
+            started_at__lte=period_end,
+        )
+        .order_by("-started_at")
+        .values("product_key", "reason_text")
+    )
 
 
 @database_sync_to_async

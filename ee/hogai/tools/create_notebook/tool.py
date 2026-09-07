@@ -1,14 +1,43 @@
 import uuid
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
+from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
 from posthog.schema import ArtifactContentType, ArtifactSource, AssistantTool, AssistantToolCallMessage
 
-from ee.hogai.tool import MaxTool, ToolMessagesArtifact
-from ee.hogai.tools.create_notebook.helpers import ArtifactStatus, create_or_update_notebook_artifact
+from posthog.models import Team, User
+from posthog.sync import database_sync_to_async
 
-CREATE_NOTEBOOK_PROMPT = """
+from products.notebooks.backend.facade import api as notebooks
+from products.notebooks.backend.facade.contracts import NotebookCellLimitExceeded
+from products.notebooks.backend.facade.widget_catalog import format_notebook_widget_catalog_for_agents
+
+from ee.hogai.context.context import AssistantContextManager
+from ee.hogai.context.notebook.prompts import cell_guidance_prompt
+from ee.hogai.tool import MaxTool, ToolMessagesArtifact
+from ee.hogai.tools.create_notebook.helpers import (
+    ArtifactStatus,
+    NotebookEditNotAllowedError,
+    create_or_update_notebook_artifact,
+    notebook_exists_for_artifact,
+    save_notebook_to_db,
+)
+from ee.hogai.utils.types.base import AssistantState, NodePath
+
+NOTEBOOK_WIDGET_CATALOG_PROMPT = format_notebook_widget_catalog_for_agents()
+
+
+def create_notebook_prompt(*, sql_v2_enabled: bool) -> str:
+    """Build the tool description for one user.
+
+    `sql_v2_enabled` follows the same flag the notebook run endpoint enforces. Without it the
+    endpoint rejects a run, and the editor still renders the cell with a working-looking Run
+    button, so an authored SQLV2 or PythonV2 cell gives the user a dead control and no
+    explanation. Offer the ungated `<Query />` cell to those users instead.
+    """
+    cell_guidance = cell_guidance_prompt(sql_v2_enabled=sql_v2_enabled)
+    return f"""
 Use this tool to create a notebook document with rich content.
 
 # Use this when:
@@ -32,6 +61,12 @@ You must use EXACTLY ONE of these parameters:
 # How to use the <insight>insight_id</insight> tag:
 You can use the <insight>insight_id</insight> tag to reference existing visualization insights.
 Use the list_data tool with kind=artifacts to retrieve artifact ids, when in doubt.
+
+# PostHog object widgets:
+Add object widgets with component tags, for example `<FeatureFlag id={{123}} view="summary" />`.
+Use the identity prop and view that fit the task:
+
+{NOTEBOOK_WIDGET_CATALOG_PROMPT}
 
 # Best practices:
 The document should be structured as a series of sections, each with a heading and a body.
@@ -66,6 +101,18 @@ Our signup funnel shows the following conversion rates:
 # Updating existing notebooks:
 - If you want to update an existing notebook, use the `artifact_id` parameter to specify the ID of the existing artifact
 - *IMPORTANT*: Updating a notebook will replace the existing content with the new content
+
+# Editing a Markdown notebook v2 from inline AI:
+- When the UI context includes a Markdown notebook with an inline response placeholder, use this tool with `content` when the user asks to clean up, rewrite, reorganize, or replace the whole notebook
+- In that case, `content` must be the complete final markdown for the notebook, not just the text that replaces the inline prompt
+- Do not include the inline placeholder text, empty `<Prompt question="" />` blocks, or the user's instruction prompt in the final markdown unless the user explicitly asks to keep them
+- Use a direct assistant markdown response instead of this tool only for local answers or small insertions that should replace the inline response placeholder
+{cell_guidance}
+
+# Transient vs saved notebooks:
+- By default, notebooks are created as transient artifacts visible only in this conversation. Do NOT share URLs or references to notebook pages for transient artifacts.
+- Set save_to_notebook=True ONLY when the user explicitly asks to save, persist, or create a permanent notebook.
+- When updating an artifact that is already saved to the database, the saved notebook is automatically updated too.
 """
 
 
@@ -82,12 +129,42 @@ class CreateNotebookToolArgs(BaseModel):
     artifact_id: str | None = Field(
         default=None, description="The ID of an existing notebook artifact that you want to update."
     )
+    save_to_notebook: bool = Field(
+        default=False,
+        description="Set to true ONLY when the user explicitly asks to save/persist the notebook to the database.",
+    )
 
 
 class CreateNotebookTool(MaxTool):
     name: Literal[AssistantTool.CREATE_NOTEBOOK] = AssistantTool.CREATE_NOTEBOOK
     args_schema: type[BaseModel] = CreateNotebookToolArgs
-    description: str = CREATE_NOTEBOOK_PROMPT
+    # Fail closed: a caller that skips `create_tool_class` gets the description that authors no
+    # cell the user may be unable to run.
+    description: str = create_notebook_prompt(sql_v2_enabled=False)
+
+    @classmethod
+    async def create_tool_class(
+        cls,
+        *,
+        team: Team,
+        user: User,
+        node_path: tuple[NodePath, ...] | None = None,
+        state: AssistantState | None = None,
+        config: RunnableConfig | None = None,
+        context_manager: AssistantContextManager | None = None,
+    ) -> Self:
+        # The flag lookup reads `user.organization`, so it needs a thread with a database
+        # connection rather than this coroutine.
+        sql_v2_enabled = await database_sync_to_async(notebooks.is_sql_v2_enabled)(user)
+        return cls(
+            team=team,
+            user=user,
+            node_path=node_path,
+            state=state,
+            config=config,
+            context_manager=context_manager,
+            description=create_notebook_prompt(sql_v2_enabled=sql_v2_enabled),
+        )
 
     async def _arun_impl(
         self,
@@ -95,6 +172,7 @@ class CreateNotebookTool(MaxTool):
         content: str | None = None,
         draft_content: str | None = None,
         artifact_id: str | None = None,
+        save_to_notebook: bool = False,
     ) -> tuple[str, Any]:
         if content is not None and draft_content is not None:
             return "Error: Cannot provide both 'content' and 'draft_content'. Use exactly one.", None
@@ -106,18 +184,62 @@ class CreateNotebookTool(MaxTool):
         notebook_content = draft_content if is_draft else content
         assert notebook_content is not None
 
-        artifact, status = await create_or_update_notebook_artifact(
+        artifact, status, blocks = await create_or_update_notebook_artifact(
             artifacts_manager=self._context_manager.artifacts,
             content=notebook_content,
             title=title,
             artifact_id=artifact_id,
         )
 
-        message = f"The notebook artifact has been created with artifact_id: {artifact.short_id}"
-        if status == ArtifactStatus.FAILED_TO_UPDATE:
-            message = f"Failed to update the existing notebook artifact. A new artifact has been created with artifact_id: {artifact.short_id}"
-        elif status == ArtifactStatus.UPDATED:
-            message = f"The notebook artifact with artifact_id {artifact_id} has been updated"
+        # Check if this artifact already has a saved notebook
+        is_already_saved = await notebook_exists_for_artifact(self._team, artifact.short_id)
+
+        # Save to DB if explicitly requested or if updating an already-saved notebook
+        if save_to_notebook or is_already_saved:
+            try:
+                await save_notebook_to_db(
+                    team=self._team,
+                    user=self._user,
+                    artifact=artifact,
+                    blocks=blocks,
+                    title=title,
+                    state_messages=self._state.messages,
+                    markdown_content=notebook_content,
+                )
+            except NotebookEditNotAllowedError:
+                return (
+                    f"Error: The user does not have permission to edit the saved notebook {artifact.short_id}, "
+                    "so it was not changed.",
+                    None,
+                )
+            except NotebookCellLimitExceeded as err:
+                # Deterministic: the same save fails again, so say so rather than letting the
+                # model spend turns retrying it.
+                return (
+                    f"Error: {err} The notebook was not changed, so do not retry this save.",
+                    None,
+                )
+
+        # Build response message
+        if save_to_notebook or is_already_saved:
+            if status == ArtifactStatus.UPDATED:
+                message = f"The notebook artifact and saved notebook have been updated (short_id: {artifact.short_id})."
+            else:
+                message = f"The notebook has been saved with short_id: {artifact.short_id}. It is accessible at /notebooks/{artifact.short_id}."
+        else:
+            message = (
+                f"The notebook artifact has been created with artifact_id: {artifact.short_id}. "
+                "This is a transient artifact visible only in this conversation. "
+                "The user can save it by clicking 'Create notebook' in the UI, or ask you to save it."
+            )
+            if status == ArtifactStatus.FAILED_TO_UPDATE:
+                message = (
+                    f"Failed to update the existing notebook artifact. "
+                    f"A new artifact has been created with artifact_id: {artifact.short_id}. "
+                    "This is a transient artifact visible only in this conversation."
+                )
+            elif status == ArtifactStatus.UPDATED:
+                message = f"The notebook artifact with artifact_id {artifact_id} has been updated."
 
         if is_draft:
             return message, None

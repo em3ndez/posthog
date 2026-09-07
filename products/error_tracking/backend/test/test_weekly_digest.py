@@ -1,19 +1,35 @@
+import time
 from datetime import timedelta
 from uuid import uuid4
 
-from posthog.test.base import APIBaseTest, ClickhouseTestMixin, _create_event, flush_persons_and_events
+from posthog.test.base import APIBaseTest, ClickhouseTestMixin, _create_event, _create_person, flush_persons_and_events
+from unittest.mock import patch
 
 from django.utils import timezone
 
-from posthog.models.utils import uuid7
+from parameterized import parameterized
 
-from products.error_tracking.backend.models import ErrorTrackingIssue, ErrorTrackingIssueFingerprintV2
+from posthog.models import Team
+from posthog.models.organization import Organization
+from posthog.models.utils import uuid7
+from posthog.tasks.email_utils import compute_week_over_week_change
+
+from products.error_tracking.backend.facade.contracts import ExceptionSummary
+from products.error_tracking.backend.models import (
+    ErrorTrackingIssue,
+    ErrorTrackingIssueFingerprintV2,
+    ErrorTrackingRecommendation,
+    sync_issues_to_clickhouse,
+)
 from products.error_tracking.backend.weekly_digest import (
-    compute_week_over_week_change,
+    auto_select_project_for_user,
     get_crash_free_sessions,
     get_daily_exception_counts,
     get_exception_counts,
+    get_exception_summary_for_team,
     get_new_issues_for_team,
+    get_org_ids_with_exceptions,
+    get_source_maps_recommendation_for_team,
     get_top_issues_for_team,
 )
 
@@ -43,6 +59,8 @@ class TestWeeklyDigest(ClickhouseTestMixin, APIBaseTest):
             issue=issue,
             fingerprint=str(uuid4()),
         )
+        # issue_id resolves via the fingerprint issue state table in ClickHouse
+        sync_issues_to_clickhouse(issue_ids=[issue.id], team_id=self.team.pk)
         return issue
 
     def _create_exception_event(
@@ -55,6 +73,13 @@ class TestWeeklyDigest(ClickhouseTestMixin, APIBaseTest):
         props: dict = {}
         if issue_id:
             props["$exception_issue_id"] = str(issue_id)
+            fingerprint = (
+                ErrorTrackingIssueFingerprintV2.objects.filter(issue_id=issue_id)
+                .values_list("fingerprint", flat=True)
+                .first()
+            )
+            if fingerprint:
+                props["$exception_fingerprint"] = fingerprint
         if session_id:
             props["$session_id"] = session_id
 
@@ -84,36 +109,24 @@ class TestWeeklyDigest(ClickhouseTestMixin, APIBaseTest):
             timestamp=timestamp or _days_ago(1),
         )
 
-    def test_get_exception_counts_returns_counts_per_team(self):
+    def _create_person_with_email(self, distinct_id: str, email: str) -> None:
+        _create_person(distinct_ids=[distinct_id], properties={"email": email}, team=self.team)
+
+    def _set_internal_user_filter(self) -> None:
+        self.team.test_account_filters = [
+            {"key": "email", "type": "person", "operator": "not_icontains", "value": "@internal.com"}
+        ]
+        self.team.save()
+
+    def test_get_exception_counts_returns_teams_with_exceptions(self):
         issue = self._create_issue()
-        for _ in range(3):
-            self._create_exception_event(issue_id=issue.id)
-        self._create_exception_event(issue_id=None)
+        self._create_exception_event(issue_id=issue.id)
         flush_persons_and_events()
 
         results = get_exception_counts(team_ids=[self.team.pk])
 
         assert len(results) == 1
-        team_id, exception_count, ingestion_failure_count, prev_exception_count = results[0]
-        assert team_id == self.team.pk
-        assert exception_count == 4
-        assert ingestion_failure_count == 1
-        assert prev_exception_count == 0
-
-    def test_get_exception_counts_includes_previous_week(self):
-        issue = self._create_issue()
-        for _ in range(3):
-            self._create_exception_event(issue_id=issue.id, timestamp=_days_ago(1))
-        for _ in range(5):
-            self._create_exception_event(issue_id=issue.id, timestamp=_days_ago(10))
-        flush_persons_and_events()
-
-        results = get_exception_counts(team_ids=[self.team.pk])
-
-        assert len(results) == 1
-        _, exception_count, _, prev_exception_count = results[0]
-        assert exception_count == 3
-        assert prev_exception_count == 5
+        assert results[0][0] == self.team.pk
 
     def test_get_exception_counts_excludes_old_events(self):
         issue = self._create_issue()
@@ -133,12 +146,13 @@ class TestWeeklyDigest(ClickhouseTestMixin, APIBaseTest):
 
         result = get_crash_free_sessions(self.team)
 
-        assert result["total_sessions"] == 3
-        assert result["crash_free_rate"] == 66.67
+        assert result is not None
+        assert result.total_sessions == 3
+        assert result.crash_free_rate == 66.67
 
     def test_get_crash_free_sessions_empty_when_no_sessions(self):
         result = get_crash_free_sessions(self.team)
-        assert result == {}
+        assert result is None
 
     def test_get_crash_free_sessions_includes_previous_week_comparison(self):
         s1, s2, s3 = str(uuid7()), str(uuid7()), str(uuid7())
@@ -152,9 +166,10 @@ class TestWeeklyDigest(ClickhouseTestMixin, APIBaseTest):
 
         result = get_crash_free_sessions(self.team)
 
-        assert result["total_sessions"] == 2
-        assert result["crash_free_rate"] == 50.0
-        assert result["total_sessions_change"] is not None
+        assert result is not None
+        assert result.total_sessions == 2
+        assert result.crash_free_rate == 50.0
+        assert result.total_sessions_change is not None
 
     def test_get_daily_exception_counts_returns_7_days(self):
         issue = self._create_issue()
@@ -163,7 +178,7 @@ class TestWeeklyDigest(ClickhouseTestMixin, APIBaseTest):
         self._create_exception_event(issue_id=issue.id, timestamp=_days_ago(3))
         flush_persons_and_events()
 
-        result = get_daily_exception_counts(self.team.pk)
+        result = get_daily_exception_counts(self.team)
 
         assert len(result) == 7
 
@@ -180,7 +195,7 @@ class TestWeeklyDigest(ClickhouseTestMixin, APIBaseTest):
         assert pcts[day_3_ago] == 50
 
     def test_get_daily_exception_counts_empty(self):
-        result = get_daily_exception_counts(self.team.pk)
+        result = get_daily_exception_counts(self.team)
 
         assert len(result) == 7
         assert all(d["count"] == 0 for d in result)
@@ -247,6 +262,11 @@ class TestWeeklyDigest(ClickhouseTestMixin, APIBaseTest):
         )
         ErrorTrackingIssue.objects.filter(id=old_issue.id).update(created_at=timezone.now() - timedelta(days=14))
         ErrorTrackingIssueFingerprintV2.objects.create(team=self.team, issue=old_issue, fingerprint=str(uuid4()))
+        # first_seen is auto_now_add; backdate it so the issue counts as old (newness comes from state-table first_seen)
+        ErrorTrackingIssueFingerprintV2.objects.filter(issue=old_issue).update(
+            first_seen=timezone.now() - timedelta(days=14)
+        )
+        sync_issues_to_clickhouse(issue_ids=[old_issue.id], team_id=self.team.pk)
         for _ in range(10):
             self._create_exception_event(issue_id=old_issue.id)
         flush_persons_and_events()
@@ -260,6 +280,218 @@ class TestWeeklyDigest(ClickhouseTestMixin, APIBaseTest):
     def test_get_new_issues_empty_when_none(self):
         result = get_new_issues_for_team(self.team)
         assert result == []
+
+    def test_summary_not_suppressed_by_high_issue_cardinality(self):
+        # 101+ prior-week issues used to fill HogQL's injected LIMIT 100 and truncate away the current week
+        for _ in range(101):
+            self._create_exception_event(issue_id=str(uuid7()), timestamp=_days_ago(10))
+        issue = self._create_issue()
+        self._create_exception_event(issue_id=issue.id)
+        flush_persons_and_events()
+
+        result = get_exception_summary_for_team(self.team)
+
+        assert result is not None
+        assert result.exception_count == 1
+        assert result.prev_exception_count == 101
+
+    def test_top_issues_follow_issue_merges(self):
+        issue_a = self._create_issue(name="OriginalIssue")
+        self._create_exception_event(issue_id=issue_a.id)  # ingested while the fingerprint pointed at A
+        issue_b = ErrorTrackingIssue.objects.create(
+            id=uuid7(), team=self.team, status=ErrorTrackingIssue.Status.ACTIVE, name="MergedIntoIssue"
+        )
+        ErrorTrackingIssueFingerprintV2.objects.filter(issue=issue_a).update(issue=issue_b)
+        # force a later state version so the merge wins argMax
+        with patch("products.error_tracking.backend.models.time") as mock_time:
+            mock_time.time.return_value = time.time() + 10
+            sync_issues_to_clickhouse(issue_ids=[issue_b.id], team_id=self.team.pk)
+        flush_persons_and_events()
+
+        result = get_top_issues_for_team(self.team)
+
+        assert len(result) == 1
+        assert str(result[0]["id"]) == str(issue_b.id)
+        assert result[0]["name"] == "MergedIntoIssue"
+
+    def test_get_org_ids_with_exceptions(self):
+        issue = self._create_issue()
+        self._create_exception_event(issue_id=issue.id)
+        flush_persons_and_events()
+
+        org_ids = get_org_ids_with_exceptions()
+
+        assert self.team.organization_id in org_ids
+
+    def test_get_org_ids_with_exceptions_empty(self):
+        org_ids = get_org_ids_with_exceptions()
+        assert org_ids == []
+
+    def test_get_exception_summary_for_team(self):
+        issue = self._create_issue()
+        for _ in range(3):
+            self._create_exception_event(issue_id=issue.id)
+        self._create_exception_event(issue_id=None)  # ingestion failure
+        flush_persons_and_events()
+
+        result = get_exception_summary_for_team(self.team)
+
+        assert result == ExceptionSummary(exception_count=4, ingestion_failure_count=1, prev_exception_count=0)
+
+    def test_get_exception_summary_for_team_includes_previous_week(self):
+        issue = self._create_issue()
+        for _ in range(3):
+            self._create_exception_event(issue_id=issue.id, timestamp=_days_ago(1))
+        for _ in range(5):
+            self._create_exception_event(issue_id=issue.id, timestamp=_days_ago(10))
+        flush_persons_and_events()
+
+        result = get_exception_summary_for_team(self.team)
+
+        assert result is not None
+        assert result.exception_count == 3
+        assert result.prev_exception_count == 5
+
+    def test_get_exception_summary_for_team_excludes_other_teams(self):
+        other_org = Organization.objects.create(name="Other Org")
+        other_team = Team.objects.create(organization=other_org, name="Other Team")
+
+        issue = self._create_issue()
+        self._create_exception_event(issue_id=issue.id)
+        flush_persons_and_events()
+
+        result = get_exception_summary_for_team(other_team)
+
+        assert result is None or result.exception_count == 0
+
+    @parameterized.expand(["engineering", "data", "founder", "Engineering", "DATA", "Founder"])
+    def test_auto_select_project_enrolls_eligible_roles(self, role):
+        self.user.role_at_organization = role
+        self.user.save()
+
+        team_exception_counts = {
+            self.team.pk: ExceptionSummary(exception_count=10, ingestion_failure_count=0, prev_exception_count=0),
+        }
+
+        auto_select_project_for_user(self.user, self.organization.id, team_exception_counts)
+        self.user.refresh_from_db()
+
+        settings = self.user.notification_settings or {}
+        project_enabled = settings.get("error_tracking_weekly_digest_project_enabled", {})
+        assert project_enabled[str(self.team.pk)] is True
+
+    @parameterized.expand(["marketing", "sales", "leadership", "product", "other", None])
+    def test_auto_select_project_sets_empty_for_ineligible_roles(self, role):
+        self.user.role_at_organization = role
+        self.user.save()
+
+        team_exception_counts = {
+            self.team.pk: ExceptionSummary(exception_count=10, ingestion_failure_count=0, prev_exception_count=0),
+        }
+
+        auto_select_project_for_user(self.user, self.organization.id, team_exception_counts)
+        self.user.refresh_from_db()
+
+        settings = self.user.notification_settings or {}
+        project_enabled = settings.get("error_tracking_weekly_digest_project_enabled", {})
+        assert project_enabled == {}
+
+    def test_auto_select_project_skips_if_already_configured(self):
+        self.user.role_at_organization = "engineering"
+        self.user.partial_notification_settings = {
+            "error_tracking_weekly_digest_project_enabled": {str(self.team.pk): True},
+        }
+        self.user.save()
+
+        team_exception_counts = {
+            self.team.pk: ExceptionSummary(exception_count=5, ingestion_failure_count=0, prev_exception_count=0),
+        }
+
+        auto_select_project_for_user(self.user, self.organization.id, team_exception_counts)
+        self.user.refresh_from_db()
+
+        settings = self.user.notification_settings or {}
+        assert settings["error_tracking_weekly_digest_project_enabled"] == {str(self.team.pk): True}
+
+    def test_auto_select_project_noop_when_no_exceptions(self):
+        auto_select_project_for_user(self.user, self.organization.id, {})
+        self.user.refresh_from_db()
+
+        assert "error_tracking_weekly_digest_project_enabled" not in (self.user.partial_notification_settings or {})
+
+    def test_get_exception_summary_filters_internal_users(self):
+        self._set_internal_user_filter()
+        issue = self._create_issue()
+        self._create_person_with_email("regular_user", "user@external.com")
+        self._create_person_with_email("internal_user", "bot@internal.com")
+        self._create_exception_event(issue_id=issue.id, distinct_id="regular_user")
+        self._create_exception_event(issue_id=issue.id, distinct_id="regular_user")
+        self._create_exception_event(issue_id=issue.id, distinct_id="internal_user")
+        flush_persons_and_events()
+
+        result = get_exception_summary_for_team(self.team)
+
+        assert result is not None
+        assert result.exception_count == 2
+
+    def test_get_daily_exception_counts_filters_internal_users(self):
+        self._set_internal_user_filter()
+        issue = self._create_issue()
+        self._create_person_with_email("regular_user", "user@external.com")
+        self._create_person_with_email("internal_user", "bot@internal.com")
+        self._create_exception_event(issue_id=issue.id, distinct_id="regular_user")
+        self._create_exception_event(issue_id=issue.id, distinct_id="internal_user")
+        flush_persons_and_events()
+
+        result = get_daily_exception_counts(self.team)
+
+        assert sum(d["count"] for d in result) == 1
+
+    def test_get_top_issues_filters_internal_users(self):
+        self._set_internal_user_filter()
+        issue = self._create_issue()
+        self._create_person_with_email("regular_user", "user@external.com")
+        self._create_person_with_email("internal_user", "bot@internal.com")
+        self._create_exception_event(issue_id=issue.id, distinct_id="regular_user")
+        self._create_exception_event(issue_id=issue.id, distinct_id="internal_user")
+        self._create_exception_event(issue_id=issue.id, distinct_id="internal_user")
+        flush_persons_and_events()
+
+        result = get_top_issues_for_team(self.team)
+
+        assert len(result) == 1
+        assert result[0]["occurrence_count"] == 1
+
+    def test_get_new_issues_filters_internal_users(self):
+        self._set_internal_user_filter()
+        issue = self._create_issue()
+        self._create_person_with_email("regular_user", "user@external.com")
+        self._create_person_with_email("internal_user", "bot@internal.com")
+        self._create_exception_event(issue_id=issue.id, distinct_id="regular_user")
+        self._create_exception_event(issue_id=issue.id, distinct_id="internal_user")
+        self._create_exception_event(issue_id=issue.id, distinct_id="internal_user")
+        flush_persons_and_events()
+
+        result = get_new_issues_for_team(self.team)
+
+        assert len(result) == 1
+        assert result[0]["occurrence_count"] == 1
+
+    def test_get_crash_free_sessions_filters_internal_users(self):
+        self._set_internal_user_filter()
+        s1, s2 = str(uuid7()), str(uuid7())
+        self._create_person_with_email("regular_user", "user@external.com")
+        self._create_person_with_email("internal_user", "bot@internal.com")
+        self._create_pageview(distinct_id="regular_user", session_id=s1)
+        self._create_pageview(distinct_id="internal_user", session_id=s2)
+        self._create_exception_event(distinct_id="internal_user", session_id=s2)
+        flush_persons_and_events()
+
+        result = get_crash_free_sessions(self.team)
+
+        assert result is not None
+        assert result.total_sessions == 1
+        assert result.crash_free_rate == 100.0
 
 
 class TestComputeWeekOverWeekChange:
@@ -304,3 +536,61 @@ class TestComputeWeekOverWeekChange:
 
     def test_returns_none_when_no_change(self):
         assert compute_week_over_week_change(100, 100, higher_is_better=True) is None
+
+
+# total_frames >= 20 and unresolved_pct > 0.30 => an active (not completed) recommendation
+_ACTIVE_META = {
+    "total_frames": 100,
+    "unresolved_frames": 72,
+    "unresolved_pct": 0.72,
+    "threshold_pct": 0.30,
+    "min_sample_frames": 20,
+    "lookback_hours": 24,
+}
+
+
+class TestSourceMapsRecommendationForDigest(APIBaseTest):
+    def _create_recommendation(
+        self, *, meta: dict, computed: bool = True, dismissed: bool = False
+    ) -> ErrorTrackingRecommendation:
+        now = timezone.now()
+        return ErrorTrackingRecommendation.objects.create(
+            team=self.team,
+            type="source_maps",
+            meta=meta,
+            computed_at=now if computed else None,
+            dismissed_at=now if dismissed else None,
+        )
+
+    def test_returns_none_when_no_recommendation(self):
+        assert get_source_maps_recommendation_for_team(self.team) is None
+
+    def test_returns_none_when_not_yet_computed(self):
+        self._create_recommendation(meta=_ACTIVE_META, computed=False)
+        assert get_source_maps_recommendation_for_team(self.team) is None
+
+    def test_returns_none_when_dismissed(self):
+        self._create_recommendation(meta=_ACTIVE_META, dismissed=True)
+        assert get_source_maps_recommendation_for_team(self.team) is None
+
+    def test_returns_none_when_completed_below_threshold(self):
+        self._create_recommendation(meta={**_ACTIVE_META, "unresolved_frames": 5, "unresolved_pct": 0.05})
+        assert get_source_maps_recommendation_for_team(self.team) is None
+
+    def test_returns_none_when_completed_too_few_frames(self):
+        self._create_recommendation(meta={**_ACTIVE_META, "total_frames": 5})
+        assert get_source_maps_recommendation_for_team(self.team) is None
+
+    def test_returns_data_when_active(self):
+        self._create_recommendation(meta=_ACTIVE_META)
+        result = get_source_maps_recommendation_for_team(self.team)
+        assert result is not None
+        assert result["unresolved_percent"] == 72
+        assert result["lookback_hours"] == 24
+        assert result["wizard_command"] == "npx -y @posthog/wizard@latest upload-source-maps"
+        assert result["docs_url"].startswith("https://posthog.com/docs/error-tracking/upload-source-maps")
+
+    def test_only_returns_recommendation_for_the_given_team(self):
+        other_team = Team.objects.create(organization=self.organization, name="Other")
+        self._create_recommendation(meta=_ACTIVE_META)
+        assert get_source_maps_recommendation_for_team(other_team) is None

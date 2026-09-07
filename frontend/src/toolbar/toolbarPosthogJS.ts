@@ -20,6 +20,8 @@ const initResult = posthog.init(
             featureFlags: {},
         },
         autocapture: false,
+        // The toolbar runs on customer pages and must not install global exception handlers.
+        capture_exceptions: false,
         capture_pageview: false,
         capture_pageleave: false,
         disable_surveys: true,
@@ -44,6 +46,18 @@ export const toolbarPosthogJS = initResult
 
 if (runningOnPosthog && window.JS_POSTHOG_SELF_CAPTURE) {
     toolbarPosthogJS.debug()
+}
+
+/** Capture an exception with a required toolbar context tag for filtering. */
+export function captureToolbarException(
+    error: unknown,
+    context: string,
+    additionalProperties?: Record<string, unknown>
+): void {
+    toolbarPosthogJS.captureException(error, {
+        toolbar_context: context,
+        ...additionalProperties,
+    })
 }
 
 export const useToolbarFeatureFlag = (flag: FeatureFlagKey, match?: string): boolean => {

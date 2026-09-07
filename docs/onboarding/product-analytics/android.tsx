@@ -1,8 +1,8 @@
-import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/OnboardingDocsContentWrapper'
+import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/shared/OnboardingDocsContentWrapper'
 
 import { StepDefinition } from '../steps'
 
-export const getAndroidSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
+export const getAndroidInstallSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
     const { CodeBlock, Markdown, dedent } = ctx
 
     return [
@@ -43,16 +43,16 @@ export const getAndroidSteps = (ctx: OnboardingComponentsContext): StepDefinitio
                                     class SampleApp : Application() {
 
                                         companion object {
-                                            const val POSTHOG_API_KEY = "<ph_project_api_key>"
+                                            const val POSTHOG_PROJECT_TOKEN = "<ph_project_token>"
                                             const val POSTHOG_HOST = "<ph_client_api_host>"
                                         }
 
                                         override fun onCreate() {
                                             super.onCreate()
 
-                                            // Create a PostHog Config with the given API key and host
+                                            // Create a PostHog Config with the given project token and host
                                             val config = PostHogAndroidConfig(
-                                                apiKey = POSTHOG_API_KEY,
+                                                apiKey = POSTHOG_PROJECT_TOKEN,
                                                 host = POSTHOG_HOST
                                             )
 
@@ -67,21 +67,27 @@ export const getAndroidSteps = (ctx: OnboardingComponentsContext): StepDefinitio
                 </>
             ),
         },
-        {
-            title: 'Send events',
-            badge: 'recommended',
-            content: (
-                <>
-                    <Markdown>
-                        Once installed, PostHog will automatically start capturing events. You can also manually send
-                        events to test your integration:
-                    </Markdown>
-                    <CodeBlock
-                        blocks={[
-                            {
-                                language: 'kotlin',
-                                file: 'Kotlin',
-                                code: dedent`
+    ]
+}
+
+export const getAndroidEventStep = (ctx: OnboardingComponentsContext): StepDefinition => {
+    const { CodeBlock, Markdown, dedent } = ctx
+
+    return {
+        title: 'Send events',
+        badge: 'recommended',
+        content: (
+            <>
+                <Markdown>
+                    Once installed, PostHog will automatically start capturing events. You can also manually send events
+                    to test your integration:
+                </Markdown>
+                <CodeBlock
+                    blocks={[
+                        {
+                            language: 'kotlin',
+                            file: 'Kotlin',
+                            code: dedent`
                                     import com.posthog.PostHog
 
                                     PostHog.capture(
@@ -91,13 +97,17 @@ export const getAndroidSteps = (ctx: OnboardingComponentsContext): StepDefinitio
                                         )
                                     )
                                 `,
-                            },
-                        ]}
-                    />
-                </>
-            ),
-        },
-    ]
+                        },
+                    ]}
+                />
+            </>
+        ),
+    }
 }
+
+export const getAndroidSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => [
+    ...getAndroidInstallSteps(ctx),
+    getAndroidEventStep(ctx),
+]
 
 export const AndroidInstallation = createInstallation(getAndroidSteps)

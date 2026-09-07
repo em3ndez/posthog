@@ -3,8 +3,8 @@ import { useActions } from 'kea'
 import { LemonButton } from '@posthog/lemon-ui'
 
 import { supportLogic } from 'lib/components/Support/supportLogic'
-import { LemonMenuOverlay } from 'lib/lemon-ui/LemonMenu/LemonMenu'
 import { IconErrorOutline } from 'lib/lemon-ui/icons'
+import { LemonMenuOverlay } from 'lib/lemon-ui/LemonMenu/LemonMenu'
 import { urls } from 'scenes/urls'
 
 import { parseErrorMessage } from '~/queries/query'
@@ -19,10 +19,18 @@ type MetricErrorStateProps = {
     metric: ExperimentMetric
     query?: Record<string, any>
     onRetry?: () => void
+    /** Disables the "Try again" button (with a tooltip) while a recalculation is already in flight. */
+    retryDisabledReason?: string
     height?: number
 }
 
-export const MetricErrorState = ({ error, query, onRetry, height = 200 }: MetricErrorStateProps): JSX.Element => {
+export const MetricErrorState = ({
+    error,
+    query,
+    onRetry,
+    retryDisabledReason,
+    height = 200,
+}: MetricErrorStateProps): JSX.Element => {
     const { openSupportForm } = useActions(supportLogic)
 
     const errorMessage = parseErrorMessage(error.detail)
@@ -51,6 +59,7 @@ export const MetricErrorState = ({ error, query, onRetry, height = 200 }: Metric
                         type="primary"
                         size="xsmall"
                         onClick={onRetry}
+                        disabledReason={retryDisabledReason}
                         sideAction={
                             query
                                 ? {
@@ -81,7 +90,6 @@ export const MetricErrorState = ({ error, query, onRetry, height = 200 }: Metric
                     onClick={() =>
                         openSupportForm({
                             kind: 'bug',
-                            target_area: 'experiments',
                         })
                     }
                 >

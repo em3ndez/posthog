@@ -3,18 +3,21 @@ from typing import Any, Optional, cast
 
 from freezegun import freeze_time
 from posthog.test.base import APIBaseTest
+from unittest.mock import patch
 
 from django.utils import timezone
 
 import dateutil.parser
+from parameterized import parameterized
 from rest_framework import status
 
-from posthog.api.test.test_event_definition import EventData, capture_event
+from posthog.api.test.test_event_definition import EventFixture, capture_event
 from posthog.api.test.test_organization import create_organization
 from posthog.api.test.test_team import create_team
 from posthog.api.test.test_user import create_user
 from posthog.models import ActivityLog, ObjectMediaPreview, Tag, Team, UploadedMedia, User
-from posthog.models.event_definition import EventDefinition
+
+from products.event_definitions.backend.models.event_definition import EventDefinition
 
 from ee.models.event_definition import EnterpriseEventDefinition
 from ee.models.license import License, LicenseManager
@@ -45,7 +48,7 @@ class TestEventDefinitionEnterpriseAPI(APIBaseTest):
         for event_definition in cls.EXPECTED_EVENT_DEFINITIONS:
             EnterpriseEventDefinition.objects.create(name=event_definition["name"], team_id=cls.demo_team.pk)
             capture_event(
-                event=EventData(
+                event=EventFixture(
                     event=event_definition["name"],
                     team_id=cls.demo_team.pk,
                     distinct_id="abc",
@@ -148,10 +151,11 @@ class TestEventDefinitionEnterpriseAPI(APIBaseTest):
             ["entered_free_trial", "enterprise event"],
         )
 
-        self.assertEqual(response_data["results"][1]["name"], "enterprise event")
-        self.assertEqual(response_data["results"][1]["description"], "")
-        self.assertEqual(response_data["results"][1]["tags"], ["deprecated"])
-        self.assertEqual(response_data["results"][1]["owner"]["id"], self.user.id)
+        enterprise_event = next((r for r in response_data["results"] if r["name"] == "enterprise event"), None)
+        assert enterprise_event is not None
+        assert enterprise_event["description"] == ""
+        assert enterprise_event["tags"] == ["deprecated"]
+        assert enterprise_event["owner"]["id"] == self.user.id
 
         response = self.client.get(f"/api/projects/@current/event_definitions/?search=enterprise")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
@@ -170,6 +174,35 @@ class TestEventDefinitionEnterpriseAPI(APIBaseTest):
         self.assertEqual(response.status_code, status.HTTP_200_OK)
         response_data = response.json()
         self.assertEqual(len(response_data["results"]), 0)
+
+    @parameterized.expand(
+        [
+            # $pageview is a core PostHog event, so it's treated as verified
+            ("verified_only", "true", ["$pageview", "entered_free_trial", "watched_movie"]),
+            ("unverified_only", "false", ["purchase"]),
+            ("all_when_not_specified", None, ["$pageview", "entered_free_trial", "purchase", "watched_movie"]),
+        ]
+    )
+    def test_filter_event_definitions_by_verified(
+        self, _name: str, verified_param: Optional[str], expected_names: list[str]
+    ):
+        super(LicenseManager, cast(LicenseManager, License.objects)).create(
+            plan="enterprise", valid_until=datetime(2500, 1, 19, 3, 14, 7)
+        )
+
+        for event_definition in self.EXPECTED_EVENT_DEFINITIONS:
+            EnterpriseEventDefinition.objects.filter(name=event_definition["name"], team=self.demo_team).update(
+                verified=event_definition["verified"] or False
+            )
+
+        url = "/api/projects/@current/event_definitions/"
+        if verified_param is not None:
+            url += f"?verified={verified_param}"
+
+        response = self.client.get(url)
+
+        assert response.status_code == status.HTTP_200_OK
+        assert sorted([r["name"] for r in response.json()["results"]]) == expected_names
 
     def test_update_event_definition(self):
         super(LicenseManager, cast(LicenseManager, License.objects)).create(
@@ -262,6 +295,226 @@ class TestEventDefinitionEnterpriseAPI(APIBaseTest):
         assert response.json()["verified"] is False
         assert response.json()["verified_by"] is None
         assert response.json()["verified_at"] is None
+
+    @parameterized.expand([("verify", True), ("unverify", False)])
+    def test_bulk_update_verified_flips_state_and_skips_noops(self, _name, target):
+        super(LicenseManager, cast(LicenseManager, License.objects)).create(
+            plan="enterprise", valid_until=datetime(2500, 1, 19, 3, 14, 7)
+        )
+        already = EnterpriseEventDefinition.objects.create(
+            team=self.demo_team, name="bulk_verify_already", verified=target
+        )
+        to_change = EnterpriseEventDefinition.objects.create(
+            team=self.demo_team, name="bulk_verify_change", verified=not target
+        )
+
+        response = self.client.post(
+            f"/api/projects/{self.demo_team.pk}/event_definitions/bulk_update_verified/",
+            {"ids": [str(already.id), str(to_change.id)], "verified": target},
+        )
+
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        data = response.json()
+        # Only the event that actually changed is reported; the one already in the target state is skipped.
+        assert {u["id"] for u in data["updated"]} == {str(to_change.id)}
+        assert all(u["verified"] is target for u in data["updated"])
+        assert data["skipped"] == []
+
+        already.refresh_from_db()
+        to_change.refresh_from_db()
+        assert already.verified is target
+        assert to_change.verified is target
+        # Verifying stamps metadata; unverifying clears it.
+        if target:
+            assert to_change.verified_by_id == self.user.id
+            assert to_change.verified_at is not None
+        else:
+            assert to_change.verified_by_id is None
+            assert to_change.verified_at is None
+
+    def test_bulk_update_verified_promotes_base_event_definition(self):
+        super(LicenseManager, cast(LicenseManager, License.objects)).create(
+            plan="enterprise", valid_until=datetime(2500, 1, 19, 3, 14, 7)
+        )
+        # A base row with no enterprise extension, as created during ingestion.
+        base = EventDefinition.objects.create(team=self.demo_team, name="ingested_only_event")
+        assert not EnterpriseEventDefinition.objects.filter(id=base.id).exists()
+
+        response = self.client.post(
+            f"/api/projects/{self.demo_team.pk}/event_definitions/bulk_update_verified/",
+            {"ids": [str(base.id)], "verified": True},
+        )
+
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        assert response.json()["updated"] == [{"id": str(base.id), "verified": True}]
+        promoted = EnterpriseEventDefinition.objects.get(id=base.id)
+        assert promoted.verified is True
+        assert promoted.verified_by_id == self.user.id
+
+    def test_bulk_update_verified_logs_activity_per_event(self):
+        super(LicenseManager, cast(LicenseManager, License.objects)).create(
+            plan="enterprise", valid_until=datetime(2500, 1, 19, 3, 14, 7)
+        )
+        events = [
+            EnterpriseEventDefinition.objects.create(team=self.demo_team, name=f"bulk_log_event_{i}", verified=False)
+            for i in range(3)
+        ]
+        ActivityLog.objects.filter(team_id=self.demo_team.pk, scope="EventDefinition").delete()
+
+        response = self.client.post(
+            f"/api/projects/{self.demo_team.pk}/event_definitions/bulk_update_verified/",
+            {"ids": [str(e.id) for e in events], "verified": True},
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert len(response.json()["updated"]) == 3
+
+        logs = ActivityLog.objects.filter(team_id=self.demo_team.pk, scope="EventDefinition", activity="changed")
+        assert logs.count() == 3
+        assert {log.item_id for log in logs} == {str(e.id) for e in events}
+        for log in logs:
+            assert log.user == self.user
+            assert log.detail is not None
+            verified_changes = [c for c in (log.detail.get("changes") or []) if c["field"] == "verified"]
+            assert verified_changes == [
+                {"type": "EventDefinition", "action": "changed", "field": "verified", "before": False, "after": True}
+            ]
+
+    def test_bulk_update_verified_ignores_event_definitions_in_other_project(self):
+        super(LicenseManager, cast(LicenseManager, License.objects)).create(
+            plan="enterprise", valid_until=datetime(2500, 1, 19, 3, 14, 7)
+        )
+        mine = EnterpriseEventDefinition.objects.create(team=self.demo_team, name="bulk_verify_mine", verified=False)
+        other_team = Team.objects.create(organization=self.organization, name="Other project")
+        other = EnterpriseEventDefinition.objects.create(team=other_team, name="bulk_verify_other", verified=False)
+
+        response = self.client.post(
+            f"/api/projects/{self.demo_team.pk}/event_definitions/bulk_update_verified/",
+            {"ids": [str(mine.id), str(other.id)], "verified": True},
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        data = response.json()
+        assert {u["id"] for u in data["updated"]} == {str(mine.id)}
+        assert data["skipped"] == [{"id": str(other.id), "reason": "Not found"}]
+
+        mine.refresh_from_db()
+        other.refresh_from_db()
+        assert mine.verified is True
+        assert other.verified is False
+
+    def test_bulk_update_verified_unhides_event_when_verifying(self):
+        super(LicenseManager, cast(LicenseManager, License.objects)).create(
+            plan="enterprise", valid_until=datetime(2500, 1, 19, 3, 14, 7)
+        )
+        hidden_event = EnterpriseEventDefinition.objects.create(
+            team=self.demo_team, name="bulk_verify_hidden", verified=False, hidden=True
+        )
+
+        response = self.client.post(
+            f"/api/projects/{self.demo_team.pk}/event_definitions/bulk_update_verified/",
+            {"ids": [str(hidden_event.id)], "verified": True},
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        hidden_event.refresh_from_db()
+        assert hidden_event.verified is True
+        assert hidden_event.hidden is False
+
+    def test_bulk_update_verified_deduplicates_repeated_ids(self):
+        super(LicenseManager, cast(LicenseManager, License.objects)).create(
+            plan="enterprise", valid_until=datetime(2500, 1, 19, 3, 14, 7)
+        )
+        event = EnterpriseEventDefinition.objects.create(team=self.demo_team, name="bulk_verify_dupe", verified=False)
+        ActivityLog.objects.filter(team_id=self.demo_team.pk, scope="EventDefinition").delete()
+
+        response = self.client.post(
+            f"/api/projects/{self.demo_team.pk}/event_definitions/bulk_update_verified/",
+            {"ids": [str(event.id), str(event.id)], "verified": True},
+        )
+
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        # A repeated id is applied and reported once, not once per occurrence.
+        assert response.json()["updated"] == [{"id": str(event.id), "verified": True}]
+        assert (
+            ActivityLog.objects.filter(team_id=self.demo_team.pk, scope="EventDefinition", activity="changed").count()
+            == 1
+        )
+
+    @patch("posthog.api.event_definition.log_activity")
+    def test_bulk_update_verified_rolls_back_batch_on_error(self, mock_log_activity):
+        super(LicenseManager, cast(LicenseManager, License.objects)).create(
+            plan="enterprise", valid_until=datetime(2500, 1, 19, 3, 14, 7)
+        )
+        first = EnterpriseEventDefinition.objects.create(
+            team=self.demo_team, name="bulk_verify_atomic_1", verified=False
+        )
+        second = EnterpriseEventDefinition.objects.create(
+            team=self.demo_team, name="bulk_verify_atomic_2", verified=False
+        )
+        # Fail once the second event is mid-flight, after the first has already been written.
+        mock_log_activity.side_effect = [None, RuntimeError("boom")]
+
+        # The unhandled error surfaces as a 500 rather than propagating: PostHog's DRF exception
+        # handler catches it before the test client can re-raise.
+        response = self.client.post(
+            f"/api/projects/{self.demo_team.pk}/event_definitions/bulk_update_verified/",
+            {"ids": [str(first.id), str(second.id)], "verified": True},
+        )
+        assert response.status_code == status.HTTP_500_INTERNAL_SERVER_ERROR
+
+        first.refresh_from_db()
+        second.refresh_from_db()
+        # The batch is atomic: a failure on the second event rolls back the first too.
+        assert first.verified is False
+        assert second.verified is False
+
+    def test_bulk_update_verified_requires_enterprise_build(self):
+        event = EnterpriseEventDefinition.objects.create(team=self.demo_team, name="bulk_verify_foss", verified=False)
+
+        # Without the gate, the FOSS build would 500 on the ee import instead of rejecting cleanly.
+        with patch("posthog.api.event_definition.EE_AVAILABLE", False):
+            response = self.client.post(
+                f"/api/projects/{self.demo_team.pk}/event_definitions/bulk_update_verified/",
+                {"ids": [str(event.id)], "verified": True},
+            )
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        event.refresh_from_db()
+        assert event.verified is False
+
+    def test_bulk_update_verified_survives_concurrent_promotion(self):
+        super(LicenseManager, cast(LicenseManager, License.objects)).create(
+            plan="enterprise", valid_until=datetime(2500, 1, 19, 3, 14, 7)
+        )
+        base = EventDefinition.objects.create(team=self.demo_team, name="bulk_verify_race")
+        # The competing request's promotion of the same base row, mirroring _get_event_definition.
+        competing = EnterpriseEventDefinition(eventdefinition_ptr_id=base.id, description="")
+        competing.__dict__.update(base.__dict__)
+        competing.save()
+
+        real_filter = EnterpriseEventDefinition.objects.filter
+
+        def hide_from_existence_check(*args, **kwargs):
+            # Only the promotion path's existence check filters on a single id. Hiding the row
+            # there recreates the interleaving where the competing promotion lands between the
+            # check and the save, so the save hits the real unique constraint.
+            if "id" in kwargs:
+                return EnterpriseEventDefinition.objects.none()
+            return real_filter(*args, **kwargs)
+
+        with patch.object(EnterpriseEventDefinition.objects, "filter", side_effect=hide_from_existence_check):
+            response = self.client.post(
+                f"/api/projects/{self.demo_team.pk}/event_definitions/bulk_update_verified/",
+                {"ids": [str(base.id)], "verified": True},
+            )
+
+        # Losing the promotion race must fall back to the competitor's row, not fail the request.
+        assert response.status_code == status.HTTP_200_OK, response.json()
+        assert response.json()["updated"] == [{"id": str(base.id), "verified": True}]
+        promoted = EnterpriseEventDefinition.objects.get(id=base.id)
+        assert promoted.verified is True
+        assert promoted.verified_by_id == self.user.id
 
     def test_verify_then_verify_again_no_change(self):
         super(LicenseManager, cast(LicenseManager, License.objects)).create(
@@ -384,9 +637,9 @@ class TestEventDefinitionEnterpriseAPI(APIBaseTest):
         EnterpriseEventDefinition.objects.create(team=self.demo_team, name="installed_app")
 
         response = self.client.get("/api/projects/@current/event_definitions/?search=app&event_type=event")
-        self.assertEqual(response.status_code, status.HTTP_200_OK)
-        self.assertEqual(response.json()["count"], 2)
-        self.assertEqual(response.json()["results"][0]["name"], "installed_app")
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["count"] == 2
+        assert [row["name"] for row in response.json()["results"]] == ["rated_app", "installed_app"]
 
     def test_create_event_definition_with_description(self):
         """Test creating an event definition with enterprise fields"""
@@ -445,6 +698,63 @@ class TestEventDefinitionEnterpriseAPI(APIBaseTest):
         assert event_def.verified is True
         assert event_def.verified_by == self.user
         assert event_def.verified_at is not None
+
+    def test_cannot_assign_owner_from_another_organization(self):
+        """Owner must belong to the current organization (PATCH)."""
+        License.objects.create(key="test_key", plan="enterprise", valid_until=datetime(2500, 1, 19, 3, 14, 7))
+
+        other_org = create_organization(name="other org")
+        other_user = create_user("other-user-patch@example.com", "pass", other_org)
+
+        event = EnterpriseEventDefinition.objects.create(team=self.demo_team, name="owner_patch_event", owner=self.user)
+
+        response = self.client.patch(
+            f"/api/projects/@current/event_definitions/{event.id}/",
+            {"owner": other_user.id},
+        )
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert other_user.email.encode() not in response.content
+
+        event.refresh_from_db()
+        assert event.owner_id == self.user.id
+
+    def test_cannot_create_with_owner_from_another_organization(self):
+        """Owner must belong to the current organization (POST)."""
+        License.objects.create(key="test_key", plan="enterprise", valid_until=datetime(2500, 1, 19, 3, 14, 7))
+
+        other_org = create_organization(name="other org")
+        other_user = create_user("other-user-post@example.com", "pass", other_org)
+
+        response = self.client.post(
+            "/api/projects/@current/event_definitions/",
+            {"name": "owner_post_event", "owner": other_user.id},
+        )
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert other_user.email.encode() not in response.content
+        assert not EnterpriseEventDefinition.objects.filter(name="owner_post_event", team=self.demo_team).exists()
+
+    def test_can_assign_owner_from_same_organization(self):
+        """Assigning an owner who is in the same org should still work."""
+        License.objects.create(key="test_key", plan="enterprise", valid_until=datetime(2500, 1, 19, 3, 14, 7))
+
+        same_org_user = create_user("same-org@example.com", "pass", self.organization)
+
+        event = EnterpriseEventDefinition.objects.create(
+            team=self.demo_team, name="same_org_owner_event", owner=self.user
+        )
+
+        response = self.client.patch(
+            f"/api/projects/@current/event_definitions/{event.id}/",
+            {"owner": same_org_user.id},
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["owner"]["id"] == same_org_user.id
+
+        event.refresh_from_db()
+        assert event.owner_id == same_org_user.id
 
     def test_create_event_definition_with_hidden(self):
         """Test creating a hidden event definition"""

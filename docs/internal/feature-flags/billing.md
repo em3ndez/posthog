@@ -1,6 +1,6 @@
 # Feature flag billing
 
-This document explains how the Rust feature flags service tracks usage for billing purposes, including Redis counter management, scheduled aggregation, and event processing.
+This document explains how the Rust feature flags service tracks usage for billing purposes, including Redis counter management, scheduled aggregation, event processing, and quota enforcement.
 
 ## Architecture overview
 
@@ -39,8 +39,9 @@ When a feature flag request is processed, the Rust service increments Redis coun
 
 **Source files:**
 
-- `rust/feature-flags/src/flags/flag_analytics.rs` - Counter increment logic
-- `rust/feature-flags/src/handler/billing.rs` - Billable flag detection
+- `rust/feature-flags/src/flags/flag_analytics.rs` - Counter increment logic, shared `is_billable_flag_key` predicate
+- `rust/feature-flags/src/handler/billing.rs` - Billable flag detection for `/decide`
+- `rust/feature-flags/src/api/flag_definitions.rs` - Billable flag detection and quota enforcement for `/flags/definitions`
 
 ### Redis key structure
 
@@ -76,6 +77,23 @@ Not all flag evaluations are billable. The following flags are excluded:
 - **Inactive flags**: Flags where `active = false`
 
 A request is only counted for billing if it contains at least one active, non-survey, non-product-tour flag.
+
+The billable flag key check is implemented as a shared predicate (`is_billable_flag_key` in `flag_analytics.rs`) used by both the `/decide` handler (`contains_billable_flags`) and the `/flags/definitions` handler (`has_billable_flags`). This ensures the filtering logic stays consistent across endpoints.
+
+### Quota enforcement
+
+Rust's `/flags/definitions` endpoint enforces billing quotas. When a team exceeds their feature flag request quota, the endpoint returns **HTTP 402** with a JSON body:
+
+```json
+{
+  "type": "quota_limited",
+  "code": "payment_required",
+  "detail": "You have exceeded your feature flag request quota",
+  "attr": null
+}
+```
+
+The Rust endpoint checks `FeatureFlagsLimiter.is_limited(token)` before the ETag comparison and cache fetch. If the quota is exceeded, all requests (including conditional ones) return HTTP 402 — no 304 is issued while a team is over quota. Requests that pass the quota check but result in a 304 (ETag match) are not counted toward billing usage, matching Django's behavior.
 
 ### SDK tracking
 
@@ -241,6 +259,20 @@ AND has([%(validity_token)s], replaceRegexpAll(JSONExtractRaw(properties, 'token
 | 10x local evaluation weight      | Local evaluation returns full flag definitions, requiring more server resources    |
 | Selective billing                | Survey and product tour flags are internal features, not customer-billable         |
 | SDK breakdown for analytics only | Billing charges per request regardless of SDK; breakdown is for internal analytics |
+
+## Customer request usage view
+
+The feature flags **Usage** tab shows the existing billing events grouped by SDK and request type. It does not add counters or work to the request path.
+
+- Daily queries cover up to 31 days. Hourly queries cover up to 8 days so calendar-aligned 30-day and 7-day presets fit.
+- Remote evaluation combines `/flags` and legacy `/decide` traffic.
+- Local evaluation combines `/flags/definitions` and its legacy alias.
+- Counts include billable requests only. They are not raw HTTP traffic totals.
+- Local evaluation requests contribute 10 billing units each.
+- The SDK breakdown comes from the request user-agent and unknown SDKs appear as `other`.
+- Aggregation means recent usage can take approximately 30 minutes to appear. Hourly buckets use aggregation event time, so they approximate rather than preserve exact request time.
+
+The view cannot attribute a request to an individual flag lookup. `$feature_flag_called` events describe evaluation activity, but their totals do not map one-to-one to request usage.
 
 ## Billing service processing
 

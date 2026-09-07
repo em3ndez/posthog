@@ -53,8 +53,8 @@ import structlog
 from posthog.caching.flags_redis_cache import FLAGS_DEDICATED_CACHE_ALIAS
 from posthog.metrics import TOMBSTONE_COUNTER
 from posthog.models.team.team import Team
-from posthog.redis import get_client
 from posthog.storage.cache_expiry_manager import (
+    CacheRefreshCounts,
     cleanup_stale_expiry_tracking as cleanup_generic,
     get_teams_with_expiring_caches as get_teams_generic,
     refresh_expiring_caches as refresh_generic,
@@ -63,6 +63,11 @@ from posthog.storage.hypercache import HyperCache, HyperCacheStoreMissing, KeyTy
 from posthog.storage.hypercache_manager import (
     HyperCacheManagementConfig,
     get_cache_stats as get_cache_stats_generic,
+)
+
+from products.feature_flags.backend.models.team_feature_flags_config import (
+    PropertyMatchingVersion,
+    TeamFeatureFlagsConfig,
 )
 
 logger = structlog.get_logger(__name__)
@@ -154,12 +159,20 @@ def _serialize_team_field(field: str, value: Any) -> Any:
     return value
 
 
-def _serialize_team_to_metadata(team: Team) -> dict[str, Any]:
+def _serialize_team_to_metadata(
+    team: Team,
+    minimal_flag_called_events: bool | None = None,
+    property_matching_version: int | None = None,
+) -> dict[str, Any]:
     """
     Serialize a Team object to metadata dictionary.
 
     Args:
         team: Team object with organization and project already loaded
+        minimal_flag_called_events: Pre-fetched value from TeamFeatureFlagsConfig, to let
+            batch callers avoid an N+1 query. If None, this looks it up itself.
+        property_matching_version: Pre-fetched property matching semantics version. If None,
+            this looks it up with the other feature flags config value.
 
     Returns:
         Dictionary containing full team metadata
@@ -171,6 +184,23 @@ def _serialize_team_to_metadata(team: Team) -> dict[str, Any]:
 
     metadata["organization_name"] = team.organization.name if team.organization else None
     metadata["project_name"] = team.project.name if team.project else None
+
+    if minimal_flag_called_events is None or property_matching_version is None:
+        # Deliberately not team.teamfeatureflagsconfig: the reverse O2O accessor gets
+        # cache-populated as a side effect of register_team_extension_signal's
+        # get_or_create(team=instance, ...) at team-creation time, so an already-loaded
+        # Team object can carry a stale cached value if the config row changes after
+        # the Team was loaded. An explicit query is always fresh.
+        config_values = (
+            TeamFeatureFlagsConfig.objects.filter(team_id=team.id)
+            .values_list("minimal_flag_called_events", "property_matching_version")
+            .first()
+        )
+        if config_values is not None:
+            minimal_flag_called_events = config_values[0]
+            property_matching_version = config_values[1]
+    metadata["minimal_flag_called_events"] = minimal_flag_called_events or False
+    metadata["property_matching_version"] = property_matching_version or PropertyMatchingVersion.LEGACY
 
     return metadata
 
@@ -189,7 +219,20 @@ def _batch_load_team_metadata(teams: list[Team]) -> dict[int, dict[str, Any]]:
     Returns:
         Dict mapping team_id -> metadata dict
     """
-    return {team.id: _serialize_team_to_metadata(team) for team in teams}
+    config_by_team_id = {
+        team_id: (minimal_flag_called_events, property_matching_version)
+        for team_id, minimal_flag_called_events, property_matching_version in TeamFeatureFlagsConfig.objects.filter(
+            team_id__in=[team.id for team in teams]
+        ).values_list("team_id", "minimal_flag_called_events", "property_matching_version")
+    }
+    return {
+        team.id: _serialize_team_to_metadata(
+            team,
+            minimal_flag_called_events=config_by_team_id.get(team.id, (False, PropertyMatchingVersion.LEGACY))[0],
+            property_matching_version=config_by_team_id.get(team.id, (False, PropertyMatchingVersion.LEGACY))[1],
+        )
+        for team in teams
+    }
 
 
 def _load_team_metadata(team_key: KeyType) -> dict[str, Any] | HyperCacheStoreMissing:
@@ -278,21 +321,14 @@ def verify_team_metadata(
         Dict with 'status' ("match", "miss", "mismatch") and 'issue' type.
         When verbose=True, includes 'diffs' list with detailed diff information.
     """
-    # Get cached data - use pre-loaded batch data if available (single MGET for whole batch)
+    # Get cached data - use pre-loaded batch data if available (single MGET for whole batch).
+    # The third tuple element (etag) is unused for team-metadata verification.
     if cache_batch_data and team.id in cache_batch_data:
-        cached_data, source = cache_batch_data[team.id]
+        cached_data, source, _ = cache_batch_data[team.id]
     else:
         # Fall back to individual lookup
         cached_data = get_team_metadata(team)
         source = "redis" if cached_data else "miss"
-
-    # Handle cache miss
-    if not cached_data or source == "miss":
-        return {
-            "status": "miss",
-            "issue": "CACHE_MISS",
-            "details": "No cached data found",
-        }
 
     # Get database comparison data - use db_batch_data if available to avoid redundant serialization
     if db_batch_data and team.id in db_batch_data:
@@ -300,9 +336,23 @@ def verify_team_metadata(
     else:
         db_data = _serialize_team_to_metadata(team)
 
+    # Handle cache miss
+    if not cached_data or source == "miss":
+        return {
+            "status": "miss",
+            "issue": "CACHE_MISS",
+            "details": "No cached data found",
+            "db_data": db_data,
+        }
+
     # Compare only fields we care about (defined in TEAM_METADATA_FIELDS + derived fields).
     # This allows removing fields from the cache without triggering unnecessary fixes.
-    fields_to_check = set(TEAM_METADATA_FIELDS) | {"organization_name", "project_name"}
+    fields_to_check = set(TEAM_METADATA_FIELDS) | {
+        "organization_name",
+        "project_name",
+        "minimal_flag_called_events",
+        "property_matching_version",
+    }
     diffs = []
     for key in fields_to_check:
         db_val = db_data.get(key)
@@ -321,6 +371,7 @@ def verify_team_metadata(
         "issue": "DATA_MISMATCH",
         "details": f"{len(diffs)} field(s) differ",
         "diff_fields": diff_fields,
+        "db_data": db_data,
     }
 
     if verbose:
@@ -380,6 +431,10 @@ TEAM_HYPERCACHE_MANAGEMENT_CONFIG = HyperCacheManagementConfig(
     update_fn=update_team_metadata_cache,
     cache_name="team_metadata",
     get_team_ids_to_skip_fix_fn=_get_team_ids_with_recently_updated_teams,
+    # The refresh serializes exactly these columns (plus organization/project names
+    # via select_related), so narrowing the SELECT to them keeps the job resilient to
+    # newly added Team columns the read replica may not have yet.
+    refresh_only_fields=TEAM_METADATA_FIELDS,
 )
 
 
@@ -392,23 +447,6 @@ def clear_team_metadata_cache(team: Team | str | int, kinds: list[str] | None = 
         kinds: Optional list of cache types to clear (["redis", "s3"])
     """
     team_metadata_hypercache.clear_cache(team, kinds=kinds)
-
-    # Remove from expiry tracking sorted set
-    try:
-        redis_client = get_client(team_metadata_hypercache.redis_url)
-
-        # Derive identifier using HyperCache's centralized logic
-        if isinstance(team, Team):
-            identifier = team_metadata_hypercache.get_cache_identifier(team)
-        elif isinstance(team, str):
-            identifier = team  # Already have the token
-        else:
-            # If team ID, skip sorted set cleanup (rare case)
-            return
-
-        redis_client.zrem(TEAM_CACHE_EXPIRY_SORTED_SET, identifier)
-    except Exception as e:
-        logger.warning("Failed to remove from expiry tracking", error=str(e), error_type=type(e).__name__)
 
 
 # ===================================================================
@@ -433,7 +471,7 @@ def get_teams_with_expiring_caches(ttl_threshold_hours: int = 24, limit: int = 5
     return get_teams_generic(TEAM_HYPERCACHE_MANAGEMENT_CONFIG, ttl_threshold_hours, limit)
 
 
-def refresh_expiring_caches(ttl_threshold_hours: int = 24, limit: int = 5000) -> tuple[int, int]:
+def refresh_expiring_caches(ttl_threshold_hours: int = 24, limit: int = 5000) -> CacheRefreshCounts:
     """
     Refresh caches that are expiring soon to prevent cache misses.
 
@@ -451,7 +489,7 @@ def refresh_expiring_caches(ttl_threshold_hours: int = 24, limit: int = 5000) ->
         limit: Maximum number of teams to refresh per run (default 5000)
 
     Returns:
-        Tuple of (successful_refreshes, failed_refreshes)
+        CacheRefreshCounts with successful and failed refresh counts
     """
     return refresh_generic(TEAM_HYPERCACHE_MANAGEMENT_CONFIG, ttl_threshold_hours, limit)
 

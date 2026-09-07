@@ -1,4 +1,4 @@
-import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/OnboardingDocsContentWrapper'
+import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/shared/OnboardingDocsContentWrapper'
 
 import { getReactSteps as getReactStepsPA } from '../product-analytics/react'
 import { StepDefinition } from '../steps'
@@ -43,7 +43,7 @@ export const getReactSteps = (ctx: OnboardingComponentsContext): StepDefinition[
                                 import { PostHogProvider, PostHogErrorBoundary } from '@posthog/react'
                                 const Layout = () => {
                                   return (
-                                    <PostHogProvider apiKey="<ph_project_api_key>">
+                                    <PostHogProvider apiKey="<ph_project_token>">
                                       <PostHogErrorBoundary
                                         fallback={<YourFallbackComponent />} // (Optional) Add a fallback component that's shown when an error happens.
                                       >
@@ -103,13 +103,7 @@ export const getReactSteps = (ctx: OnboardingComponentsContext): StepDefinition[
         ),
     }
 
-    return [
-        ...installSteps,
-        exceptionAutocaptureStep,
-        errorBoundaryStep,
-        manualCaptureStep,
-        verifyStep,
-    ]
+    return [...installSteps, exceptionAutocaptureStep, errorBoundaryStep, manualCaptureStep, verifyStep]
 }
 
 export const ReactInstallation = createInstallation(getReactSteps)

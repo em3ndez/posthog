@@ -146,6 +146,7 @@ export function SurveyAppearanceModal({
     survey,
     selectedPageIndex,
     setSelectedPageIndex,
+    disabledReason,
 }: CommonProps): JSX.Element | null {
     const { setIsAppearanceModalOpen } = useActions(surveysLogic)
     const { surveysStylingAvailable, isAppearanceModalOpen } = useValues(surveysLogic)
@@ -167,6 +168,7 @@ export function SurveyAppearanceModal({
                 onClick={() => {
                     setIsAppearanceModalOpen(true)
                 }}
+                disabledReason={disabledReason || undefined}
             >
                 Full-screen survey editor
             </LemonButton>
@@ -175,7 +177,11 @@ export function SurveyAppearanceModal({
                 <LemonModal.Content className="flex flex-col md:flex-row flex-1 h-full gap-4 overflow-hidden">
                     <div className="flex-1 overflow-y-auto flex flex-col gap-2 pr-1">
                         {!surveysStylingAvailable && (
-                            <PayGateMini feature={AvailableFeature.SURVEYS_STYLING} className="mb-4">
+                            <PayGateMini
+                                feature={AvailableFeature.SURVEYS_STYLING}
+                                featureDetail="survey-appearance-modal"
+                                className="mb-4"
+                            >
                                 <></>
                             </PayGateMini>
                         )}
@@ -184,6 +190,7 @@ export function SurveyAppearanceModal({
                             onAppearanceChange={onAppearanceChange}
                             validationErrors={validationErrors}
                             surveyType={survey.type}
+                            disabledReason={disabledReason}
                         />
                         <LemonDivider />
                         <SurveyColorsAppearance
@@ -192,6 +199,7 @@ export function SurveyAppearanceModal({
                             validationErrors={validationErrors}
                             customizeRatingButtons={hasRatingButtons}
                             customizePlaceholderText={hasPlaceholderText}
+                            disabledReason={disabledReason}
                         />
                     </div>
                     <SurveyPreview

@@ -1,4 +1,4 @@
-use std::{future::ready, sync::Arc};
+use std::{future::ready, sync::Arc, time::Instant};
 
 use axum::{
     extract::{Json, State},
@@ -6,6 +6,7 @@ use axum::{
     routing::get,
     Router,
 };
+use chrono::{DateTime, Utc};
 use common_kafka::kafka_consumer::RecvErr;
 use common_metrics::{serve, setup_metrics_routes};
 use common_types::embedding::{EmbeddingRecord, EmbeddingRequest};
@@ -14,11 +15,18 @@ use embedding_worker::{
     app_context::AppContext,
     config::Config,
     handle_batch,
+    metrics_utils::{
+        DROPPED_REQUESTS, RECENTLY_SEEN_DOCUMENTS, RECENTLY_SEEN_OPERATIONS,
+        RECENTLY_SEEN_OPERATION_TIME,
+    },
+    recently_seen::{dedup_seen, DocumentKey, SeenRecord},
 };
 
+use metrics::{counter, histogram};
+use serde::{Deserialize, Serialize};
 use tokio::task::JoinHandle;
 use tracing::level_filters::LevelFilter;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 use uuid::Uuid;
 
@@ -46,10 +54,55 @@ async fn ad_hoc_handler(
         Ok(response) => Ok(Json(response)),
         Err(e) => {
             // TODO - this is a hack until I do a proper pass and add real error enums
-            error!("Ad hoc embedding request failed: {}", e);
+            error!("Ad hoc embedding request failed: {:?}", e);
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
+}
+
+#[derive(Deserialize)]
+struct RecentlySeenRequest {
+    team_id: i32,
+    documents: Vec<DocumentKey>,
+}
+
+#[derive(Serialize)]
+struct RecentlySeenResult {
+    #[serde(flatten)]
+    document: DocumentKey,
+    emitted_at: Option<DateTime<Utc>>,
+}
+
+async fn recently_seen_handler(
+    State(context): State<Arc<AppContext>>,
+    Json(request): Json<RecentlySeenRequest>,
+) -> Json<Vec<RecentlySeenResult>> {
+    let started_at = Instant::now();
+    let lookup = context
+        .recently_seen
+        .lookup(request.team_id, request.documents)
+        .await;
+    histogram!(RECENTLY_SEEN_OPERATION_TIME, "operation" => "read")
+        .record(started_at.elapsed().as_secs_f64());
+    counter!(RECENTLY_SEEN_OPERATIONS, "operation" => "read").increment(1);
+    let hit_count = lookup
+        .values()
+        .filter(|emitted_at| emitted_at.is_some())
+        .count();
+    counter!(RECENTLY_SEEN_DOCUMENTS, "operation" => "read", "result" => "hit")
+        .increment(hit_count as u64);
+    counter!(RECENTLY_SEEN_DOCUMENTS, "operation" => "read", "result" => "miss")
+        .increment((lookup.len() - hit_count) as u64);
+
+    Json(
+        lookup
+            .into_iter()
+            .map(|(document, emitted_at)| RecentlySeenResult {
+                document,
+                emitted_at,
+            })
+            .collect(),
+    )
 }
 
 fn start_health_liveness_server(config: &Config, context: Arc<AppContext>) -> JoinHandle<()> {
@@ -63,6 +116,7 @@ fn start_health_liveness_server(config: &Config, context: Arc<AppContext>) -> Jo
             get(move || ready(liveness_context.health_registry.get_status())),
         )
         .route("/generate/ad_hoc", axum::routing::post(ad_hoc_handler))
+        .route("/recently_seen", axum::routing::post(recently_seen_handler))
         .with_state(context);
     let router = setup_metrics_routes(router);
     let bind = format!("{}:{}", config.host, config.port);
@@ -84,26 +138,18 @@ async fn main() {
     let _profiling_agent = match config.continuous_profiling.start_agent() {
         Ok(agent) => agent,
         Err(e) => {
-            error!("Failed to start continuous profiling agent: {e}");
+            error!("Failed to start continuous profiling agent: {e:?}");
             None
         }
     };
 
-    match &config.posthog_api_key {
-        Some(key) => {
-            let ph_config = posthog_rs::ClientOptionsBuilder::default()
-                .api_key(key.clone())
-                .api_endpoint(config.posthog_endpoint.clone())
-                .build()
-                .unwrap();
-            posthog_rs::init_global(ph_config).await.unwrap();
-            info!("Posthog client initialized");
-        }
-        None => {
-            posthog_rs::disable_global();
-            warn!("Posthog client disabled");
-        }
-    }
+    common_posthog::init(
+        "embedding-worker",
+        config.posthog_api_key.as_deref(),
+        &config.posthog_endpoint,
+    )
+    .await
+    .unwrap();
 
     let context = Arc::new(AppContext::new(config.clone()).await.unwrap());
 
@@ -139,6 +185,7 @@ async fn main() {
                     // If we failed to parse the message, or it was empty, just log and continue, our
                     // consumer has already stored the offset for us.
                     error!("Error receiving message: {:?}", err);
+                    counter!(DROPPED_REQUESTS, &[("cause", "recv_err")]).increment(1);
                     continue;
                 }
             };
@@ -147,8 +194,8 @@ async fn main() {
         let responses = match handle_batch(to_process, &offsets, context.clone()).await {
             Ok(embeddings) => embeddings,
             Err(failure) => {
-                error!("Error handling batch: {failure}");
-                panic!("Unhandled error: {failure}");
+                error!("Error handling batch: {failure:?}");
+                panic!("Unhandled error: {failure:?}");
             }
         };
 
@@ -179,6 +226,8 @@ async fn main() {
             .flat_map(Vec::<EmbeddingRecord>::from)
             .collect();
 
+        // Capture immediately before Kafka assigns ClickHouse inserted_at.
+        let emitted_at = Utc::now();
         let emit_results = txn
             .send_keyed_iter_to_kafka(
                 &context.config.output_topic,
@@ -212,6 +261,30 @@ async fn main() {
                 error!("Failed to commit kafka transaction, {:?}", e);
                 panic!("Failed to commit kafka transaction, {e:?}");
             }
+        }
+
+        // Store only after commit so a hit never advertises uncommitted output.
+        let seen = dedup_seen(records.iter().map(|record| {
+            let key = DocumentKey {
+                product: record.product.clone(),
+                document_type: record.document_type.clone(),
+                rendering: record.rendering.clone(),
+                document_id: record.document_id.clone(),
+            };
+            SeenRecord {
+                team_id: record.team_id,
+                key,
+                emitted_at,
+            }
+        }));
+        if !seen.is_empty() {
+            let started_at = Instant::now();
+            context.recently_seen.record(&seen).await;
+            histogram!(RECENTLY_SEEN_OPERATION_TIME, "operation" => "write")
+                .record(started_at.elapsed().as_secs_f64());
+            counter!(RECENTLY_SEEN_OPERATIONS, "operation" => "write").increment(1);
+            counter!(RECENTLY_SEEN_DOCUMENTS, "operation" => "write", "result" => "attempted")
+                .increment(seen.len() as u64);
         }
     }
 }

@@ -22,17 +22,24 @@ from posthog.hogql.query import execute_hogql_query
 from posthog.models import Team, User
 from posthog.redis import get_client
 
+from products.notebooks.backend.compute_pricing import get_default_compute_preset
 from products.notebooks.backend.models import KernelRuntime, Notebook
-from products.tasks.backend.services.sandbox import (
+from products.tasks.backend.facade.sandbox import (
+    SandboxBase,
     SandboxClass,
     SandboxConfig,
-    SandboxProtocol,
     SandboxStatus,
     SandboxTemplate,
     get_sandbox_class_for_backend,
 )
 
 logger = structlog.get_logger(__name__)
+
+# Hard lifetime of a notebook kernel sandbox, used when the notebook sets no
+# `kernel_idle_timeout_seconds`. A kernel serves one interactive session, so nobody waits on it
+# once the tab closes and this TTL is what reclaims it. The task-agent default
+# (`SANDBOX_TTL_SECONDS`) is longer because it has to outlast an unattended agent run.
+NOTEBOOK_KERNEL_TTL_SECONDS = 1 * 60 * 60
 
 
 @dataclass
@@ -229,11 +236,13 @@ class KernelRuntimeSession:
 
 
 def build_notebook_sandbox_config(notebook: Notebook) -> SandboxConfig:
+    default_preset = get_default_compute_preset()
     sandbox_config = SandboxConfig(
         name=f"notebook-kernel-{notebook.short_id}",
         template=SandboxTemplate.NOTEBOOK_BASE,
-        cpu_cores=1,
-        memory_gb=2,
+        cpu_cores=default_preset.cpu_cores,
+        memory_gb=default_preset.memory_gb,
+        ttl_seconds=NOTEBOOK_KERNEL_TTL_SECONDS,
     )
     if notebook.kernel_cpu_cores:
         sandbox_config.cpu_cores = notebook.kernel_cpu_cores
@@ -552,7 +561,9 @@ class KernelRuntimeService:
         else:
             try:
                 placeholders = self._parse_hogql_placeholders_payload(placeholders_payload)
-                response = execute_hogql_query(query=query, team=team, placeholders=placeholders)
+                response = execute_hogql_query(
+                    query=query, team=team, placeholders=placeholders, user=handle.runtime.user
+                )
                 if hasattr(response, "model_dump"):
                     response_payload = response.model_dump(exclude_none=True)
                 else:
@@ -708,7 +719,7 @@ class KernelRuntimeService:
         if handle.backend in (KernelRuntime.Backend.MODAL, KernelRuntime.Backend.DOCKER):
             if not handle.sandbox_id:
                 return False
-            from products.tasks.backend.services.sandbox import SandboxStatus
+            from products.tasks.backend.facade.sandbox import SandboxStatus
 
             try:
                 sandbox_class = self._get_sandbox_class(handle.backend)
@@ -770,8 +781,18 @@ class KernelRuntimeService:
         connection_file = f"/tmp/jupyter/kernel-{runtime.id}.json"
         kernel_id = f"kernel-{runtime.id}"
         sandbox_config = build_notebook_sandbox_config(notebook)
+        # Record the shape this sandbox gets, so the price can describe what is running rather
+        # than what the notebook is configured for. The two diverge until a restart.
+        runtime.provisioned_cpu_cores = sandbox_config.cpu_cores
+        runtime.provisioned_memory_gb = sandbox_config.memory_gb
+        runtime.save(update_fields=["provisioned_cpu_cores", "provisioned_memory_gb"])
         sandbox_class = self._get_sandbox_class(backend)
-        sandbox = sandbox_class.create(sandbox_config)
+        try:
+            sandbox = sandbox_class.create(sandbox_config)
+        except Exception as err:
+            detail = getattr(err, "context", None) or str(err)
+            self._mark_runtime_error(runtime, f"Failed to provision sandbox: {detail}")
+            raise
 
         try:
             kernel_pid = self._start_kernel_process(sandbox, connection_file)
@@ -809,7 +830,7 @@ class KernelRuntimeService:
             sandbox_id=sandbox.id,
         )
 
-    def _start_kernel_process(self, sandbox: SandboxProtocol, connection_file: str) -> int:
+    def _start_kernel_process(self, sandbox: SandboxBase, connection_file: str) -> int:
         start_command = (
             "mkdir -p /tmp/jupyter && "
             f"nohup python3 -m ipykernel_launcher -f {connection_file} "
@@ -838,7 +859,7 @@ class KernelRuntimeService:
             raise RuntimeError(f"Kernel did not become ready: {result.stdout} {result.stderr}")
 
     def _bootstrap_kernel(
-        self, sandbox: SandboxProtocol, connection_file: str, notebook: Notebook, user: User | None
+        self, sandbox: SandboxBase, connection_file: str, notebook: Notebook, user: User | None
     ) -> None:
         code = self._build_kernel_bootstrap_code(notebook, user, sandbox.id)
         if not code:
@@ -1561,8 +1582,15 @@ class KernelRuntimeService:
         return payload
 
 
-notebook_kernel_runtime_service = KernelRuntimeService()
+_notebook_kernel_runtime_service: KernelRuntimeService | None = None
+
+
+def _get_service() -> KernelRuntimeService:
+    global _notebook_kernel_runtime_service
+    if _notebook_kernel_runtime_service is None:
+        _notebook_kernel_runtime_service = KernelRuntimeService()
+    return _notebook_kernel_runtime_service
 
 
 def get_kernel_runtime(notebook: Notebook, user: User | None) -> KernelRuntimeSession:
-    return notebook_kernel_runtime_service.get_kernel_runtime(notebook, user)
+    return _get_service().get_kernel_runtime(notebook, user)

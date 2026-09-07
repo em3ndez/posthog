@@ -9,7 +9,6 @@ from ee.hogai.chat_agent.executables import (
     ChatAgentToolsExecutable,
 )
 from ee.hogai.tools.replay.filter_session_recordings import FilterSessionRecordingsTool
-from ee.hogai.tools.replay.summarize_sessions import SummarizeSessionsTool
 from ee.hogai.tools.todo_write import TodoWriteExample
 
 from ..factory import AgentModeDefinition
@@ -54,7 +53,6 @@ The assistant used the todo list because:
 1. Session summarization requires filtering first (can't summarize without identifying relevant sessions)
 2. The filtering requires discovering event properties through read_taxonomy
 3. Complex event-based filters need validation before being used
-4. The summarize_sessions tool requires filter_session_recordings to be called first
 5. This is a multi-step analysis requiring systematic progression through discovery, filtering, and summarization
 """.strip()
 
@@ -79,7 +77,7 @@ The assistant used the todo list because:
 5. This approach allows for tracking progress across multiple recording queries and summaries
 """.strip()
 
-MODE_DESCRIPTION = "Specialized mode for analyzing session recordings and user behavior. This mode allows you to filter session recordings, and summarize entire sessions or a set of them."
+SESSION_REPLAY_MODE_DESCRIPTION = "Specialized mode for analyzing session recordings and user behavior. This mode allows you to filter session recordings, summarize entire sessions or a set of them, and find recordings by the meaning of what Replay Vision scanners observed in them."
 
 
 class SessionReplayAgentToolkit(AgentToolkit):
@@ -100,13 +98,43 @@ class SessionReplayAgentToolkit(AgentToolkit):
 
     @property
     def tools(self) -> list[type["MaxTool"]]:
-        tools: list[type[MaxTool]] = [FilterSessionRecordingsTool, SummarizeSessionsTool]
+        # Lazy import keeps the product dependency off this module's import path (see test_toolkit_imports).
+        from products.replay_vision.backend.max_tools import (
+            AnalyzeReplayVisionImpactTool,
+            CreateReplayVisionScannerTool,
+            DeleteReplayVisionScannerTool,
+            EstimateReplayVisionScannerTool,
+            GetReplayVisionQuotaTool,
+            LabelReplayVisionObservationTool,
+            ListReplayVisionScannersTool,
+            RetryReplayVisionObservationTool,
+            ScanReplayVisionSessionsTool,
+            SearchReplayVisionObservationsTool,
+            SuggestReplayVisionTagsTool,
+            UpdateReplayVisionScannerTool,
+        )
+
+        tools: list[type[MaxTool]] = [
+            FilterSessionRecordingsTool,
+            SearchReplayVisionObservationsTool,
+            ScanReplayVisionSessionsTool,
+            RetryReplayVisionObservationTool,
+            GetReplayVisionQuotaTool,
+            CreateReplayVisionScannerTool,
+            UpdateReplayVisionScannerTool,
+            AnalyzeReplayVisionImpactTool,
+            DeleteReplayVisionScannerTool,
+            EstimateReplayVisionScannerTool,
+            LabelReplayVisionObservationTool,
+            ListReplayVisionScannersTool,
+            SuggestReplayVisionTagsTool,
+        ]
         return tools
 
 
 session_replay_agent = AgentModeDefinition(
     mode=AgentMode.SESSION_REPLAY,
-    mode_description=MODE_DESCRIPTION,
+    mode_description=SESSION_REPLAY_MODE_DESCRIPTION,
     toolkit_class=SessionReplayAgentToolkit,
     node_class=ChatAgentExecutable,
     tools_node_class=ChatAgentToolsExecutable,
@@ -115,7 +143,7 @@ session_replay_agent = AgentModeDefinition(
 
 chat_agent_plan_session_replay_agent = AgentModeDefinition(
     mode=AgentMode.SESSION_REPLAY,
-    mode_description=MODE_DESCRIPTION,
+    mode_description=SESSION_REPLAY_MODE_DESCRIPTION,
     toolkit_class=SessionReplayAgentToolkit,
     node_class=ChatAgentPlanExecutable,
     tools_node_class=ChatAgentPlanToolsExecutable,

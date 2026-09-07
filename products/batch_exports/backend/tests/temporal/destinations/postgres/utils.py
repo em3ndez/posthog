@@ -6,12 +6,14 @@ import collections.abc
 
 from psycopg import sql
 
-from posthog.batch_exports.service import BackfillDetails, BatchExportModel, BatchExportSchema
+from posthog.models import Integration
 from posthog.temporal.common.clickhouse import ClickHouseClient
 
+from products.batch_exports.backend.service import BackfillDetails, BatchExportModel, BatchExportSchema
 from products.batch_exports.backend.temporal.destinations.postgres_batch_export import postgres_default_fields
+from products.batch_exports.backend.temporal.queue import RecordBatchQueue
 from products.batch_exports.backend.temporal.record_batch_model import SessionsRecordBatchModel
-from products.batch_exports.backend.temporal.spmc import Producer, RecordBatchQueue
+from products.batch_exports.backend.tests.temporal.utils.clickhouse_test_producer import ClickHouseTestProducer
 from products.batch_exports.backend.tests.temporal.utils.records import (
     get_record_batch_from_queue,
     remove_duplicates_from_records,
@@ -135,16 +137,15 @@ async def assert_clickhouse_records_in_postgres(
     expected_records = []
     queue = RecordBatchQueue()
     if model_name == "sessions":
-        producer = Producer(model=SessionsRecordBatchModel(team_id))
+        producer = ClickHouseTestProducer(model=SessionsRecordBatchModel(team_id))
     else:
-        producer = Producer()
+        producer = ClickHouseTestProducer()
 
     producer_task = await producer.start(
         queue=queue,
         model_name=model_name,
         team_id=team_id,
         full_range=(data_interval_start, data_interval_end),
-        done_ranges=[],
         fields=fields,
         filters=filters,
         destination_default_fields=postgres_default_fields(),
@@ -212,3 +213,26 @@ async def assert_clickhouse_records_in_postgres(
     assert len(inserted_records) == len(expected_records)
     assert inserted_records[0] == expected_records[0]
     assert inserted_records == expected_records
+
+
+async def make_integration(team_id, postgres_config) -> Integration:
+    """Make an integration model for testing."""
+    host = postgres_config["host"]
+    port = postgres_config["port"]
+    user = postgres_config["user"]
+
+    integration = await Integration.objects.acreate(
+        team_id=team_id,
+        kind=Integration.IntegrationKind.POSTGRESQL,
+        integration_id=f"{team_id}-{host}-{port}-{user}",
+        config={
+            "host": host,
+            "port": port,
+            "user": user,
+            "ssl_mode": "prefer",
+        },
+        sensitive_config={
+            "password": postgres_config["password"],
+        },
+    )
+    return integration

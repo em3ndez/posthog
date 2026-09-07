@@ -2,6 +2,8 @@ from typing import Any, cast
 from uuid import uuid4
 
 import pydantic
+from drf_spectacular.types import OpenApiTypes
+from drf_spectacular.utils import extend_schema
 from rest_framework import serializers
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
@@ -11,12 +13,14 @@ from rest_framework.viewsets import GenericViewSet
 
 from posthog.api.routing import TeamAndOrgViewSetMixin
 from posthog.auth import OAuthAccessTokenAuthentication, PersonalAPIKeyAuthentication
+from posthog.event_usage import get_event_source
 from posthog.models.user import User
 from posthog.rate_limit import AIBurstRateThrottle, AISustainedRateThrottle
 from posthog.renderers import SafeJSONRenderer
 
+from products.posthog_ai.backend.models.assistant import Conversation
+
 from ee.hogai.utils.types import AssistantState
-from ee.models.assistant import Conversation
 
 
 class InsightsToolCallSerializer(serializers.Serializer):
@@ -46,6 +50,7 @@ class MaxToolsViewSet(TeamAndOrgViewSetMixin, GenericViewSet):
     throttle_classes = [AIBurstRateThrottle, AISustainedRateThrottle]
     authentication_classes = [PersonalAPIKeyAuthentication, OAuthAccessTokenAuthentication]
 
+    @extend_schema(request=InsightsToolCallSerializer, responses={200: OpenApiTypes.OBJECT})
     @action(
         detail=False,
         methods=["POST"],
@@ -64,6 +69,11 @@ class MaxToolsViewSet(TeamAndOrgViewSetMixin, GenericViewSet):
             user=cast(User, request.user),
             is_new_conversation=False,  # we don't care about the conversation id being sent back to the client
             initial_state=serializer.validated_data["state"],
+            is_agent_billable=False,
+            # This endpoint has no session auth, so it is never the web assistant — it is reached
+            # only by an agent through the MCP server. Resolving from the request rather than
+            # pinning `mcp` keeps the surface that wrapped MCP (desktop, Slack, the CLI) visible.
+            event_source=get_event_source(request),
         )
 
         return Response(

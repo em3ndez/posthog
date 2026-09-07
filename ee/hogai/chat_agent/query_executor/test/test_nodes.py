@@ -28,6 +28,8 @@ from posthog.schema import (
 
 from posthog.api.services.query import process_query_dict
 
+from products.posthog_ai.backend.models.assistant import AgentArtifact, Conversation
+
 from ee.hogai.artifacts.manager import ArtifactManager
 from ee.hogai.chat_agent.query_executor.nodes import QueryExecutorNode
 from ee.hogai.context.insight.prompts import (
@@ -39,7 +41,6 @@ from ee.hogai.context.insight.prompts import (
 )
 from ee.hogai.utils.types import AssistantState
 from ee.hogai.utils.types.base import ArtifactRefMessage, PartialAssistantState
-from ee.models import AgentArtifact, Conversation
 
 
 class TestQueryExecutorNode(ClickhouseTestMixin, NonAtomicBaseTest):
@@ -103,7 +104,9 @@ class TestQueryExecutorNode(ClickhouseTestMixin, NonAtomicBaseTest):
             name="test insight",
             type=AgentArtifact.Type.VISUALIZATION,
             data=VisualizationArtifactContent(
-                query=AssistantTrendsQuery(series=[]), name="test insight", description="test description"
+                query=AssistantTrendsQuery(series=[AssistantTrendsEventsNode()]),
+                name="test insight",
+                description="test description",
             ).model_dump(),
             conversation=self.conversation,
             team=self.team,
@@ -142,7 +145,8 @@ class TestQueryExecutorNode(ClickhouseTestMixin, NonAtomicBaseTest):
         mock_process_query_dict.assert_called_once()  # Query processing started
         msg = cast(AssistantToolCallMessage, new_state.messages[0])
         self.assertIn("Here is the results table of the TrendsQuery insight:", msg.content)
-        self.assertIn(f"Insight ID: {insight.short_id}", msg.content)
+        # The node renders an ephemeral artifact, so the ID is labelled as one and carries no URL
+        self.assertIn(f"Artifact ID: {insight.short_id}", msg.content)
         self.assertIn("Name: test insight", msg.content)
         self.assertIn("Description: test description", msg.content)
         self.assertEqual(msg.type, "tool")
@@ -192,7 +196,7 @@ class TestQueryExecutorNode(ClickhouseTestMixin, NonAtomicBaseTest):
         msg = cast(AssistantMessage, new_state.messages[0])
         self.assertEqual(
             msg.content,
-            "There was an error running this query: Error executing query: There was an unknown error running this query.",
+            "There was an error running this query: Error executing query: There was an unknown error running this query: You have not glibbled the glorp before running this.",
         )
         self.assertEqual(msg.type, "ai")
         self.assertIsNotNone(msg.id)
@@ -335,8 +339,8 @@ class TestQueryExecutorNode(ClickhouseTestMixin, NonAtomicBaseTest):
         # Test Retention Query
         retention_query = AssistantRetentionQuery(
             retentionFilter=AssistantRetentionFilter(
-                targetEntity=AssistantRetentionEventsNode(name="event"),
-                returningEntity=AssistantRetentionEventsNode(name="event"),
+                targetEntity=AssistantRetentionEventsNode(id="event"),
+                returningEntity=AssistantRetentionEventsNode(id="event"),
             )
         )
         self.assertEqual(get_example_prompt(retention_query), RETENTION_EXAMPLE_PROMPT)

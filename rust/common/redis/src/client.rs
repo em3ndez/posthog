@@ -1,8 +1,11 @@
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use redis::aio::MultiplexedConnection;
 use redis::{AsyncCommands, RedisError};
-use std::time::Duration;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::pipeline::{PipelineCommand, PipelineResult};
 use crate::{Client, CompressionConfig, CustomRedisError, RedisValueFormat};
@@ -14,9 +17,70 @@ const ERR_RAWBYTES_SET: &str =
 
 #[derive(Clone)]
 pub struct RedisClient {
-    connection: MultiplexedConnection,
+    /// Shared across clones so a `heal()` on any handle repairs all of them.
+    /// `MultiplexedConnection` does not reconnect after its TCP connection
+    /// dies; `heal()` swaps in a rebuilt one.
+    connection: Arc<ArcSwap<MultiplexedConnection>>,
+    /// Connection info retained so `heal()` can rebuild.
+    client: redis::Client,
+    response_timeout: Option<Duration>,
+    connection_timeout: Option<Duration>,
+    /// Serializes heal attempts and carries the last-attempt time for the
+    /// cooldown, so an error burst cannot stampede reconnects.
+    heal_state: Arc<tokio::sync::Mutex<Instant>>,
     compression: CompressionConfig,
     format: RedisValueFormat,
+}
+
+/// Minimum time between reconnect attempts (see `RedisClient::heal_connection`).
+const HEAL_COOLDOWN: Duration = Duration::from_secs(5);
+
+impl RedisClient {
+    /// Current connection handle. Cheap: one atomic load plus a
+    /// `MultiplexedConnection` clone (an mpsc sender clone).
+    fn conn(&self) -> MultiplexedConnection {
+        self.connection.load().as_ref().clone()
+    }
+
+    /// Rebuild the underlying connection after it has died.
+    ///
+    /// `MultiplexedConnection` never reconnects on its own: once its TCP
+    /// connection drops (Redis failover, node replacement), every command
+    /// errors forever. Callers that detect an unrecoverable error
+    /// (`CustomRedisError::is_unrecoverable_error`) call this to swap in a
+    /// fresh connection; all clones of this client share the swap. Attempts
+    /// are serialized and rate-limited by `HEAL_COOLDOWN`, and a failed
+    /// attempt just waits for the next caller -- the client keeps failing
+    /// open in the meantime, exactly as it would without healing.
+    pub async fn heal_connection(&self) {
+        let mut last_attempt = self.heal_state.lock().await;
+        if last_attempt.elapsed() < HEAL_COOLDOWN {
+            return;
+        }
+        *last_attempt = Instant::now();
+
+        let mut config = redis::AsyncConnectionConfig::new();
+        if let Some(timeout) = self.response_timeout {
+            config = config.set_response_timeout(timeout);
+        }
+        if let Some(timeout) = self.connection_timeout {
+            config = config.set_connection_timeout(timeout);
+        }
+
+        match self
+            .client
+            .get_multiplexed_async_connection_with_config(&config)
+            .await
+        {
+            Ok(connection) => {
+                self.connection.store(Arc::new(connection));
+                info!("Redis connection healed after unrecoverable error");
+            }
+            Err(e) => {
+                warn!(error = %e, "Redis heal attempt failed; will retry after cooldown");
+            }
+        }
+    }
 }
 
 impl RedisClient {
@@ -147,7 +211,11 @@ impl RedisClient {
             .await?;
 
         Ok(RedisClient {
-            connection,
+            connection: Arc::new(ArcSwap::from_pointee(connection)),
+            client,
+            response_timeout,
+            connection_timeout,
+            heal_state: Arc::new(tokio::sync::Mutex::new(Instant::now() - HEAL_COOLDOWN)),
             compression,
             format,
         })
@@ -219,29 +287,90 @@ impl RedisClient {
 
         Self::maybe_compress(bytes, &self.compression)
     }
+
+    /// Evaluate a Lua script (EVALSHA with EVAL fallback) and decode the reply
+    /// as a list of integers. Used by the error-tracking rate limiter, whose
+    /// fused script returns `{ issue_admitted, team_admitted }`. Bypasses this
+    /// client's value (de)serialization and compression — the script operates
+    /// on raw Redis types directly.
+    pub async fn eval_int_vec(
+        &self,
+        script: &str,
+        keys: Vec<String>,
+        args: Vec<String>,
+    ) -> Result<Vec<i64>, CustomRedisError> {
+        let script = redis::Script::new(script);
+        let mut invocation = script.prepare_invoke();
+        for key in keys {
+            invocation.key(key);
+        }
+        for arg in args {
+            invocation.arg(arg);
+        }
+        let mut conn = self.conn();
+        let result: Vec<i64> = invocation.invoke_async(&mut conn).await?;
+        Ok(result)
+    }
+}
+
+/// Run a Lua script and decode its integer-array reply. Behind a trait so callers
+/// can be unit-tested against an in-memory fake, including a failing one that
+/// proves a limiter fails open.
+#[async_trait]
+pub trait ScriptRunner: Send + Sync {
+    async fn eval_int_vec(
+        &self,
+        script: &str,
+        keys: Vec<String>,
+        args: Vec<String>,
+    ) -> Result<Vec<i64>, CustomRedisError>;
+
+    /// Rebuild the underlying connection after a connection-class failure; see
+    /// [`Client::heal`]. The default no-op keeps test fakes trivial.
+    async fn heal(&self) {}
+}
+
+#[async_trait]
+impl ScriptRunner for RedisClient {
+    async fn eval_int_vec(
+        &self,
+        script: &str,
+        keys: Vec<String>,
+        args: Vec<String>,
+    ) -> Result<Vec<i64>, CustomRedisError> {
+        RedisClient::eval_int_vec(self, script, keys, args).await
+    }
+
+    async fn heal(&self) {
+        self.heal_connection().await;
+    }
 }
 
 #[async_trait]
 impl Client for RedisClient {
+    async fn heal(&self) {
+        self.heal_connection().await;
+    }
+
     async fn zrangebyscore(
         &self,
         k: String,
         min: String,
         max: String,
     ) -> Result<Vec<String>, CustomRedisError> {
-        let mut conn = self.connection.clone();
+        let mut conn = self.conn();
         let results = conn.zrangebyscore(k, min, max).await?;
         Ok(results)
     }
 
-    async fn hincrby(
-        &self,
-        k: String,
-        v: String,
-        count: Option<i32>,
-    ) -> Result<(), CustomRedisError> {
-        let mut conn = self.connection.clone();
-        let count = count.unwrap_or(1);
+    async fn zadd(&self, k: String, member: String, score: i64) -> Result<(), CustomRedisError> {
+        let mut conn = self.conn();
+        conn.zadd::<_, _, _, ()>(k, member, score).await?;
+        Ok(())
+    }
+
+    async fn hincrby(&self, k: String, v: String, count: i64) -> Result<(), CustomRedisError> {
+        let mut conn = self.conn();
         conn.hincr::<_, _, _, ()>(k, v, count).await?;
         Ok(())
     }
@@ -255,7 +384,7 @@ impl Client for RedisClient {
         k: String,
         format: RedisValueFormat,
     ) -> Result<String, CustomRedisError> {
-        let mut conn = self.connection.clone();
+        let mut conn = self.conn();
         let raw_bytes: Vec<u8> = conn.get(k).await?;
 
         // return NotFound error when empty
@@ -284,7 +413,7 @@ impl Client for RedisClient {
     }
 
     async fn get_raw_bytes(&self, k: String) -> Result<Vec<u8>, CustomRedisError> {
-        let mut conn = self.connection.clone();
+        let mut conn = self.conn();
         let raw_bytes: Vec<u8> = conn.get(k).await?;
 
         // return NotFound error when empty
@@ -303,7 +432,7 @@ impl Client for RedisClient {
         v: Vec<u8>,
         ttl_seconds: Option<u64>,
     ) -> Result<(), CustomRedisError> {
-        let mut conn = self.connection.clone();
+        let mut conn = self.conn();
         match ttl_seconds {
             Some(ttl) => conn.set_ex::<_, _, ()>(k, v, ttl).await?,
             None => conn.set::<_, _, ()>(k, v).await?,
@@ -323,15 +452,25 @@ impl Client for RedisClient {
     ) -> Result<(), CustomRedisError> {
         let final_bytes = self.serialize_and_compress(v, format)?;
 
-        let mut conn = self.connection.clone();
+        let mut conn = self.conn();
         conn.set::<_, _, ()>(k, final_bytes).await?;
         Ok(())
     }
 
     async fn setex(&self, k: String, v: String, seconds: u64) -> Result<(), CustomRedisError> {
-        let final_bytes = self.serialize_and_compress(v, self.format)?;
+        self.setex_with_format(k, v, seconds, self.format).await
+    }
 
-        let mut conn = self.connection.clone();
+    async fn setex_with_format(
+        &self,
+        k: String,
+        v: String,
+        seconds: u64,
+        format: RedisValueFormat,
+    ) -> Result<(), CustomRedisError> {
+        let final_bytes = self.serialize_and_compress(v, format)?;
+
+        let mut conn = self.conn();
         conn.set_ex::<_, _, ()>(k, final_bytes, seconds).await?;
         Ok(())
     }
@@ -354,7 +493,7 @@ impl Client for RedisClient {
     ) -> Result<bool, CustomRedisError> {
         let final_bytes = self.serialize_and_compress(v, format)?;
 
-        let mut conn = self.connection.clone();
+        let mut conn = self.conn();
         let seconds_usize = seconds as usize;
 
         // Use SET with both NX and EX options
@@ -389,7 +528,7 @@ impl Client for RedisClient {
                 .ignore();
         }
 
-        let mut conn = self.connection.clone();
+        let mut conn = self.conn();
         pipe.query_async::<()>(&mut conn).await?;
         Ok(())
     }
@@ -405,19 +544,19 @@ impl Client for RedisClient {
             pipe.cmd("EXPIRE").arg(&k).arg(ttl_seconds).ignore();
         }
 
-        let mut conn = self.connection.clone();
+        let mut conn = self.conn();
         pipe.query_async::<()>(&mut conn).await?;
         Ok(())
     }
 
     async fn del(&self, k: String) -> Result<(), CustomRedisError> {
-        let mut conn = self.connection.clone();
+        let mut conn = self.conn();
         conn.del::<_, ()>(k).await?;
         Ok(())
     }
 
     async fn hget(&self, k: String, field: String) -> Result<String, CustomRedisError> {
-        let mut conn = self.connection.clone();
+        let mut conn = self.conn();
         let result: Option<String> = conn.hget(k, field).await?;
 
         match result {
@@ -427,7 +566,7 @@ impl Client for RedisClient {
     }
 
     async fn scard(&self, k: String) -> Result<u64, CustomRedisError> {
-        let mut conn = self.connection.clone();
+        let mut conn = self.conn();
         let result = conn.scard(k).await?;
         Ok(result)
     }
@@ -436,7 +575,7 @@ impl Client for RedisClient {
         if keys.is_empty() {
             return Ok(vec![]);
         }
-        let mut conn = self.connection.clone();
+        let mut conn = self.conn();
         let results: Vec<Option<Vec<u8>>> = conn.mget(&keys).await?;
         Ok(results)
     }
@@ -449,7 +588,7 @@ impl Client for RedisClient {
         for k in &keys {
             pipe.scard(k);
         }
-        let mut conn = self.connection.clone();
+        let mut conn = self.conn();
         let results: Vec<u64> = pipe.query_async(&mut conn).await?;
         Ok(results)
     }
@@ -471,29 +610,23 @@ impl Client for RedisClient {
                 .arg("NX")
                 .ignore();
         }
-        let mut conn = self.connection.clone();
+        let mut conn = self.conn();
         pipe.query_async::<()>(&mut conn).await?;
         Ok(())
     }
 
     async fn batch_set_nx_ex(
         &self,
-        items: Vec<(String, String)>,
-        ttl_seconds: usize,
+        items: Vec<(String, String, usize)>,
     ) -> Result<Vec<bool>, CustomRedisError> {
         if items.is_empty() {
             return Ok(vec![]);
         }
         let mut pipe = redis::pipe();
-        for (k, v) in &items {
-            pipe.cmd("SET")
-                .arg(k)
-                .arg(v)
-                .arg("NX")
-                .arg("EX")
-                .arg(ttl_seconds);
+        for (k, v, ttl) in &items {
+            pipe.cmd("SET").arg(k).arg(v).arg("NX").arg("EX").arg(ttl);
         }
-        let mut conn = self.connection.clone();
+        let mut conn = self.conn();
         let results: Vec<Option<String>> = pipe.query_async(&mut conn).await?;
         Ok(results.into_iter().map(|r| r.is_some()).collect())
     }
@@ -502,7 +635,7 @@ impl Client for RedisClient {
         if keys.is_empty() {
             return Ok(());
         }
-        let mut conn = self.connection.clone();
+        let mut conn = self.conn();
         redis::cmd("DEL")
             .arg(&keys)
             .query_async::<()>(&mut conn)
@@ -515,6 +648,13 @@ impl Client for RedisClient {
         commands: Vec<PipelineCommand>,
     ) -> Result<Vec<Result<PipelineResult, CustomRedisError>>, CustomRedisError> {
         let mut pipe = redis::pipe();
+        // Wrap the batch in MULTI/EXEC so partial commits are impossible.
+        // Without this, a connection drop after some commands have been
+        // acknowledged returns `Err` here while leaving those commands
+        // committed in Redis — which breaks any caller that retries on `Err`
+        // with non-idempotent commands (e.g. HINCRBY in the billing
+        // aggregator: a retry would double-increment the surviving writes).
+        pipe.atomic();
 
         // Track commands for result processing
         let mut metas: Vec<PipelineCommand> = Vec::with_capacity(commands.len());
@@ -564,6 +704,12 @@ impl Client for RedisClient {
                 PipelineCommand::Scard { key } => {
                     pipe.cmd("SCARD").arg(key);
                 }
+                PipelineCommand::SAdd { key, member } => {
+                    pipe.cmd("SADD").arg(key).arg(member);
+                }
+                PipelineCommand::Expire { key, seconds } => {
+                    pipe.cmd("EXPIRE").arg(key).arg(*seconds);
+                }
                 PipelineCommand::ZRangeByScore { key, min, max } => {
                     pipe.cmd("ZRANGEBYSCORE").arg(key).arg(min).arg(max);
                 }
@@ -572,7 +718,7 @@ impl Client for RedisClient {
         }
 
         // Execute the pipeline
-        let mut conn = self.connection.clone();
+        let mut conn = self.conn();
         let raw_results: Vec<redis::Value> = pipe.query_async(&mut conn).await?;
 
         // Process results
@@ -624,6 +770,14 @@ impl RedisClient {
             | PipelineCommand::SetEx { .. }
             | PipelineCommand::Del { .. }
             | PipelineCommand::HIncrBy { .. } => Ok(PipelineResult::Ok),
+            PipelineCommand::Expire { .. } => {
+                // EXPIRE returns 1 if the timeout was set, 0 if the key does not exist
+                Ok(PipelineResult::Bool(matches!(raw, redis::Value::Int(1))))
+            }
+            PipelineCommand::SAdd { .. } => {
+                let count: u64 = redis::from_redis_value(&raw)?;
+                Ok(PipelineResult::Count(count))
+            }
             PipelineCommand::SetNxEx { .. } => {
                 // SET NX returns OK if set, nil if key existed
                 match raw {
@@ -1058,7 +1212,7 @@ mod integration_tests {
     use crate::{ClientPipelineExt, PipelineResult};
     use testcontainers::core::{IntoContainerPort, WaitFor};
     use testcontainers::runners::AsyncRunner;
-    use testcontainers::GenericImage;
+    use testcontainers::{GenericImage, ImageExt};
 
     async fn create_test_client() -> (RedisClient, testcontainers::ContainerAsync<GenericImage>) {
         let container = GenericImage::new("redis", "7-alpine")
@@ -1083,6 +1237,106 @@ mod integration_tests {
         .unwrap();
 
         (client, container)
+    }
+
+    // Kill the Redis container and bring it back on the same port: a client
+    // stays broken (MultiplexedConnection never reconnects) until heal() swaps
+    // in a rebuilt connection.
+    #[tokio::test]
+    #[ignore] // Requires Docker; run with: cargo test integration_tests -- --ignored
+    async fn test_heal_recovers_connection_after_redis_restart() {
+        // A fixed host port: docker assigns a NEW random host port when a
+        // killed container restarts, which would leave the client dialing a
+        // dead port and turn this test into a false failure.
+        let host_port = 30000 + (std::process::id() % 10000) as u16;
+        let container = GenericImage::new("redis", "7-alpine")
+            .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"))
+            .with_mapped_port(host_port, 6379.tcp())
+            .start()
+            .await
+            .unwrap();
+        let host = container.get_host().await.unwrap();
+        let port = container.get_host_port_ipv4(6379).await.unwrap();
+        let url = format!("redis://{host}:{port}");
+
+        let connect = || async {
+            RedisClient::with_config(
+                url.clone(),
+                CompressionConfig::disabled(),
+                RedisValueFormat::Utf8,
+                Some(Duration::from_millis(1000)),
+                Some(Duration::from_millis(2000)),
+            )
+            .await
+        };
+
+        // The readiness banner can land a hair before the socket accepts, so
+        // probe with a real command until Redis answers.
+        let mut healed_client = None;
+        for _ in 0..20 {
+            if let Ok(c) = connect().await {
+                if c.set("probe".to_string(), "1".to_string()).await.is_ok() {
+                    healed_client = Some(c);
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let healed_client = healed_client.expect("redis container never became ready");
+        let broken_client = connect().await.unwrap();
+        broken_client
+            .set("k".to_string(), "v".to_string())
+            .await
+            .unwrap();
+
+        // Kill/start via the docker CLI: an abrupt kill matches the
+        // node-replacement failure heal() exists for.
+        let docker = |args: Vec<String>| {
+            let status = std::process::Command::new("docker")
+                .args(&args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "docker {args:?} failed");
+        };
+        docker(vec!["kill".to_string(), container.id().to_string()]);
+
+        assert!(healed_client
+            .set("k".to_string(), "v".to_string())
+            .await
+            .is_err());
+        assert!(broken_client
+            .set("k".to_string(), "v".to_string())
+            .await
+            .is_err());
+
+        docker(vec!["start".to_string(), container.id().to_string()]);
+        // Wait until the restarted Redis answers (checked via a fresh client)
+        // so the single heal attempt below cannot race the restart and burn
+        // its cooldown.
+        let mut ready = false;
+        for _ in 0..50 {
+            if let Ok(c) = connect().await {
+                if c.set("probe".to_string(), "1".to_string()).await.is_ok() {
+                    ready = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(ready, "redis container never came back");
+
+        Client::heal(&healed_client).await;
+        assert!(healed_client
+            .set("k".to_string(), "v".to_string())
+            .await
+            .is_ok());
+
+        // Without heal() the connection stays dead - the failure mode heal
+        // exists to fix.
+        assert!(broken_client
+            .set("k".to_string(), "v".to_string())
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -1190,6 +1444,36 @@ mod integration_tests {
         assert!(matches!(results[0], Ok(PipelineResult::Ok)));
         assert!(matches!(results[1], Ok(PipelineResult::Ok)));
         assert!(matches!(results[2], Err(CustomRedisError::NotFound)));
+    }
+
+    #[tokio::test]
+    #[ignore] // Requires Docker; run with: cargo test integration_tests -- --ignored
+    async fn test_pipeline_expire() {
+        let (client, _container) = create_test_client().await;
+
+        // EXPIRE on a key that exists should return true
+        let results = client
+            .pipeline()
+            .set("expirable_key", "value")
+            .expire("expirable_key", 3600)
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(matches!(results[0], Ok(PipelineResult::Ok)));
+        assert!(matches!(results[1], Ok(PipelineResult::Bool(true))));
+
+        // EXPIRE on a key that doesn't exist should return false
+        let results = client
+            .pipeline()
+            .expire("nonexistent_key", 3600)
+            .execute()
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], Ok(PipelineResult::Bool(false))));
     }
 
     #[tokio::test]

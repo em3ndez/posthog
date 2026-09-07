@@ -1,3 +1,4 @@
+import tailwindcss from '@tailwindcss/postcss'
 import autoprefixer from 'autoprefixer'
 import chokidar from 'chokidar'
 import cors from 'cors'
@@ -15,6 +16,14 @@ import postcss from 'postcss'
 import postcssPresetEnv from 'postcss-preset-env'
 import ts from 'typescript'
 
+import { chunkLoaderScript, chunkMapFileContents, chunkMapFileName } from './chunkLoader.mjs'
+
+// Re-exported for one-shot builds outside buildInParallel (e.g. the toolbar loader, which is
+// built after the toolbar app build so it can embed the hashed entry filename). Consumers
+// depend on @posthog/esbuilder, not on esbuild directly, so pnpm's strict node_modules
+// wouldn't let them import 'esbuild' themselves.
+export { build as esbuildBuild } from 'esbuild'
+
 const defaultHost = process.argv.includes('--host') && process.argv.includes('0.0.0.0') ? '0.0.0.0' : 'localhost'
 const defaultPort = 8234
 
@@ -28,21 +37,26 @@ export function copyPublicFolder(srcDir, destDir) {
     })
 }
 
-export function copySnappyWASMFile(absWorkingDir) {
+export function copySnappyWASMFile(absWorkingDir, destDir = path.resolve(absWorkingDir, 'dist')) {
     try {
+        fse.ensureDirSync(destDir)
         fse.copyFileSync(
             path.resolve(absWorkingDir, 'node_modules/snappy-wasm/es/snappy_bg.wasm'),
-            path.resolve(absWorkingDir, 'dist/snappy_bg.wasm')
+            path.resolve(destDir, 'snappy_bg.wasm')
         )
     } catch (error) {
         console.warn('Could not copy snappy wasm file:', error.message)
     }
 }
 
-export function copyRRWebWorkerFiles(absWorkingDir) {
+export function copyRRWebWorkerFiles(absWorkingDir, distSubdir = 'dist') {
+    // Mirror rrweb's image-bitmap worker sourcemap (shipped from posthog-js) into the output
+    // dir so the sourceMappingURL baked into our bundled rrweb resolves under collectstatic.
+    // ManifestStaticFilesStorage resolves the reference relative to the referencing file's
+    // directory, so every outdir that bundles rrweb needs its own copy.
     try {
-        const rrwebSourceDir = path.resolve(absWorkingDir, 'node_modules/@posthog/rrweb/dist')
-        const distDir = path.resolve(absWorkingDir, 'dist')
+        const rrwebSourceDir = path.resolve(absWorkingDir, 'node_modules/posthog-js/dist')
+        const distDir = path.resolve(absWorkingDir, distSubdir)
         const files = fse.readdirSync(rrwebSourceDir)
         const mapFiles = files.filter((f) => f.startsWith('image-bitmap-data-url-worker-') && f.endsWith('.js.map'))
         mapFiles.forEach((file) => {
@@ -51,12 +65,6 @@ export function copyRRWebWorkerFiles(absWorkingDir) {
     } catch (error) {
         console.warn('Could not copy rrweb map files:', error.message)
     }
-}
-
-/** Update the file's modified and accessed times to now. */
-async function touchFile(file) {
-    const now = new Date()
-    await fs.utimes(file, now, now)
 }
 
 export function copyIndexHtml(
@@ -82,6 +90,7 @@ export function copyIndexHtml(
     const cssFile =
         relativeFiles.length > 0 ? relativeFiles.find((e) => e.endsWith('.css')) : `${entry}.css?t=${buildId}`
 
+    const jsFileFallback = `${entry}.js?t=${buildId}`
     const scriptCode = `
         window.ESBUILD_LOAD_SCRIPT = async function (file) {
             try {
@@ -89,6 +98,9 @@ export function copyIndexHtml(
             } catch (error) {
                 console.error('Error loading chunk: "' + file + '"')
                 console.error(error)
+                if (file === ${JSON.stringify(jsFile)} && file !== ${JSON.stringify(jsFileFallback)}) {
+                    await import((window.JS_URL || '') + '/static/' + ${JSON.stringify(jsFileFallback)})
+                }
             }
         }
         window.ESBUILD_LOAD_SCRIPT(${JSON.stringify(jsFile)})
@@ -97,30 +109,50 @@ export function copyIndexHtml(
     // Esbuild "chunks" a scene into possibly hundreds of tiny files. When we load the first few files,
     // they tell us which other files to load. This cascading loading is slow. That's why we cache
     // the list of chunks per scene, and load them all in parallel when a scene is loaded.
+    //
+    // The full map is written to its own content-hashed file in dist and fetched by the inline
+    // loader, instead of being inlined into the HTML: the map is hundreds of KB that changed on
+    // every deploy and had to be downloaded and parsed before the app could boot, on every page.
 
     // Don't use chunks in dev mode.
     // Django caches the generated index.html, and we'll end up loading the wrong chunks after one change.
     const chunksToServe = isDev ? {} : chunks
-    const chunkCode = `
-        window.ESBUILD_LOADED_CHUNKS = new Set();
-        window.ESBUILD_LOAD_CHUNKS = function(name) {
-            const chunks = ${JSON.stringify(chunksToServe)}[name] || [];
-            for (const chunk of chunks) {
-                if (!window.ESBUILD_LOADED_CHUNKS.has(chunk)) {
-                    window.ESBUILD_LOAD_SCRIPT('chunk-'+chunk+'.js');
-                    window.ESBUILD_LOADED_CHUNKS.add(chunk);
-                }
-            }
-        }
-        window.ESBUILD_LOAD_CHUNKS('index');
-    `
+    const chunkMapFile = Object.keys(chunksToServe).length > 0 ? chunkMapFileName(entry, chunksToServe) : null
+    if (chunkMapFile) {
+        fse.writeFileSync(path.resolve(absWorkingDir, 'dist', chunkMapFile), chunkMapFileContents(chunksToServe))
+    }
+    const chunkCode = Object.keys(chunks).length > 0 ? chunkLoaderScript(chunksToServe, chunkMapFile) : ''
 
-    // Modified CSS loader to handle both files
+    // Fallback to non-hashed CSS (with cache-busting build ID) when the hashed
+    // version fails to load (e.g. CDN returns 403). Mirrors the JS fallback above.
+    const cssFileFallback = `${entry}.css?t=${buildId}`
+    const needsCssFallback = cssFile !== cssFileFallback
     const cssLoader = `
         const link = document.createElement("link");
         link.rel = "stylesheet";
         link.crossOrigin = "anonymous";
         link.href = (window.JS_URL || '') + "/static/" + ${JSON.stringify(cssFile)};
+        ${
+            needsCssFallback
+                ? `link.onerror = function() {
+            link.onerror = null;
+            console.warn('Failed to load stylesheet "' + ${JSON.stringify(cssFile)} + '", trying fallback');
+            var fallbackLink = document.createElement("link");
+            fallbackLink.rel = "stylesheet";
+            fallbackLink.crossOrigin = "anonymous";
+            fallbackLink.href = (window.JS_URL || '') + "/static/" + ${JSON.stringify(cssFileFallback)};
+            document.head.appendChild(fallbackLink);
+        };`
+                : ''
+        }
+        // Resolves once the boot stylesheet is applied (or failed), so the entry script can hold
+        // React's first render until then. The entry JS is small enough to win the race against
+        // the stylesheet on slow networks; rendering before the sheet arrives paints the app
+        // unstyled for a frame or two.
+        window.ESBUILD_CSS_READY = new Promise(function (resolve) {
+            link.addEventListener("load", function () { resolve(true) }, { once: true });
+            link.addEventListener("error", function () { resolve(false) }, { once: true });
+        });
         document.head.appendChild(link)
     `
 
@@ -139,7 +171,7 @@ export function copyIndexHtml(
                     // adding elements to the DOM
                     ${cssFile ? cssLoader : ''}
                     ${scriptCode}
-                    ${Object.keys(chunks).length > 0 ? chunkCode : ''}
+                    ${chunkCode}
                 </script>
             </head>`
         )
@@ -176,6 +208,35 @@ export const commonConfig = {
     // no hashes in dev mode for faster reloads --> we save the old hash in index.html otherwise
     entryNames: isDev ? '[dir]/[name]' : '[dir]/[name]-[hash]',
     plugins: [
+        // @posthog/brand's PNG stubs locate their image via `new URL("./x.png", import.meta.url)`,
+        // which esbuild leaves verbatim in the output: the URL then resolves relative to the
+        // built chunk's URL, where the PNG doesn't exist (404), and IIFE builds like the toolbar
+        // have no import.meta at all. Rewrite the stub to a static import so the `.png` file
+        // loader emits the image with a hashed name and a correct publicPath URL.
+        {
+            name: 'brand-png-asset-urls',
+            setup(build) {
+                build.onLoad(
+                    { filter: /@posthog[\\/]brand[\\/]dist[\\/].*[\\/]png[\\/][^\\/]+\.mjs$/ },
+                    async (args) => {
+                        const source = await fs.readFile(args.path, 'utf8')
+                        if (!source.includes('.png')) {
+                            // png/index.mjs barrels only re-export the leaf stubs - nothing to rewrite.
+                            return undefined
+                        }
+                        const contents = source.replace(
+                            /const src = new URL\((".*?\.png"), import\.meta\.url\)\.href;?/,
+                            'import src from $1;'
+                        )
+                        if (contents === source) {
+                            // Stub shape changed upstream - fail loudly rather than shipping 404ing URLs.
+                            throw new Error(`brand-png-asset-urls: no rewritable URL stub found in ${args.path}`)
+                        }
+                        return { contents, loader: 'js' }
+                    }
+                )
+            },
+        },
         // monaco-vim imports monaco-editor internals without .js extensions (e.g. monaco-editor/esm/vs/editor/editor.api)
         // which esbuild can't resolve through monaco-editor's package.json exports map
         {
@@ -194,21 +255,39 @@ export const commonConfig = {
         },
         sassPlugin({
             async transform(source, resolveDir, filePath) {
-                const plugins = [autoprefixer, postcssPresetEnv({ stage: 0 })]
+                const plugins = [tailwindcss, autoprefixer, postcssPresetEnv({ stage: 0 })]
                 if (!isDev) {
                     plugins.push(cssnano({ preset: 'default' }))
                 }
-                const { css } = await postcss(plugins).process(source, { from: filePath })
-                return css
+                const result = await postcss(plugins).process(source, { from: filePath })
+                // Tailwind reports each scanned source file as a PostCSS `dependency` message.
+                // Surface them as esbuild watchFiles so editing a TSX file re-runs this
+                // transform on tailwind.css in watch mode.
+                const watchFiles = result.messages
+                    .filter((message) => message.type === 'dependency' && message.file)
+                    .map((message) => message.file)
+                return { contents: result.css, loader: 'css', watchFiles }
             },
         }),
         lessLoader({ javascriptEnabled: true }),
         polyfillNode({
+            globals: {
+                buffer: false,
+                process: true,
+            },
             polyfills: {
-                crypto: true,
+                buffer: false,
+                crypto: false,
+                process: true,
+                stream: false,
             },
         }),
     ],
+    alias: {
+        buffer: 'buffer',
+        crypto: 'crypto-browserify',
+        stream: 'stream-browserify',
+    },
     tsconfig: tsconfigPath,
     define: {
         global: 'globalThis',
@@ -222,8 +301,9 @@ export const commonConfig = {
         '.woff': 'file',
         '.woff2': 'file',
         '.mp3': 'file',
-        '.lottie': 'file',
         '.sql': 'text',
+        '.yaml': 'text',
+        '.md': 'text',
     },
     metafile: true,
 }
@@ -248,13 +328,58 @@ function getChunks(result) {
             (i) => i.kind === 'import-statement' && i.path.startsWith('dist/chunk-')
         )
         const exports = output.exports.filter((e) => e !== 'default' && e !== 'scene')
-        if (importStatements.length > 0 && (exports.length > 0 || output.entryPoint === 'src/index.tsx')) {
+        const isRootEntry = output.entryPoint === 'src/index.tsx' || output.entryPoint === 'src/exporter/index.tsx'
+        if (importStatements.length > 0 && (exports.length > 0 || isRootEntry)) {
             chunks[exports[0] || 'index'] = importStatements.map((i) =>
                 i.path.replace('dist/chunk-', '').replace('.js', '')
             )
         }
     }
     return chunks
+}
+
+function formatBytes(bytes) {
+    if (bytes >= 1_000_000) {
+        return `${(bytes / 1_000_000).toFixed(2)} MB`
+    }
+    if (bytes >= 1_000) {
+        return `${(bytes / 1_000).toFixed(1)} KB`
+    }
+    return `${bytes} B`
+}
+
+function shortenInputPath(inputPath) {
+    const pnpmMatch = inputPath.match(/node_modules\/\.pnpm\/([^/]+)\/node_modules\/(.+)$/)
+    if (pnpmMatch) {
+        const pkg = pnpmMatch[1].replace(/_.*$/, '')
+        return `${pkg} (${pnpmMatch[2]})`
+    }
+    return inputPath
+}
+
+export function reportTopChunks(outputs, { topChunks = 10, topContributors = 5, label = 'chunks' } = {}) {
+    if (!outputs) {
+        return
+    }
+    const chunkEntries = Object.entries(outputs)
+        .filter(([outputPath]) => /\/chunk-[A-Za-z0-9]+\.js$/.test(outputPath))
+        .sort((a, b) => b[1].bytes - a[1].bytes)
+        .slice(0, topChunks)
+    if (chunkEntries.length === 0) {
+        return
+    }
+    const lines = [`Top ${chunkEntries.length} ${label} by uncompressed size:`]
+    for (const [outputPath, output] of chunkEntries) {
+        const inputCount = Object.keys(output.inputs || {}).length
+        lines.push(`  ${formatBytes(output.bytes).padStart(9)}  ${path.basename(outputPath)}  (${inputCount} inputs)`)
+        const contributors = Object.entries(output.inputs || {})
+            .sort((a, b) => b[1].bytesInOutput - a[1].bytesInOutput)
+            .slice(0, topContributors)
+        for (const [inputPath, info] of contributors) {
+            lines.push(`               ${formatBytes(info.bytesInOutput).padStart(9)}  ${shortenInputPath(inputPath)}`)
+        }
+    }
+    console.info(lines.join('\n'))
 }
 
 export async function buildInParallel(configs, { onBuildStart, onBuildComplete } = {}) {
@@ -268,7 +393,10 @@ export async function buildInParallel(configs, { onBuildStart, onBuildComplete }
                 })
             )
         )
-    } catch {
+    } catch (error) {
+        // esbuild already prints its own compile errors, but onBuildStart/onBuildComplete
+        // failures (e.g. finalizeToolbarBuild) would otherwise die silently here.
+        console.error(error)
         if (!isDev) {
             process.exit(1)
         }
@@ -281,10 +409,52 @@ export async function buildInParallel(configs, { onBuildStart, onBuildComplete }
 
 /** Get the main ".js" and ".css" files for a build */
 function getBuiltEntryPoints(config, result) {
+    // Normalise entryPoints: support both array form and object form { name: path }
+    const entryValues = Array.isArray(config.entryPoints) ? config.entryPoints : Object.values(config.entryPoints || {})
+
+    // Primary: scan the metafile directly — works regardless of entryNames overrides.
+    // CSS outputs never have entryPoint set, so we find JS entries first, then locate
+    // each companion CSS by matching the same base name (hashes differ between JS and CSS).
+    const jsFiles = []
+    for (const [outputPath, output] of Object.entries(result.metafile?.outputs || {})) {
+        if (output.entryPoint && entryValues.includes(output.entryPoint) && outputPath.endsWith('.js')) {
+            jsFiles.push(path.resolve(process.cwd(), outputPath))
+        }
+    }
+    if (jsFiles.length > 0) {
+        const allFiles = [...jsFiles]
+        const allOutputPaths = Object.keys(result.metafile?.outputs || {})
+        // Pair each entry JS with its companion CSS by stripping the optional
+        // "-<hash>" suffix. The hash matcher excludes `-` so that a sibling
+        // entry sharing a prefix can't have its CSS stolen — e.g. an `exporter`
+        // entry must not match `dist/exporter-extra-HASH.css` (the `-extra-HASH`
+        // segment contains a `-`, which fails the single-segment match).
+        // esbuild's default hash is base32 (uppercase + digits, no hyphens) so
+        // the constraint is compatible with default builds and allows mixed-
+        // case alphabets too.
+        const hashSuffixPattern = /(-[^./-]+)?\.js$/
+        for (const jsFile of jsFiles) {
+            const baseName = jsFile.replace(hashSuffixPattern, '')
+            const escapedBase = baseName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+            const expectedCss = new RegExp(`^${escapedBase}(-[^./-]+)?\\.css$`)
+            for (const outputPath of allOutputPaths) {
+                if (!outputPath.endsWith('.css')) {
+                    continue
+                }
+                const absoluteCss = path.resolve(process.cwd(), outputPath)
+                if (expectedCss.test(absoluteCss)) {
+                    allFiles.push(absoluteCss)
+                }
+            }
+        }
+        return allFiles
+    }
+
+    // Fallback: path-based convention for configs where metafile scan yields nothing
     let outfiles = []
     if (config.outdir) {
         // convert "src/index.tsx" --> /a/posthog/frontend/dist/index.js
-        outfiles = config.entryPoints.map((file) =>
+        outfiles = entryValues.map((file) =>
             path
                 .resolve(config.absWorkingDir, file)
                 .replace('/src/', '/dist/')
@@ -294,30 +464,44 @@ function getBuiltEntryPoints(config, result) {
         outfiles = [path.resolve(config.absWorkingDir, config.outfile)]
     }
 
-    const builtFiles = []
+    const fallbackFiles = []
     for (const outfile of outfiles) {
-        // convert "/a/something.tsx" --> "/a/something-"
         const fileNoExt = outfile.replace(/\.[^/]+$/, '')
-        // find if we built a .js or .css file that matches
-        for (const file of Object.keys(result.metafile.outputs)) {
+        for (const file of Object.keys(result.metafile?.outputs || {})) {
             const absoluteFile = path.resolve(process.cwd(), file)
             if (
                 (absoluteFile.startsWith(`${fileNoExt}-`) && (file.endsWith('.js') || file.endsWith('.css'))) ||
                 absoluteFile === `${fileNoExt}.js` ||
                 absoluteFile === `${fileNoExt}.css`
             ) {
-                builtFiles.push(absoluteFile)
+                fallbackFiles.push(absoluteFile)
             }
         }
     }
-
-    return builtFiles
+    return fallbackFiles
 }
 
 let buildsInProgress = 0
 
+// Serialize the heavy full-app bundles (PostHog App, Exporter). All esbuild contexts in a
+// process multiplex over one Go service, so concurrent heavy rebuilds keep both build graphs
+// resident at once — the summed peak is what OOM-kills the Docker builder. Each heavy build
+// disposes its context before releasing the lock (see runBuild), so the next heavy build reuses
+// the freed memory instead of stacking on top of it. Dev is unaffected: it keeps contexts alive
+// for incremental watch rebuilds and isn't memory-constrained.
+let heavyBuildChain = Promise.resolve()
+function runExclusiveHeavy(fn) {
+    const result = heavyBuildChain.then(fn)
+    heavyBuildChain = result.then(
+        () => {},
+        () => {}
+    )
+    return result
+}
+
 export async function buildOrWatch(config) {
-    const { absWorkingDir, name, onBuildStart, onBuildComplete, writeMetaFile, extraPlugins, ..._config } = config
+    const { absWorkingDir, name, heavy, onBuildStart, onBuildComplete, writeMetaFile, extraPlugins, ..._config } =
+        config
 
     let buildPromise = null
     let buildAgain = false
@@ -389,12 +573,26 @@ export async function buildOrWatch(config) {
         buildCount++
         const time = new Date()
         log({ name })
+
+        // In production each build runs once then the process exits, so free the build graph
+        // as soon as it's done instead of letting all contexts pile up until process.exit.
+        // Dev keeps the context for incremental rebuilds. For heavy builds this dispose happens
+        // inside the serialization lock, so the next heavy build starts with this one freed.
+        async function rebuildAndRelease() {
+            const result = await esbuildContext.rebuild()
+            if (!isDev) {
+                await esbuildContext.dispose()
+                esbuildContext = null
+            }
+            return result
+        }
+
         try {
-            const buildResult = await esbuildContext.rebuild()
+            const buildResult = heavy && !isDev ? await runExclusiveHeavy(rebuildAndRelease) : await rebuildAndRelease()
 
             if (writeMetaFile) {
                 await fs.writeFile(
-                    `${config.name.toLowerCase().replace(' ', '-')}-esbuild-meta.json`,
+                    `${config.name.toLowerCase().replace(/ /g, '-')}-esbuild-meta.json`,
                     JSON.stringify(buildResult.metafile)
                 )
             }
@@ -426,8 +624,9 @@ export async function buildOrWatch(config) {
                     path.resolve(absWorkingDir, '../products/*/frontend/**/*'),
                 ],
                 {
-                    ignored: /.*(Type|\.test\.stories)\.[tj]sx?$/,
+                    ignored: [/.*(Type|\.test\.stories)\.[tj]sx?$/, /(^|[/\\])node_modules([/\\]|$)/],
                     ignoreInitial: true,
+                    followSymlinks: false,
                 }
             )
             .on('all', async (event, filePath) => {
@@ -441,11 +640,6 @@ export async function buildOrWatch(config) {
                 }
 
                 if (inputFiles.has(filePath)) {
-                    if (filePath.match(/\.tsx?$/)) {
-                        // For changed TS/TSX files, we need to initiate a Tailwind JIT rescan
-                        // in case any new utility classes are used. `touch`ing `base.scss` (or the file that imports tailwind.css) achieves this.
-                        await touchFile(path.resolve(absWorkingDir, '../common/tailwind/tailwind.css'))
-                    }
                     void debouncedBuild()
                 }
             })

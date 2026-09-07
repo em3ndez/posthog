@@ -13,32 +13,84 @@ from posthog.test.base import (
 from unittest import mock
 from unittest.mock import patch
 
+from django.conf import settings
+
+from parameterized import parameterized
 from rest_framework import status
 
 from posthog.schema import (
     CachedEventsQueryResponse,
     CachedHogQLQueryResponse,
-    CachedRetentionQueryResponse,
     EventPropertyFilter,
     EventsQuery,
+    HogLanguage,
+    HogQLAutocomplete,
     HogQLPropertyFilter,
     HogQLQuery,
-    MeanRetentionCalculation,
     PersonPropertyFilter,
     PropertyOperator,
-    RetentionQuery,
 )
 
 from posthog.hogql.constants import LimitContext
 
-from posthog.api.services.query import process_query_dict
-from posthog.models.insight_variable import InsightVariable
-from posthog.models.property_definition import PropertyDefinition, PropertyType
+from posthog.api.query import (
+    CONCURRENCY_LIMIT_USER_MESSAGE,
+    MANAGED_WAREHOUSE_QUERY_UNAVAILABLE_CODE,
+    MANAGED_WAREHOUSE_QUERY_UNAVAILABLE_MESSAGE,
+)
+from posthog.api.services.query import process_query_dict, process_query_model
+from posthog.clickhouse.client import sync_execute
+from posthog.clickhouse.client.limit import ConcurrencyLimitExceeded
+from posthog.clickhouse.query_tagging import Product, QueryTags
+from posthog.event_usage import EventSource
+from posthog.exceptions import ClickHouseQueryTimeOut
+from posthog.llm.completions import OpenAICompletion
 from posthog.models.utils import UUIDT
+
+from products.event_definitions.backend.models.property_definition import PropertyDefinition, PropertyType
+from products.managed_warehouse.backend.facade.query_labels import MANAGED_WAREHOUSE_QUERY_STATUS_LABEL_PREFIX
+from products.product_analytics.backend.facade.models import InsightVariable
+from products.warehouse_sources.backend.facade.models import MANAGED_WAREHOUSE_SOURCE_PREFIX, ExternalDataSource
+from products.warehouse_sources.backend.facade.types import ExternalDataSourceType
 
 
 class TestQuery(ClickhouseTestMixin, APIBaseTest):
     ENDPOINT = "query"
+
+    def test_concurrency_limit_returns_friendly_message_without_internal_key(self):
+        # A concurrency block must surface as a 429 with a user-facing message — not str(exc),
+        # which embeds the limiter's internal Redis key + task id and used to leak into the UI.
+        raw = "Exceeded maximum concurrency limit: 30 for key: app:query:per-org:abc and task: def"
+        with patch("posthog.api.query.process_query_model", side_effect=ConcurrencyLimitExceeded(raw)):
+            response = self.client.post(
+                f"/api/environments/{self.team.id}/query/",
+                {"query": HogQLQuery(query="select 1").model_dump()},
+            )
+        self.assertEqual(response.status_code, status.HTTP_429_TOO_MANY_REQUESTS)
+        detail = response.json()["detail"]
+        self.assertEqual(detail, CONCURRENCY_LIMIT_USER_MESSAGE)
+        self.assertNotIn("app:query:per-org", detail)
+
+    @parameterized.expand(
+        [
+            ("served_from_cache", True, False),
+            ("fresh_failure", False, True),
+        ]
+    )
+    def test_served_from_query_failure_cache_is_not_recaptured(self, _name, served_from_cache, expect_capture):
+        error = ClickHouseQueryTimeOut("failed the same way 3 times in a row")
+        if served_from_cache:
+            error.served_from_query_failure_cache = True  # type: ignore[attr-defined]
+        with (
+            patch("posthog.api.query.process_query_model", side_effect=error),
+            patch("posthog.api.query.capture_exception") as mock_capture,
+        ):
+            response = self.client.post(
+                f"/api/environments/{self.team.id}/query/",
+                {"query": HogQLQuery(query="select 1").model_dump()},
+            )
+        self.assertEqual(response.status_code, ClickHouseQueryTimeOut.status_code)
+        self.assertEqual(mock_capture.called, expect_capture)
 
     @snapshot_clickhouse_queries
     def test_select_hogql_expressions(self):
@@ -145,6 +197,21 @@ class TestQuery(ClickhouseTestMixin, APIBaseTest):
                     "results": [[2, "sign out"], [1, "sign up"]],
                 },
             )
+
+    @patch("posthog.api.services.query.get_query_runner_or_none")
+    def test_hogql_autocomplete_bypasses_query_runner(self, mock_get_query_runner_or_none):
+        query = HogQLAutocomplete(
+            kind="HogQLAutocomplete",
+            query="select event from events",
+            language=HogLanguage.HOG_QL,
+            startPosition=6,
+            endPosition=6,
+        )
+
+        result = process_query_model(self.team, query, user=self.user)
+
+        self.assertIn("suggestions", result.model_dump())  # type: ignore
+        mock_get_query_runner_or_none.assert_not_called()
 
     @also_test_with_materialized_columns(["key"])
     @snapshot_clickhouse_queries
@@ -361,8 +428,31 @@ class TestQuery(ClickhouseTestMixin, APIBaseTest):
                 response["detail"],
             )
 
+    def test_hogql_error_is_enriched_with_metadata(self):
+        query = {"kind": "HogQLQuery", "query": "SELECT user_id FROM events LIMIT 1"}
+
+        response_post = self.client.post(f"/api/environments/{self.team.id}/query/", {"query": query})
+        self.assertEqual(response_post.status_code, status.HTTP_400_BAD_REQUEST)
+
+        response = response_post.json()
+        self.assertEqual(response["type"], "validation_error")
+
+        self.assertIn("Tables referenced: events", response["detail"])
+
+        self.assertIn("extra", response)
+        self.assertIn("hogql_metadata", response["extra"])
+        metadata = response["extra"]["hogql_metadata"]
+        self.assertFalse(metadata["isValid"])
+        self.assertEqual(metadata["table_names"], ["events"])
+        self.assertTrue(len(metadata["errors"]) > 0)
+        first_error = metadata["errors"][0]
+        self.assertIn("user_id", first_error["message"])
+        self.assertIsNotNone(first_error.get("start"))
+        self.assertIsNotNone(first_error.get("end"))
+        self.assertIn("Did you mean", first_error["message"])
+
     @patch(
-        "posthog.clickhouse.client.execute._annotate_tagged_query", return_value=("SELECT 1&&&", {})
+        "posthog.clickhouse.client.execute._annotate_tagged_query", return_value=("SELECT 1&&&", QueryTags())
     )  # Erroneously constructed SQL
     def test_unsafe_clickhouse_error_is_swallowed(self, sqlparse_format_mock):
         query = {"kind": "EventsQuery", "select": ["timestamp"]}
@@ -457,7 +547,10 @@ class TestQuery(ClickhouseTestMixin, APIBaseTest):
         flush_persons_and_events()
 
         with freeze_time("2020-01-10 12:14:00"):
-            query = EventsQuery(select=["event", "person", "person -- P"])
+            query = EventsQuery(
+                select=["event", "person", "person -- P"],
+                orderBy=["timestamp DESC"] if settings.CLICKHOUSE_HOGQL_USE_NEW_EVENTS_SCHEMA else None,
+            )
             response = self.client.post(f"/api/environments/{self.team.id}/query/", {"query": query.dict()}).json()
             self.assertEqual(len(response["results"]), 4)
             self.assertEqual(response["results"][0][1], {"distinct_id": "4"})
@@ -590,6 +683,21 @@ class TestQuery(ClickhouseTestMixin, APIBaseTest):
         response = self.client.post(f"/api/environments/{self.team.id}/query/", {"query": query})
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
+    @patch("posthog.hogql_queries.query_runner.QueryRunner.run", side_effect=RuntimeError("source query failed"))
+    def test_data_visualization_source_error_is_not_chained_to_wrapper_runner_lookup(self, _mock_run):
+        query = {
+            "kind": "DataVisualizationNode",
+            "source": {
+                "kind": "HogQLQuery",
+                "query": "SELECT 1",
+            },
+        }
+
+        with self.assertRaises(RuntimeError) as raised:
+            process_query_dict(team=self.team, query_json=query)
+
+        self.assertIsNone(raised.exception.__context__)
+
     def test_query_not_supported(self):
         query = {
             "kind": "SavedInsightNode",
@@ -662,6 +770,9 @@ class TestQuery(ClickhouseTestMixin, APIBaseTest):
         )
         mock_process_query_model.assert_called_once()
         self.assertEqual(mock_process_query_model.call_args[1]["limit_context"], LimitContext.POSTHOG_AI)
+        # The posthog_ai limit context also retags the analytics source, so Max's insight tiles
+        # (browser session requests that would otherwise read as "web") are attributed to posthog_ai.
+        self.assertEqual(mock_process_query_model.call_args[1]["analytics_props"]["source"], EventSource.POSTHOG_AI)
 
     @patch("posthog.api.query.process_query_model")
     def test_query_limit_context_default(self, mock_process_query_model):
@@ -889,6 +1000,7 @@ class TestQuery(ClickhouseTestMixin, APIBaseTest):
                         "end_time": None,
                         "error": False,
                         "error_message": None,
+                        "error_code": None,
                         "expiration_time": mock.ANY,
                         "id": mock.ANY,
                         "query_async": True,
@@ -1053,41 +1165,6 @@ class TestQuery(ClickhouseTestMixin, APIBaseTest):
         response = CachedHogQLQueryResponse.model_validate(api_response)
         assert response.results[0][0] == variable_override_value
 
-    @patch("posthog.api.query.process_query_model")
-    def test_upgrades_query(self, mock_process_query):
-        mock_process_query.return_value = CachedRetentionQueryResponse(
-            cache_key="cache_123",
-            is_cached=False,
-            last_refresh="2023-10-16T12:00:00Z",
-            next_allowed_client_refresh="2023-10-16T14:00:00Z",
-            results=[],
-            timezone="UTC",
-        )
-
-        self.client.post(
-            f"/api/environments/{self.team.id}/query/",
-            {
-                "query": {
-                    "kind": "RetentionQuery",
-                    "retentionFilter": {
-                        "period": "Day",
-                        "totalIntervals": 8,
-                        "targetEntity": {"id": "$pageview", "name": "$pageview", "type": "events"},
-                        "returningEntity": {"id": "$pageview", "name": "$pageview", "type": "events"},
-                        "retentionType": "retention_first_time",
-                        "showMean": True,
-                    },
-                },
-                "client_query_id": "5d92fb51-5088-45e8-91b2-843aef3d69bd",
-            },
-        ).json()
-
-        mock_process_query.assert_called_once()
-        updated_query = mock_process_query.call_args.args[1]
-        assert isinstance(updated_query, RetentionQuery)
-        assert updated_query.version == 2
-        assert updated_query.retentionFilter.meanRetentionCalculation == MeanRetentionCalculation.SIMPLE
-
 
 class TestQueryRetrieve(APIBaseTest):
     def setUp(self):
@@ -1146,6 +1223,63 @@ class TestQueryRetrieve(APIBaseTest):
         self.assertEqual(response.status_code, 202)
         self.assertFalse(response.json()["query_status"]["complete"])
 
+    @parameterized.expand(
+        [
+            ("ready", True, 200),
+            ("revoked", False, 404),
+        ]
+    )
+    def test_managed_warehouse_query_status_checks_reader_readiness_without_feature_flag_lookup(
+        self, _name: str, reader_configured: bool, expected_status: int
+    ) -> None:
+        source = ExternalDataSource.objects.create(
+            source_id="managed-source",
+            connection_id="managed-connection",
+            destination_id="managed-destination",
+            team=self.team,
+            status=ExternalDataSource.Status.COMPLETED,
+            source_type=ExternalDataSourceType.POSTGRES,
+            prefix=MANAGED_WAREHOUSE_SOURCE_PREFIX,
+            access_method=ExternalDataSource.AccessMethod.DIRECT,
+            direct_query_enabled=True,
+            connection_metadata={
+                "engine": "duckdb",
+                "system_managed": True,
+                "credential_kind": "project_reader",
+                "reader_configured": reader_configured,
+            },
+            job_inputs={
+                "host": "managed.example.com",
+                "port": 5432,
+                "database": "ducklake",
+                "user": f"posthog_team_{self.team.id}",
+                "password": "reader-password",
+            },
+        )
+        self.redis_client_mock.get.return_value = json.dumps(
+            {
+                "id": self.valid_query_id,
+                "team_id": self.team_id,
+                "complete": True,
+                "labels": [f"{MANAGED_WAREHOUSE_QUERY_STATUS_LABEL_PREFIX}{source.id}"],
+                "results": ["result1"],
+            }
+        ).encode()
+
+        with patch(
+            "posthog.permissions.posthog_feature_flag_enabled",
+            side_effect=AssertionError("query-status authorization must not evaluate a product feature flag"),
+        ) as feature_flag_lookup:
+            response = self.client.get(f"/api/environments/{self.team.id}/query/{self.valid_query_id}/")
+
+        self.assertEqual(response.status_code, expected_status)
+        feature_flag_lookup.assert_not_called()
+        if not reader_configured:
+            self.assertEqual(response.json()["detail"], MANAGED_WAREHOUSE_QUERY_UNAVAILABLE_MESSAGE)
+            self.assertEqual(response.json()["code"], MANAGED_WAREHOUSE_QUERY_UNAVAILABLE_CODE)
+            self.assertNotIn(self.valid_query_id, response.json()["detail"])
+            self.assertNotIn(str(self.team_id), response.json()["detail"])
+
     def test_failed_query_with_internal_error(self):
         self.redis_client_mock.get.return_value = json.dumps(
             {
@@ -1187,7 +1321,10 @@ class TestQueryRetrieve(APIBaseTest):
 
 
 class TestQueryDraftSql(APIBaseTest):
-    @patch("posthog.hogql.ai.hit_openai", return_value=("SELECT 1", 21, 37))
+    @patch(
+        "posthog.hogql.ai.hit_openai",
+        return_value=OpenAICompletion(content="SELECT 1", prompt_tokens=21, completion_tokens=37),
+    )
     def test_draft_sql(self, hit_openai_mock):
         response = self.client.get(
             f"/api/environments/{self.team.id}/query/draft_sql/", {"prompt": "I need the number 1"}
@@ -1197,20 +1334,202 @@ class TestQueryDraftSql(APIBaseTest):
         hit_openai_mock.assert_called_once()
 
 
-class TestQueryUpgrade(APIBaseTest):
-    def test_upgrades_valid_query(self):
-        query = {"kind": "RetentionQuery", "retentionFilter": {"period": "Day", "totalIntervals": 7, "showMean": True}}
+class TestQueryLLMFormatting(ClickhouseTestMixin, APIBaseTest):
+    ENDPOINT = "query"
 
-        response = self.client.post(f"/api/environments/{self.team.id}/query/upgrade/", {"query": query})
+    @patch("posthog.api.query.process_query_model")
+    def test_hogql_query_includes_formatted_results(self, mock_process_query_model):
+        mock_process_query_model.return_value = {
+            "results": [["sign up", 10], ["sign out", 5]],
+            "columns": ["event", "count"],
+            "is_cached": False,
+        }
+
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/query/",
+            {"query": {"kind": "HogQLQuery", "query": "select event, count() from events group by event"}},
+            HTTP_X_POSTHOG_CLIENT="mcp",
+        )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            response.json(),
+        data = response.json()
+        self.assertIn("formatted_results", data)
+        self.assertIn("sign up", data["formatted_results"])
+        self.assertIn("10", data["formatted_results"])
+
+    @patch("posthog.api.query.process_query_model")
+    def test_no_formatted_results_without_header(self, mock_process_query_model):
+        mock_process_query_model.return_value = {
+            "results": [["sign up", 10]],
+            "columns": ["event", "count"],
+            "is_cached": False,
+        }
+
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/query/",
+            {"query": {"kind": "HogQLQuery", "query": "select event, count() from events group by event"}},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("results", data)
+        self.assertNotIn("formatted_results", data)
+
+    @patch("posthog.api.query.process_query_model")
+    def test_unsupported_query_type_omits_formatted_results(self, mock_process_query_model):
+        mock_process_query_model.return_value = {
+            "results": [{"event": "test"}],
+            "columns": ["event"],
+            "is_cached": False,
+        }
+
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/query/",
+            {"query": {"kind": "EventsQuery", "select": ["event"]}},
+            HTTP_X_POSTHOG_CLIENT="mcp",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("results", data)
+        self.assertNotIn("formatted_results", data)
+
+    @patch("posthog.api.query.settings")
+    @patch("posthog.api.query.process_query_model")
+    def test_ee_unavailable_omits_formatted_results(self, mock_process_query_model, mock_settings):
+        mock_settings.EE_AVAILABLE = False
+        for attr in ("TEST", "API_QUERIES_PER_TEAM", "API_QUERIES_ENABLED", "API_QUERIES_LEGACY_TEAM_LIST"):
+            setattr(mock_settings, attr, getattr(__import__("posthog").settings, attr))
+
+        mock_process_query_model.return_value = {
+            "results": [["sign up", 10]],
+            "columns": ["event", "count"],
+            "is_cached": False,
+        }
+
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/query/",
+            {"query": {"kind": "HogQLQuery", "query": "select event, count() from events group by event"}},
+            HTTP_X_POSTHOG_CLIENT="mcp",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        data = response.json()
+        self.assertIn("results", data)
+        self.assertNotIn("formatted_results", data)
+
+    @parameterized.expand(
+        [
+            # An MCP caller passing a full timestamp means an exact boundary, so the range is marked
+            # explicit and keeps the time of day instead of snapping to end of day.
+            ("mcp_explicit_midnight", True, "2026-07-09T00:00:00Z", True),
+            ("mcp_explicit_time_of_day", True, "2026-07-09T14:30:00Z", True),
+            # A bare calendar day carries no time of day, so it keeps the default end-of-day rounding
+            # and the last day stays in range.
+            ("mcp_bare_date", True, "2026-07-09", False),
+            # The web UI serialises fixed calendar ranges as naive timestamps and relies on that same
+            # rounding, so a non-MCP request must never have its boundary marked explicit.
+            ("non_mcp_explicit_timestamp", False, "2026-07-09T00:00:00Z", False),
+        ]
+    )
+    @patch("posthog.api.query.process_query_model")
+    def test_explicit_date_boundary_marking(
+        self, _name, is_mcp_client, date_to, expected_explicit, mock_process_query_model
+    ):
+        mock_process_query_model.return_value = {"results": [], "is_cached": False}
+
+        url = f"/api/environments/{self.team.id}/query/"
+        # `_mark_explicit_date_boundaries` reads `dateRange` off any query, so the kind is incidental.
+        # It only has to be one core owns, or this test drags a product's runners back into core's inputs.
+        payload = {
+            "query": {
+                "kind": "TracesQuery",
+                "dateRange": {"date_from": "2026-07-02T00:00:00Z", "date_to": date_to},
+            }
+        }
+        if is_mcp_client:
+            self.client.post(url, payload, HTTP_X_POSTHOG_CLIENT="mcp")
+        else:
+            self.client.post(url, payload)
+
+        executed_query = mock_process_query_model.call_args.args[1]
+        self.assertEqual(bool(executed_query.dateRange.explicitDate), expected_explicit)
+
+
+class TestMcpProductTaggingEndToEnd(ClickhouseTestMixin, APIBaseTest):
+    """End-to-end tests that an MCP request to the /query endpoint ends up tagged as
+    product=mcp in `system.query_log` — *unless* a more specific product was set somewhere
+    along the way, in which case MCP must not override it."""
+
+    ENDPOINT = "query"
+
+    def _get_log_comment_for_team(self) -> dict:
+        """Return the log_comment of the most recent QueryFinish entry for this team."""
+        sync_execute("SYSTEM FLUSH LOGS")
+        rows = sync_execute(
+            "SELECT log_comment FROM system.query_log "
+            "WHERE JSONExtractInt(log_comment, 'team_id') = %(team_id)s "
+            "AND type = 'QueryFinish' "
+            "ORDER BY event_time DESC LIMIT 1",
+            {"team_id": self.team.pk},
+        )
+        assert rows, f"No query_log entry found for team {self.team.pk}"
+        return json.loads(rows[0][0])
+
+    def test_mcp_request_falls_back_to_mcp_when_kind_and_scene_unmapped(self):
+        # Raw HogQLQuery has query_type="hogql_query" (not a NodeKind value) and no scene,
+        # so the fallback chain reaches the source=mcp branch and tags product=mcp.
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/query/",
+            {"query": {"kind": "HogQLQuery", "query": "SELECT 1"}},
+            HTTP_X_POSTHOG_CLIENT="mcp",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        comment = self._get_log_comment_for_team()
+        self.assertEqual(comment["source"], "mcp")
+        self.assertEqual(comment["product"], Product.MCP.value)
+
+    def test_mcp_request_with_kind_uses_kind_product_not_mcp(self):
+        # EventsQuery → product_analytics via kind_fallback_tags. The mcp source fallback
+        # must not override the kind-based attribution.
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/query/",
+            {"query": {"kind": "EventsQuery", "select": ["event"]}},
+            HTTP_X_POSTHOG_CLIENT="mcp",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        comment = self._get_log_comment_for_team()
+        self.assertEqual(comment["source"], "mcp")
+        self.assertEqual(comment["product"], Product.PRODUCT_ANALYTICS.value)
+
+    def test_mcp_request_with_inferred_product_keeps_inferred_product(self):
+        # `tags.scene="SQLEditor"` → product=warehouse via SCENE_TO_TAGS.
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/query/",
             {
                 "query": {
-                    "kind": "RetentionQuery",
-                    "retentionFilter": {"meanRetentionCalculation": "simple", "period": "Day", "totalIntervals": 7},
-                    "version": 2,
+                    "kind": "HogQLQuery",
+                    "query": "SELECT 1",
+                    "tags": {"scene": "SQLEditor"},
                 }
             },
+            HTTP_X_POSTHOG_CLIENT="mcp",
         )
+
+        self.assertEqual(response.status_code, 200)
+        comment = self._get_log_comment_for_team()
+        self.assertEqual(comment["source"], "mcp")
+        self.assertEqual(comment["product"], Product.WAREHOUSE.value)
+
+    def test_non_mcp_request_does_not_set_product_to_mcp(self):
+        response = self.client.post(
+            f"/api/environments/{self.team.id}/query/",
+            {"query": {"kind": "HogQLQuery", "query": "SELECT 1"}},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        comment = self._get_log_comment_for_team()
+        self.assertNotEqual(comment.get("source"), "mcp")
+        self.assertNotEqual(comment.get("product"), Product.MCP.value)

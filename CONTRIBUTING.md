@@ -25,6 +25,7 @@ Before we do a full review, please:
 - Respond to automated review feedback (e.g. Greptile comments) where applicable.
 - Keep the change focused; add tests and docs where it meaningfully improves clarity.
 - Follow existing patterns and conventions in the areas you touch.
+- If AI helped write your contribution, read our [AI contributions policy](AI_POLICY.md) — we expect disclosure and full understanding of the code you submit.
 
 Escalation/deferral can happen for security-sensitive or critical paths, unclear product impact, or when support load is high—another engineer may pick it up later. We sometimes reward helpful contributions with merch even if a PR doesn’t merge.
 
@@ -40,7 +41,7 @@ We prefer not to accept external contributions for paid features. If you don't s
 
 # Feature requests
 
-Raise an issue for these and tag it as an Enhancement. We love every idea. Please give us as much context on the why as possible.
+Request features on [our public roadmap](https://posthog.com/roadmap). We love every idea. Please give us as much context on the why as possible.
 
 # Features
 
@@ -48,4 +49,4 @@ We strive to keep our [roadmap](https://posthog.com/roadmap) up-to-date, while o
 
 As a rule of thumb - if you wanna work on a specific feature that fits with helping developers understand product usage and/or extending PostHog to ingest more of their customer's data, we'll generally like it.
 
-If you are at all unsure, just raise it as an enhancement issue first, and we'll attempt to respond very quickly.
+If you are at all unsure, just raise an issue to discuss it first, and we'll attempt to respond very quickly.

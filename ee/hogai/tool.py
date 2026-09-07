@@ -1,9 +1,9 @@
+import re
 import json
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from functools import cached_property
-from string import Formatter
 from typing import Any, Literal, Self
 
 import structlog
@@ -13,12 +13,13 @@ from langchain_core.tools import BaseTool
 from langgraph.types import interrupt
 from pydantic import BaseModel, ValidationError
 
-from posthog.schema import ApprovalResumePayload, AssistantTool
+from posthog.schema import ApprovalResumePayload, AssistantTool, ClientToolResultPayload
 
 from posthog.models import Team, User
-from posthog.rbac.user_access_control import AccessControlLevel, UserAccessControl
 from posthog.scopes import APIScopeObject
 from posthog.sync import database_sync_to_async
+
+from products.access_control.backend.facade.user_access_control import AccessControlLevel, UserAccessControl
 
 from ee.hogai.context.context import AssistantContextManager
 from ee.hogai.core.context import get_node_path, set_node_path
@@ -28,6 +29,8 @@ from ee.hogai.tool_errors import MaxToolAccessDeniedError, MaxToolRetryableError
 from ee.hogai.utils.types.base import AssistantMessageUnion, AssistantState, NodePath
 
 logger = structlog.get_logger(__name__)
+
+_CONTEXT_PLACEHOLDER_RE = re.compile(r"\{\{|\}\}|\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 class ToolMessagesArtifact(BaseModel):
@@ -50,6 +53,17 @@ class ApprovalRequest(BaseModel):
     tool_name: str
     preview: str
     payload: dict[str, Any]
+    original_tool_call_id: str | None = None
+
+
+class ClientToolCallRequest(BaseModel):
+    """Interrupt payload when a tool hands execution to its client-side handler.
+
+    Nothing is streamed: the frontend detects the pending call from the thread, runs the
+    registered handler, and resumes with a ClientToolResultPayload.
+    """
+
+    tool_name: str
     original_tool_call_id: str | None = None
 
 
@@ -198,14 +212,14 @@ class MaxTool(AssistantContextMixin, AssistantDispatcherMixin, BaseTool):
     def _run_with_context(self, *args, **kwargs):
         """Sets the context for the tool."""
         with set_node_path(self.node_path):
-            if permission_check_result := async_to_sync(self._check_dangerous_operation)(**kwargs):
+            if permission_check_result := async_to_sync(self._check_dangerous_operation)(kwargs):
                 return permission_check_result
             return self._run_impl(*args, **kwargs)
 
     async def _arun_with_context(self, *args, **kwargs):
         """Sets the context for the tool. Checks for approved/dangerous operations before executing."""
         with set_node_path(self.node_path):
-            if permission_check_result := await self._check_dangerous_operation(**kwargs):
+            if permission_check_result := await self._check_dangerous_operation(kwargs):
                 return permission_check_result
             return await self._arun_impl(*args, **kwargs)
 
@@ -247,22 +261,31 @@ class MaxTool(AssistantContextMixin, AssistantDispatcherMixin, BaseTool):
     def format_context_prompt_injection(self, context: dict[str, Any]) -> str | None:
         if not self.context_prompt_template:
             return None
-        # Build initial context
         formatted_context = {
             key: (json.dumps(value) if isinstance(value, dict | list) else value) for key, value in context.items()
         }
-        # Extract expected keys from template
-        expected_keys = {
-            field for _, field, _, _ in Formatter().parse(self.context_prompt_template) if field is not None
-        }
-        # If they expect key is not present in the context (for example, cached FE) - use None as a default
-        for key in expected_keys:
+        # Only substitute `{valid_identifier}` placeholders. Plain `str.format` parses
+        # any `{...}` — including literal code blocks like `fun onEvent(event) { ... }`
+        # in prompt templates — as placeholders, which raises on substitution.
+        # `{{` / `}}` are honored as literal-brace escapes for backwards compatibility.
+        tool_name = self.get_name()
+
+        def _substitute(match: re.Match[str]) -> str:
+            text = match.group(0)
+            if text == "{{":
+                return "{"
+            if text == "}}":
+                return "}"
+            key = match.group(1)
             if key not in formatted_context:
-                formatted_context[key] = None
                 logger.warning(
-                    f"Context prompt template for {self.get_name()} expects key {key} but it is not present in the context"
+                    f"Context prompt template for {tool_name} expects key {key} but it is not present in the context"
                 )
-        return self.context_prompt_template.format(**formatted_context)
+                return "None"
+            value = formatted_context[key]
+            return "None" if value is None else str(value)
+
+        return _CONTEXT_PLACEHOLDER_RE.sub(_substitute, self.context_prompt_template)
 
     def set_node_path(self, node_path: tuple[NodePath, ...]):
         self._node_path = node_path
@@ -325,19 +348,25 @@ class MaxTool(AssistantContextMixin, AssistantDispatcherMixin, BaseTool):
             resource_name = resource or obj._meta.model_name
             raise MaxToolAccessDeniedError(resource_name, required_level, action=action)
 
-    async def _check_dangerous_operation(self, **kwargs) -> tuple[str, Any] | None:
+    async def _check_dangerous_operation(self, kwargs: dict[str, Any]) -> tuple[str, Any] | None:
+        """Takes the caller's kwargs dict by reference, not unpacked.
+
+        An approving user may edit the arguments, and `_handle_dangerous_operation` writes them back
+        into this dict. Unpacking here would hand each level a fresh copy, so the edits would be
+        discarded and the caller would execute the operation the user did not approve.
+        """
         if not await self.is_dangerous_operation(**kwargs):
             return None
 
         # Handle dangerous operation approval flow
         # Pre-compute preview before calling _handle_dangerous_operation
         preview = await self.format_dangerous_operation_preview(**kwargs)
-        dangerous_result = self._handle_dangerous_operation(preview=preview, **kwargs)
+        dangerous_result = self._handle_dangerous_operation(kwargs, preview=preview)
         if dangerous_result is not None:
             return dangerous_result
         return None
 
-    def _handle_dangerous_operation(self, preview: str | None = None, **kwargs) -> tuple[str, Any] | None:
+    def _handle_dangerous_operation(self, kwargs: dict[str, Any], preview: str | None = None) -> tuple[str, Any] | None:
         """
         Handle dangerous operation approval flow using LangGraph's interrupt().
 
@@ -391,6 +420,24 @@ class MaxTool(AssistantContextMixin, AssistantDispatcherMixin, BaseTool):
                 "Please acknowledge their decision and ask if they would like to proceed differently.",
                 None,
             )
+
+    def request_client_execution(self) -> dict[str, Any]:
+        """Pause the graph until this tool's frontend handler resumes the conversation.
+
+        The handler receives this tool call's arguments. Returns the handler's result dict;
+        validate its domain shape in the calling tool.
+        """
+        response = interrupt(
+            ClientToolCallRequest(tool_name=self.name, original_tool_call_id=self._original_tool_call_id)
+        )
+        try:
+            payload = ClientToolResultPayload.model_validate(response)
+        except ValidationError as e:
+            raise MaxToolRetryableError(f"Invalid client tool result: {e}")
+        # All interrupts pending in one superstep receive the same resume value — fail loudly on misdelivery
+        if payload.tool_call_id and self._original_tool_call_id and payload.tool_call_id != self._original_tool_call_id:
+            raise MaxToolRetryableError("The client tool result was addressed to a different tool call")
+        return payload.result
 
     def _reconstruct_kwargs_from_payload(self, payload: dict) -> dict:
         """Reconstruct kwargs from stored payload (Pydantic deserialization)."""

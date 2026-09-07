@@ -1,19 +1,31 @@
 import { useEffect, useMemo, useState } from 'react'
 
+import { IconInfo } from '@posthog/icons'
+import { Tooltip } from '@posthog/lemon-ui'
+
+import { LemonTableLoader } from 'lib/lemon-ui/LemonTable/LemonTableLoader'
+
 import { ExperimentStatsMethod } from '~/types'
 
 import { useSvgResizeObserver } from '../hooks/useSvgResizeObserver'
 import { getNiceTickValues } from '../shared/utils'
+import { SVG_EDGE_MARGIN, TICK_FONT_SIZE, TICK_PANEL_HEIGHT, VIEW_BOX_WIDTH } from './constants'
 import { TickLabels } from './TickLabels'
-import { SVG_EDGE_MARGIN, TICK_FONT_SIZE_NEW, TICK_PANEL_HEIGHT, VIEW_BOX_WIDTH } from './constants'
 import { useAxisScale } from './useAxisScale'
 
 interface TableHeaderProps {
     axisRange?: number
     statsMethod?: ExperimentStatsMethod
+    sequentialTestingEnabled?: boolean
+    loading?: boolean
 }
 
-export function TableHeader({ axisRange, statsMethod }: TableHeaderProps): JSX.Element {
+export function TableHeader({
+    axisRange,
+    statsMethod,
+    sequentialTestingEnabled,
+    loading = false,
+}: TableHeaderProps): JSX.Element {
     const [svgWidth, setSvgWidth] = useState<number | undefined>(undefined)
 
     // Set up tick values and scaling for the header
@@ -53,7 +65,30 @@ export function TableHeader({ axisRange, statsMethod }: TableHeaderProps): JSX.E
                     Delta
                 </th>
                 <th className="w-1/15 border-b-2 bg-bg-table p-3 text-center text-xs sticky top-0 z-10 metric-cell-header whitespace-nowrap">
-                    {statsMethod === ExperimentStatsMethod.Frequentist ? 'P-value' : 'Win %'}
+                    {statsMethod === ExperimentStatsMethod.Frequentist ? (
+                        sequentialTestingEnabled ? (
+                            <span className="inline-flex items-center gap-1">
+                                p-value
+                                <Tooltip title="Sequential testing is enabled. These are always-valid p-values, robust to peeking. They have a slightly different interpretation than ordinary p-values and can often be exactly 1.000 early in the experiment. The result is still statistically significant if the p-value drops below your threshold.">
+                                    <IconInfo className="text-secondary text-base" />
+                                </Tooltip>
+                            </span>
+                        ) : (
+                            <span className="inline-flex items-center gap-1">
+                                p-value
+                                <Tooltip title="The probability of seeing a difference at least this large if the variant had no real effect. The result is significant when the p-value drops below your threshold.">
+                                    <IconInfo className="text-secondary text-base" />
+                                </Tooltip>
+                            </span>
+                        )
+                    ) : (
+                        <span className="inline-flex items-center gap-1">
+                            Win %
+                            <Tooltip title="Chance to win: the probability that this variant beats the baseline, not the size of the lift.">
+                                <IconInfo className="text-secondary text-base" />
+                            </Tooltip>
+                        </span>
+                    )}
                 </th>
                 <th className="border-b-2 bg-bg-table p-3 z-10" />
                 <th className="border-b-2 bg-bg-table p-0 z-10">
@@ -73,7 +108,7 @@ export function TableHeader({ axisRange, statsMethod }: TableHeaderProps): JSX.E
                                     scale={scale}
                                     y={(TICK_PANEL_HEIGHT + 13) / 2}
                                     viewBoxWidth={VIEW_BOX_WIDTH}
-                                    fontSize={TICK_FONT_SIZE_NEW}
+                                    fontSize={TICK_FONT_SIZE}
                                     fontWeight="600"
                                     dominantBaseline="middle"
                                     svgWidth={svgWidth}
@@ -83,6 +118,13 @@ export function TableHeader({ axisRange, statsMethod }: TableHeaderProps): JSX.E
                     ) : (
                         <div className="p-3" />
                     )}
+                </th>
+            </tr>
+            {/* Thin loader line spanning the full table width, pinned to the header's bottom edge.
+                Mirrors LemonTable's loader row: a zero-height positioning host for the absolute line. */}
+            <tr>
+                <th colSpan={7} className="relative h-0 overflow-visible !border-none !p-0 leading-none">
+                    <LemonTableLoader loading={loading} tag="div" placement="bottom" />
                 </th>
             </tr>
         </thead>

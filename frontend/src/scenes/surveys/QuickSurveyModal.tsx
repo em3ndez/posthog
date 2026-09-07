@@ -1,6 +1,6 @@
 import { BindLogic, useActions, useValues } from 'kea'
 import { SurveyQuestionType } from 'posthog-js'
-import { useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import {
     LemonBanner,
@@ -13,11 +13,12 @@ import {
 } from '@posthog/lemon-ui'
 
 import { LemonMenuOverlay } from 'lib/lemon-ui/LemonMenu/LemonMenu'
+import { getExperimentVariants } from 'scenes/experiments/utils'
+import { SdkVersionWarnings } from 'scenes/surveys/components/SdkVersionWarnings'
 import { SurveyAppearancePreview } from 'scenes/surveys/SurveyAppearancePreview'
 import { SurveyEnableToggle } from 'scenes/surveys/SurveySettings'
-import { SdkVersionWarnings } from 'scenes/surveys/components/SdkVersionWarnings'
-import { getSurveyWarnings } from 'scenes/surveys/surveyVersionRequirements'
 import { surveysSdkLogic } from 'scenes/surveys/surveysSdkLogic'
+import { getSurveyWarnings } from 'scenes/surveys/surveyVersionRequirements'
 import { teamLogic } from 'scenes/teamLogic'
 
 import { Survey } from '~/types'
@@ -66,6 +67,16 @@ export function QuickSurveyForm({ context, info, onCancel, showFollowupToggle }:
     return (
         <BindLogic logic={quickSurveyFormLogic} props={logicProps}>
             {info && <LemonBanner type="info">{info}</LemonBanner>}
+
+            {shouldShowSurveyToggle && (
+                <div className="p-4 border rounded bg-warning-highlight space-y-2 mt-2">
+                    <div>
+                        Surveys are currently disabled for this project. Enable them so this survey can be shown to
+                        users.
+                    </div>
+                    <SurveyEnableToggle />
+                </div>
+            )}
 
             <div className="grid grid-cols-2 gap-6 mt-2">
                 <div className="space-y-4">
@@ -190,7 +201,7 @@ export function QuickSurveyForm({ context, info, onCancel, showFollowupToggle }:
                     {context.type === QuickSurveyType.EXPERIMENT && (
                         <>
                             <VariantSelector
-                                variants={context.experiment.parameters?.feature_flag_variants || []}
+                                variants={getExperimentVariants(context.experiment)}
                                 defaultOptionText="All users exposed to this experiment"
                             />
                             <EventSelector />
@@ -211,12 +222,6 @@ export function QuickSurveyForm({ context, info, onCancel, showFollowupToggle }:
             {context.type === QuickSurveyType.ERROR_TRACKING && <ExceptionFilters />}
 
             <div className="flex flex-col gap-3 mt-4">
-                {shouldShowSurveyToggle && (
-                    <div className="p-4 border rounded bg-warning-highlight">
-                        <SurveyEnableToggle />
-                    </div>
-                )}
-
                 <SdkVersionWarnings warnings={warnings} />
 
                 {submitDisabledReason && (
@@ -287,9 +292,32 @@ export function QuickSurveyModal({
     isOpen: boolean
     modalTitle?: string
     showFollowupToggle?: boolean
-}): JSX.Element {
+}): JSX.Element | null {
+    // Lazy mount: callers may render <QuickSurveyModal> per row (e.g. in a
+    // 100-row feature-flags table). Always-mounting the underlying
+    // react-modal allocates a portal container and ~130 delegated event
+    // listeners per instance even while closed, which adds up to tens of
+    // thousands of listeners. Track mount-state internally so the portal
+    // only exists while the modal is open, while still passing isOpen
+    // through to LemonModal so its 250ms close transition can play
+    // before onAfterClose tears the portal down.
+    const [isMounted, setIsMounted] = useState(isOpen)
+    useEffect(() => {
+        if (isOpen) {
+            setIsMounted(true)
+        }
+    }, [isOpen])
+    if (!isMounted) {
+        return null
+    }
     return (
-        <LemonModal title={modalTitle || 'Quick feedback survey'} isOpen={isOpen} onClose={onCancel} width={900}>
+        <LemonModal
+            title={modalTitle || 'Quick feedback survey'}
+            isOpen={isOpen}
+            onClose={onCancel}
+            onAfterClose={() => setIsMounted(false)}
+            width={900}
+        >
             {context && (
                 <QuickSurveyForm
                     context={context}

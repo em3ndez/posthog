@@ -8,6 +8,7 @@ import {
     IconGo,
     IconJava,
     IconJavascript,
+    IconKotlin,
     IconLogomark,
     IconNode,
     IconPHP,
@@ -16,8 +17,8 @@ import {
     IconRuby,
     IconRust,
     IconSwift,
+    type IconProps,
 } from '@posthog/icons'
-import { IconProps } from '@posthog/icons/dist/src/types/icon-types'
 
 import { ErrorTrackingRuntime } from 'lib/components/Errors/types'
 
@@ -31,6 +32,7 @@ const RuntimeIconMap: Record<ErrorTrackingRuntime, React.FC> = {
     dotnet: IconCSharp,
     php: IconPHP,
     java: IconJava,
+    kotlin: IconKotlin,
     android: IconAndroid,
     ios: IconApple,
     elixir: IconElixir,

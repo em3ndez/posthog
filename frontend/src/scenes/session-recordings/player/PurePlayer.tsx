@@ -3,28 +3,32 @@ import './SessionRecordingPlayer.scss'
 import clsx from 'clsx'
 import { useActions, useValues } from 'kea'
 import posthog from 'posthog-js'
-import { useEffect, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
-import { LemonButton } from '@posthog/lemon-ui'
+import * as construction2Png from '@posthog/brand/hoggies/png/construction-2'
+import { LemonBanner, LemonButton } from '@posthog/lemon-ui'
 
-import { BuilderHog2 } from 'lib/components/hedgehogs'
+import { pngHoggie } from 'lib/brand/hoggies'
+import { WarningHog } from 'lib/components/hedgehogs'
 import { FloatingContainerContext } from 'lib/hooks/useFloatingContainerContext'
 import useIsHovering from 'lib/hooks/useIsHovering'
 import { HotkeysInterface, useKeyboardHotkeys } from 'lib/hooks/useKeyboardHotkeys'
 import { usePageVisibilityCb } from 'lib/hooks/usePageVisibility'
 import { useResizeBreakpoints } from 'lib/hooks/useResizeObserver'
+import { Link } from 'lib/lemon-ui/Link'
+import { humanFriendlyDuration } from 'lib/utils/durations'
 import { useNotebookDrag } from 'scenes/notebooks/AddToNotebook/DraggableToNotebook'
+import { PlayerFrameCommentOverlay } from 'scenes/session-recordings/player/commenting/PlayerFrameCommentOverlay'
 import { RecordingDeleted } from 'scenes/session-recordings/player/RecordingDeleted'
 import { RecordingNotFound } from 'scenes/session-recordings/player/RecordingNotFound'
-import { PlayerFrameCommentOverlay } from 'scenes/session-recordings/player/commenting/PlayerFrameCommentOverlay'
 import { urls } from 'scenes/urls'
 
-import { PlayerFrame } from './PlayerFrame'
-import { PlayerFrameMetaOverlay } from './PlayerFrameMetaOverlay'
-import { PlayerFrameOverlay } from './PlayerFrameOverlay'
 import { ClipOverlay } from './controller/ClipRecording'
 import { PlayerController } from './controller/PlayerController'
 import { PlayerMetaBar } from './player-meta/PlayerMetaBar'
+import { PlayerFrame } from './PlayerFrame'
+import { PlayerFrameMetaOverlay } from './PlayerFrameMetaOverlay'
+import { PlayerFrameOverlay } from './PlayerFrameOverlay'
 import { playerSettingsLogic } from './playerSettingsLogic'
 import { sessionRecordingDataCoordinatorLogic } from './sessionRecordingDataCoordinatorLogic'
 import {
@@ -34,6 +38,8 @@ import {
     sessionRecordingPlayerLogic,
 } from './sessionRecordingPlayerLogic'
 import { SessionRecordingPlayerExplorer } from './view-explorer/SessionRecordingPlayerExplorer'
+
+const HedgehogConstruction2 = pngHoggie(construction2Png)
 
 export interface PurePlayerProps {
     noMeta?: boolean
@@ -48,7 +54,12 @@ export const createPlaybackSpeedKey = (action: (val: number) => void): HotkeysIn
 }
 
 export function PurePlayer({ noMeta = false, noBorder = false }: PurePlayerProps): JSX.Element {
-    const playerRef = useRef<HTMLDivElement>(null)
+    const playerRef = useRef<HTMLDivElement | null>(null)
+    const [playerContainer, setPlayerContainer] = useState<HTMLDivElement | null>(null)
+    const playerCallbackRef = useCallback((el: HTMLDivElement | null) => {
+        playerRef.current = el
+        setPlayerContainer(el)
+    }, [])
     const {
         incrementClickCount,
         setIsFullScreen,
@@ -82,11 +93,20 @@ export function PurePlayer({ noMeta = false, noBorder = false }: PurePlayerProps
         showingClipParams,
         isMuted,
         endReached,
+        hasLateFullSnapshot,
+        leadingUnplayableMs,
+        hasOversizedMutations,
     } = useValues(sessionRecordingPlayerLogic)
 
-    const { isNotFound, isRecentAndInvalid, isRecordingDeleted, recordingDeletedAt } = useValues(
-        sessionRecordingDataCoordinatorLogic(logicProps)
-    )
+    const {
+        isNotFound,
+        loadMetaError,
+        isRecentAndInvalid,
+        isOldAndInvalid,
+        isRecordingDeleted,
+        recordingDeletedAt,
+        recordingDeletedBy,
+    } = useValues(sessionRecordingDataCoordinatorLogic(logicProps))
     const { loadSnapshots } = useActions(sessionRecordingDataCoordinatorLogic(logicProps))
 
     const { isPlaylistCollapsed, showMetadataFooter } = useValues(playerSettingsLogic)
@@ -121,6 +141,33 @@ export function PurePlayer({ noMeta = false, noBorder = false }: PurePlayerProps
         },
         // eslint-disable-next-line react-hooks/exhaustive-deps
         [isRecentAndInvalid]
+    )
+
+    useEffect(
+        () => {
+            if (isOldAndInvalid) {
+                posthog.capture('session loaded old and invalid', {
+                    viewedSessionRecording: sessionRecordingId,
+                    recordingStartTime: sessionPlayerData?.start,
+                })
+            }
+        },
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [isOldAndInvalid]
+    )
+
+    useEffect(
+        () => {
+            if (hasLateFullSnapshot) {
+                posthog.capture('session loaded with late full snapshot', {
+                    viewedSessionRecording: sessionRecordingId,
+                    recordingStartTime: sessionPlayerData?.start,
+                    leadingUnplayableMs,
+                })
+            }
+        },
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+        [hasLateFullSnapshot]
     )
 
     // Track if the recording has ended to be able to reliably get it from the BE and stop the recording
@@ -168,6 +215,7 @@ export function PurePlayer({ noMeta = false, noBorder = false }: PurePlayerProps
                     seekBackward(e.altKey ? ONE_SECOND_MS : undefined)
                 },
                 willHandleEvent: true,
+                allowRepeat: true,
             },
             arrowright: {
                 action: (e) => {
@@ -179,6 +227,7 @@ export function PurePlayer({ noMeta = false, noBorder = false }: PurePlayerProps
                     seekForward(e.altKey ? ONE_SECOND_MS : undefined)
                 },
                 willHandleEvent: true,
+                allowRepeat: true,
             },
             ...speedHotkeys,
             ...(isFullScreen ? { escape: { action: () => setIsFullScreen(false) } } : {}),
@@ -224,7 +273,17 @@ export function PurePlayer({ noMeta = false, noBorder = false }: PurePlayerProps
     if (isNotFound) {
         return (
             <div className="flex-1 w-full flex justify-center">
-                <RecordingNotFound />
+                <RecordingNotFound sessionRecordingId={sessionRecordingId} />
+            </div>
+        )
+    }
+
+    if (loadMetaError) {
+        return (
+            <div className="flex-1 w-full flex justify-center items-center p-4">
+                <LemonBanner type="error" className="max-w-xl">
+                    There was an error loading this recording. Please try again later.
+                </LemonBanner>
             </div>
         )
     }
@@ -232,14 +291,14 @@ export function PurePlayer({ noMeta = false, noBorder = false }: PurePlayerProps
     if (isRecordingDeleted) {
         return (
             <div className="flex-1 w-full flex justify-center items-center">
-                <RecordingDeleted deletedAt={recordingDeletedAt} />
+                <RecordingDeleted deletedAt={recordingDeletedAt} deletedBy={recordingDeletedBy} />
             </div>
         )
     }
 
     return (
         <div
-            ref={playerRef}
+            ref={playerCallbackRef}
             className={clsx(
                 'SessionRecordingPlayer',
                 {
@@ -253,26 +312,81 @@ export function PurePlayer({ noMeta = false, noBorder = false }: PurePlayerProps
             onMouseMove={() => setPlayNextAnimationInterrupted(true)}
             onMouseOut={() => setPlayNextAnimationInterrupted(false)}
         >
-            <FloatingContainerContext.Provider value={playerRef}>
+            <FloatingContainerContext.Provider value={playerContainer}>
                 {explorerMode ? (
                     <SessionRecordingPlayerExplorer {...explorerMode} onClose={() => closeExplorer()} />
                 ) : (
                     <div className="SessionRecordingPlayer__main flex flex-col h-full w-full">
-                        {isRecentAndInvalid ? (
-                            <div className="flex flex-1 flex-col items-center justify-center">
-                                <BuilderHog2 height={200} />
-                                <h1>We're still working on it</h1>
-                                <p>
-                                    This recording hasn't been fully ingested yet. It should be ready to watch in a few
-                                    minutes.
-                                </p>
-                                <LemonButton type="secondary" onClick={loadSnapshots}>
-                                    Reload
-                                </LemonButton>
+                        {isRecentAndInvalid || isOldAndInvalid ? (
+                            <div className="flex flex-col flex-1 w-full relative">
+                                {/* Keep the meta bar so the activity/inspector panel stays reachable */}
+                                <div className="relative">{showMeta ? <PlayerMetaBar /> : null}</div>
+                                <div className="flex flex-1 flex-col items-center justify-center p-4 text-center">
+                                    {isOldAndInvalid && !isRecentAndInvalid ? (
+                                        <>
+                                            <WarningHog height={200} width={200} />
+                                            <h1>This recording can't be played</h1>
+                                            <p className="max-w-120">
+                                                The snapshot of the screen taken when this recording started never
+                                                reached PostHog, so there is nothing to play back. This usually happens
+                                                when the browser is closed or goes offline before the recording finishes
+                                                uploading.{' '}
+                                                <Link to="https://posthog.com/docs/session-replay/troubleshooting">
+                                                    Learn more
+                                                </Link>
+                                            </p>
+                                            <LemonButton type="secondary" onClick={loadSnapshots}>
+                                                Reload
+                                            </LemonButton>
+                                        </>
+                                    ) : (
+                                        <>
+                                            <HedgehogConstruction2 className="h-50" />
+                                            <h1>We're still working on it</h1>
+                                            <p className="max-w-120">
+                                                This recording hasn't been fully ingested yet. It should be ready to
+                                                watch in a few minutes.
+                                            </p>
+                                            <LemonButton type="secondary" onClick={loadSnapshots}>
+                                                Reload
+                                            </LemonButton>
+                                        </>
+                                    )}
+                                </div>
                             </div>
                         ) : (
                             <div className="flex w-full h-full">
                                 <div className="flex flex-col flex-1 w-full relative">
+                                    {hasLateFullSnapshot && !hidePlayerElements ? (
+                                        <LemonBanner
+                                            type="warning"
+                                            // The player column over-commits its height, so a flexible banner gets
+                                            // squashed and its text spills out of the border in narrow players
+                                            className="shrink-0"
+                                            dismissKey={`late-full-snapshot-${sessionRecordingId}`}
+                                        >
+                                            The first{' '}
+                                            {humanFriendlyDuration(leadingUnplayableMs / 1000, { maxUnits: 2 })} of this
+                                            recording can't be shown — the initial snapshot of the screen arrived late,
+                                            so playback starts from the first frame we can render.{' '}
+                                            <Link to="https://posthog.com/docs/session-replay/troubleshooting">
+                                                Learn more
+                                            </Link>
+                                        </LemonBanner>
+                                    ) : null}
+                                    {hasOversizedMutations && !hidePlayerElements ? (
+                                        <LemonBanner
+                                            type="warning"
+                                            className="shrink-0"
+                                            dismissKey={`oversized-mutations-${sessionRecordingId}`}
+                                        >
+                                            Parts of this recording captured too much changing content to render.
+                                            Playback skips those sections to keep the player responsive.{' '}
+                                            <Link to="https://posthog.com/docs/session-replay/troubleshooting">
+                                                Learn more
+                                            </Link>
+                                        </LemonBanner>
+                                    ) : null}
                                     <div className="relative">{showMeta ? <PlayerMetaBar /> : null}</div>
                                     <div
                                         className="SessionRecordingPlayer__body"

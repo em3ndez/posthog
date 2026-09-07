@@ -4,16 +4,18 @@ import { IconPlusSmall } from '@posthog/icons'
 import { LemonButton, LemonTabs } from '@posthog/lemon-ui'
 
 import { ActivityLog } from 'lib/components/ActivityLog/ActivityLog'
-import { AppShortcut } from 'lib/components/AppShortcuts/AppShortcut'
-import { keyBinds } from 'lib/components/AppShortcuts/shortcuts'
-import { Scene, SceneExport } from 'scenes/sceneTypes'
+import { Shortcut } from 'lib/components/Shortcuts/Shortcut'
+import { keyBinds } from 'lib/components/Shortcuts/shortcuts'
 import { sceneConfigurations } from 'scenes/scenes'
+import { Scene, SceneExport } from 'scenes/sceneTypes'
 import { urls } from 'scenes/urls'
 
 import { SceneContent } from '~/layout/scenes/components/SceneContent'
 import { SceneTitleSection } from '~/layout/scenes/components/SceneTitleSection'
 import { ProductKey } from '~/queries/schema/schema-general'
 import { ActivityScope } from '~/types'
+
+import { DestinationsIncidentReplayBanner } from 'products/cdp/frontend/DestinationsIncidentReplayBanner'
 
 import { DataPipelinesHogFunctions } from './DataPipelinesHogFunctions'
 import { destinationsSceneLogic } from './destinationsSceneLogic'
@@ -29,7 +31,7 @@ export function DestinationsScene(): JSX.Element {
     const { setActiveTab } = useActions(destinationsSceneLogic)
 
     const action = (
-        <AppShortcut
+        <Shortcut
             name="NewPipelineDestination"
             keybind={[keyBinds.new]}
             intent="New destination"
@@ -46,7 +48,7 @@ export function DestinationsScene(): JSX.Element {
             >
                 New destination
             </LemonButton>
-        </AppShortcut>
+        </Shortcut>
     )
 
     const tabs = [
@@ -78,6 +80,7 @@ export function DestinationsScene(): JSX.Element {
                 }}
                 actions={action}
             />
+            <DestinationsIncidentReplayBanner />
             <LemonTabs
                 activeKey={activeTab}
                 onChange={(key) => setActiveTab(key as 'all' | 'history')}

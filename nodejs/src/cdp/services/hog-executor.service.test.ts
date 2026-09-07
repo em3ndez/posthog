@@ -1,24 +1,42 @@
 // sort-imports-ignore
+import { PosthogJwtAudience } from '~/cdp/utils/jwt-utils'
+import { ScopedServiceJwt } from '~/cdp/utils/scoped-service-jwt'
+import { FetchOptions } from '~/common/utils/request'
+import { createHmac } from 'node:crypto'
 import { createServer } from 'http'
 import { DateTime } from 'luxon'
 import { AddressInfo } from 'net'
 
-import { CyclotronInvocationQueueParametersFetchType } from '~/schema/cyclotron'
-import { logger } from '~/utils/logger'
+import { CyclotronInvocationQueueParametersFetchType } from '~/cdp/schema/cyclotron'
+import { logger } from '~/common/utils/logger'
 
+import { HogExecutorAsyncService } from '../../../src/cdp/services/hog-executor-async.service'
 import { HogExecutorService } from '../../../src/cdp/services/hog-executor.service'
+import { HogInputsService } from '../../../src/cdp/services/hog-inputs.service'
+import { RecipientsManagerService } from '../../../src/cdp/services/managers/recipients-manager.service'
+import { TeamWorkflowsConfigService } from '../../../src/cdp/services/managers/team-workflows-config.service'
+import { EmailService } from '../../../src/cdp/services/messaging/email.service'
+import {
+    EmailSuppressionService,
+    emailSuppressionConfigFromEnv,
+} from '../../../src/cdp/services/messaging/email-suppression.service'
+import { EmailTrackingCodeSigner } from '../../../src/cdp/services/messaging/helpers/tracking-code'
+import { RecipientTokensService } from '../../../src/cdp/services/messaging/recipient-tokens.service'
 import { CyclotronJobInvocationHogFunction, HogFunctionType } from '../../../src/cdp/types'
 import { Hub } from '../../../src/types'
-import { createHub } from '../../../src/utils/db/hub'
-import { parseJSON } from '../../utils/json-parse'
-import { promisifyCallback } from '../../utils/utils'
+import { closeHub, createHub } from '~/common/utils/db/hub'
+import { parseJSON } from '~/common/utils/json-parse'
+import { promisifyCallback } from '~/common/utils/utils'
+import { compileHog } from '../templates/compiler'
 import { HOG_EXAMPLES, HOG_FILTERS_EXAMPLES, HOG_INPUTS_EXAMPLES } from '../_tests/examples'
 import { createExampleInvocation, createHogExecutionGlobals, createHogFunction } from '../_tests/fixtures'
-import { EXTEND_OBJECT_KEY, cdpTrackedFetch, shadowFetchContext } from './hog-executor.service'
+import { isConnectionLevelError } from '../utils/cdp-fetch'
+import { EXTEND_OBJECT_KEY } from './hog-inputs.service'
+import { SELF_LOOP_DEPTH_PROPERTY, selfLoopGuardCounter } from './self-loop-guard'
 
 // Mock before importing fetch
-jest.mock('~/utils/request', () => {
-    const original = jest.requireActual('~/utils/request')
+jest.mock('~/common/utils/request', () => {
+    const original = jest.requireActual('~/common/utils/request')
     return {
         ...original,
         fetch: jest.fn().mockImplementation((url, options) => {
@@ -27,7 +45,7 @@ jest.mock('~/utils/request', () => {
     }
 })
 
-import { fetch } from '~/utils/request'
+import { fetch, SecureRequestError } from '~/common/utils/request'
 
 const cleanLogs = (logs: string[]): string[] => {
     // Replaces the function time with a fixed value to simplify testing
@@ -38,7 +56,7 @@ const cleanLogs = (logs: string[]): string[] => {
 
 describe('Hog Executor', () => {
     jest.setTimeout(1000)
-    let executor: HogExecutorService
+    let executor: HogExecutorAsyncService
     let hub: Hub
 
     beforeEach(async () => {
@@ -46,12 +64,82 @@ describe('Hog Executor', () => {
         jest.spyOn(Date, 'now').mockReturnValue(fixedTime.toMillis())
 
         hub = await createHub()
-        executor = new HogExecutorService(hub)
+        const hogInputsService = new HogInputsService(
+            hub.integrationManager,
+            new RecipientTokensService(hub.ENCRYPTION_SALT_KEYS, hub.SITE_URL),
+            hub.encryptedFields
+        )
+        const emailService = new EmailService(
+            {
+                sesAccessKeyId: hub.SES_ACCESS_KEY_ID,
+                sesSecretAccessKey: hub.SES_SECRET_ACCESS_KEY,
+                sesRegion: hub.SES_REGION,
+                sesEndpoint: hub.SES_ENDPOINT,
+                sesTrackedConfigurationSet: hub.SES_TRACKED_CONFIGURATION_SET,
+                sesUntrackedConfigurationSet: hub.SES_UNTRACKED_CONFIGURATION_SET,
+            },
+            hub.integrationManager,
+            new TeamWorkflowsConfigService(hub.postgres, hub.pubSub),
+            hub.ENCRYPTION_SALT_KEYS,
+            hub.SITE_URL,
+            new EmailTrackingCodeSigner(hub.ENCRYPTION_SALT_KEYS, hub.CDP_EMAIL_TRACKING_URL),
+            new EmailSuppressionService(hub.postgres, emailSuppressionConfigFromEnv()),
+            new RecipientsManagerService(hub.postgres)
+        )
+        const recipientTokensService = new RecipientTokensService(hub.ENCRYPTION_SALT_KEYS, hub.SITE_URL)
+        executor = new HogExecutorAsyncService(
+            new HogExecutorService({ executionTimeoutMs: hub.CDP_WATCHER_HOG_COST_TIMING_UPPER_MS }, hogInputsService),
+            {
+                googleAdwordsDeveloperToken: hub.CDP_GOOGLE_ADWORDS_DEVELOPER_TOKEN,
+                fetchRetries: hub.CDP_FETCH_RETRIES,
+                fetchBackoffBaseMs: hub.CDP_FETCH_BACKOFF_BASE_MS,
+                fetchBackoffMaxMs: hub.CDP_FETCH_BACKOFF_MAX_MS,
+                siteUrl: hub.SITE_URL,
+                internalApiBaseUrl: hub.INTERNAL_API_BASE_URL,
+            },
+            {
+                teamManager: hub.teamManager,
+                conversationsTicketsJwt: new ScopedServiceJwt(
+                    PosthogJwtAudience.CONVERSATIONS_TICKETS,
+                    hub.CONVERSATIONS_TICKETS_JWT_SECRET
+                ),
+                customerAnalyticsAccountsJwt: new ScopedServiceJwt(
+                    PosthogJwtAudience.CUSTOMER_ANALYTICS_ACCOUNTS,
+                    hub.CUSTOMER_ANALYTICS_ACCOUNTS_JWT_SECRET
+                ),
+                hogInputsService,
+                emailService,
+                recipientTokensService,
+                // No push sends in this suite - the push queue type is covered by push-notification.service.test.ts
+                pushNotificationService: undefined as any,
+            }
+        )
     })
 
-    afterEach(() => {
+    afterEach(async () => {
         // Ensure any spies (e.g., execHog, Math.random, Date.now) are restored between tests
         jest.restoreAllMocks()
+        await closeHub(hub)
+    })
+
+    describe('getSensitiveValues', () => {
+        it('masks the nested secrets of every integration in an integration_multi input', () => {
+            const hogFunction = {
+                inputs_schema: [{ type: 'integration_multi', key: 'channels' }],
+            } as unknown as HogFunctionType
+            const inputs = {
+                channels: [
+                    { $integration_id: 1, access_token_raw: 'fcm-secret-token' },
+                    { $integration_id: 2, signing_key: 'apns-signing-key-secret' },
+                ],
+            }
+
+            const values = executor.hogExecutor.getSensitiveValues(hogFunction, inputs)
+
+            // Without integration_multi + array handling these secrets leak into team-visible logs.
+            expect(values).toContain('fcm-secret-token')
+            expect(values).toContain('apns-signing-key-secret')
+        })
     })
 
     describe('general event processing', () => {
@@ -71,6 +159,9 @@ describe('Hog Executor', () => {
             const result = await executor.execute(invocation)
             expect(result).toEqual({
                 capturedPostHogEvents: [],
+                warehouseWebhookPayloads: [],
+                messageAssets: [],
+                conversionWatchers: [],
                 invocation: {
                     state: {
                         globals: invocation.state.globals,
@@ -280,309 +371,48 @@ describe('Hog Executor', () => {
         })
     })
 
-    describe('filtering', () => {
-        it('builds the correct globals object when filtering', async () => {
-            const fn = createHogFunction({
-                ...HOG_EXAMPLES.simple_fetch,
-                ...HOG_INPUTS_EXAMPLES.simple_fetch,
-                ...HOG_FILTERS_EXAMPLES.no_filters,
-            })
-
-            const inputGlobals = createHogExecutionGlobals({ groups: {} })
-            expect(inputGlobals.source).toBeUndefined()
-            const results = await executor.buildHogFunctionInvocations([fn], inputGlobals)
-
-            expect(results.invocations).toHaveLength(1)
-
-            expect(results.invocations[0].state.globals.source).toEqual({
-                name: 'Hog Function',
-                url: `http://localhost:8000/projects/1/pipeline/destinations/hog-${fn.id}/configuration/`,
-            })
-        })
-
-        it('can filters incoming messages correctly', async () => {
-            const fn = createHogFunction({
-                ...HOG_EXAMPLES.simple_fetch,
-                ...HOG_INPUTS_EXAMPLES.simple_fetch,
-                ...HOG_FILTERS_EXAMPLES.pageview_or_autocapture_filter,
-            })
-
-            const resultsShouldntMatch = await executor.buildHogFunctionInvocations(
-                [fn],
-                createHogExecutionGlobals({ groups: {} })
-            )
-            expect(resultsShouldntMatch.invocations).toHaveLength(0)
-            expect(resultsShouldntMatch.metrics).toHaveLength(1)
-
-            const resultsShouldMatch = await executor.buildHogFunctionInvocations(
-                [fn],
-                createHogExecutionGlobals({
-                    groups: {},
-                    event: {
-                        event: '$pageview',
-                        properties: {
-                            $current_url: 'https://posthog.com',
-                        },
-                    } as any,
-                })
-            )
-            expect(resultsShouldMatch.invocations).toHaveLength(1)
-            expect(resultsShouldMatch.metrics).toHaveLength(0)
-        })
-
-        it('can use elements_chain_texts', async () => {
-            const fn = createHogFunction({
-                ...HOG_EXAMPLES.simple_fetch,
-                ...HOG_INPUTS_EXAMPLES.simple_fetch,
-                ...HOG_FILTERS_EXAMPLES.elements_text_filter,
-            })
-
-            const elementsChain = (buttonText: string) =>
-                `span.LemonButton__content:attr__class="LemonButton__content"nth-child="2"nth-of-type="2"text="${buttonText}";span.LemonButton__chrome:attr__class="LemonButton__chrome"nth-child="1"nth-of-type="1";button.LemonButton.LemonButton--has-icon.LemonButton--secondary.LemonButton--status-default:attr__class="LemonButton LemonButton--secondary LemonButton--status-default LemonButton--has-icon"attr__type="button"nth-child="1"nth-of-type="1"text="${buttonText}";div.flex.gap-4.items-center:attr__class="flex gap-4 items-center"nth-child="1"nth-of-type="1";div.flex.flex-wrap.gap-4.justify-between:attr__class="flex gap-4 justify-between flex-wrap"nth-child="3"nth-of-type="3";div.flex.flex-1.flex-col.gap-4.h-full.relative.w-full:attr__class="relative w-full flex flex-col gap-4 flex-1 h-full"nth-child="1"nth-of-type="1";div.LemonTabs__content:attr__class="LemonTabs__content"nth-child="2"nth-of-type="1";div.LemonTabs.LemonTabs--medium:attr__class="LemonTabs LemonTabs--medium"attr__style="--lemon-tabs-slider-width: 48px; --lemon-tabs-slider-offset: 0px;"nth-child="1"nth-of-type="1";div.Navigation3000__scene:attr__class="Navigation3000__scene"nth-child="2"nth-of-type="2";main:nth-child="2"nth-of-type="1";div.Navigation3000:attr__class="Navigation3000"nth-child="1"nth-of-type="1";div:attr__id="root"attr_id="root"nth-child="3"nth-of-type="1";body.overflow-hidden:attr__class="overflow-hidden"attr__theme="light"nth-child="2"nth-of-type="1"`
-
-            const hogGlobals1 = createHogExecutionGlobals({
-                groups: {},
-                event: {
-                    uuid: 'uuid',
-                    event: '$autocapture',
-                    elements_chain: elementsChain('Not our text'),
-                    distinct_id: 'distinct_id',
-                    url: 'http://localhost:8000/events/1',
-                    properties: {
-                        $lib_version: '1.2.3',
-                    },
-                    timestamp: new Date().toISOString(),
-                },
-            })
-
-            const resultsShouldntMatch = await executor.buildHogFunctionInvocations([fn], hogGlobals1)
-            expect(resultsShouldntMatch.invocations).toHaveLength(0)
-            expect(resultsShouldntMatch.metrics).toHaveLength(1)
-
-            const hogGlobals2 = createHogExecutionGlobals({
-                groups: {},
-                event: {
-                    uuid: 'uuid',
-                    event: '$autocapture',
-                    elements_chain: elementsChain('Reload'),
-                    distinct_id: 'distinct_id',
-                    url: 'http://localhost:8000/events/1',
-                    properties: {
-                        $lib_version: '1.2.3',
-                    },
-                    timestamp: new Date().toISOString(),
-                },
-            })
-
-            const resultsShouldMatch = await executor.buildHogFunctionInvocations([fn], hogGlobals2)
-            expect(resultsShouldMatch.invocations).toHaveLength(1)
-            expect(resultsShouldMatch.metrics).toHaveLength(0)
-        })
-
-        it('can use elements_chain_href', async () => {
-            const fn = createHogFunction({
-                ...HOG_EXAMPLES.simple_fetch,
-                ...HOG_INPUTS_EXAMPLES.simple_fetch,
-                ...HOG_FILTERS_EXAMPLES.elements_href_filter,
-            })
-
-            const elementsChain = (link: string) =>
-                `span.LemonButton__content:attr__class="LemonButton__content"attr__href="${link}"href="${link}"nth-child="2"nth-of-type="2"text="Activity";span.LemonButton__chrome:attr__class="LemonButton__chrome"nth-child="1"nth-of-type="1";a.LemonButton.LemonButton--full-width.LemonButton--has-icon.LemonButton--secondary.LemonButton--status-alt.Link.NavbarButton:attr__class="Link LemonButton LemonButton--secondary LemonButton--status-alt LemonButton--full-width LemonButton--has-icon NavbarButton"attr__data-attr="menu-item-activity"attr__href="${link}"href="${link}"nth-child="1"nth-of-type="1"text="Activity";li.w-full:attr__class="w-full"nth-child="6"nth-of-type="6";ul:nth-child="1"nth-of-type="1";div.Navbar3000__top.ScrollableShadows__inner:attr__class="ScrollableShadows__inner Navbar3000__top"nth-child="1"nth-of-type="1";div.ScrollableShadows.ScrollableShadows--vertical:attr__class="ScrollableShadows ScrollableShadows--vertical"nth-child="1"nth-of-type="1";div.Navbar3000__content:attr__class="Navbar3000__content"nth-child="1"nth-of-type="1";nav.Navbar3000:attr__class="Navbar3000"nth-child="1"nth-of-type="1";div.Navigation3000:attr__class="Navigation3000"nth-child="1"nth-of-type="1";div:attr__id="root"attr_id="root"nth-child="3"nth-of-type="1";body.overflow-hidden:attr__class="overflow-hidden"attr__theme="light"nth-child="2"nth-of-type="1"`
-
-            const hogGlobals1 = createHogExecutionGlobals({
-                groups: {},
-                event: {
-                    uuid: 'uuid',
-                    event: '$autocapture',
-                    elements_chain: elementsChain('/project/1/not-a-link'),
-                    distinct_id: 'distinct_id',
-                    url: 'http://localhost:8000/events/1',
-                    properties: {
-                        $lib_version: '1.2.3',
-                    },
-                    timestamp: new Date().toISOString(),
-                },
-            })
-
-            const resultsShouldntMatch = await executor.buildHogFunctionInvocations([fn], hogGlobals1)
-            expect(resultsShouldntMatch.invocations).toHaveLength(0)
-            expect(resultsShouldntMatch.metrics).toHaveLength(1)
-
-            const hogGlobals2 = createHogExecutionGlobals({
-                groups: {},
-                event: {
-                    uuid: 'uuid',
-                    event: '$autocapture',
-                    elements_chain: elementsChain('/project/1/activity/explore'),
-                    distinct_id: 'distinct_id',
-                    url: 'http://localhost:8000/events/1',
-                    properties: {
-                        $lib_version: '1.2.3',
-                    },
-                    timestamp: new Date().toISOString(),
-                },
-            })
-
-            const resultsShouldMatch = await executor.buildHogFunctionInvocations([fn], hogGlobals2)
-            expect(resultsShouldMatch.invocations).toHaveLength(1)
-            expect(resultsShouldMatch.metrics).toHaveLength(0)
-        })
-
-        it('can use elements_chain_tags and _ids', async () => {
-            const fn = createHogFunction({
-                ...HOG_EXAMPLES.simple_fetch,
-                ...HOG_INPUTS_EXAMPLES.simple_fetch,
-                ...HOG_FILTERS_EXAMPLES.elements_tag_and_id_filter,
-            })
-
-            const elementsChain = (id: string) =>
-                `a.Link.font-semibold.text-text-3000.text-xl:attr__class="Link font-semibold text-xl text-text-3000"attr__href="/project/1/dashboard/1"attr__id="${id}"attr_id="${id}"href="/project/1/dashboard/1"nth-child="1"nth-of-type="1"text="My App Dashboard";div.ProjectHomepage__dashboardheader__title:attr__class="ProjectHomepage__dashboardheader__title"nth-child="1"nth-of-type="1";div.ProjectHomepage__dashboardheader:attr__class="ProjectHomepage__dashboardheader"nth-child="2"nth-of-type="2";div.ProjectHomepage:attr__class="ProjectHomepage"nth-child="1"nth-of-type="1";div.Navigation3000__scene:attr__class="Navigation3000__scene"nth-child="2"nth-of-type="2";main:nth-child="2"nth-of-type="1";div.Navigation3000:attr__class="Navigation3000"nth-child="1"nth-of-type="1";div:attr__id="root"attr_id="root"nth-child="3"nth-of-type="1";body.overflow-hidden:attr__class="overflow-hidden"attr__theme="light"nth-child="2"nth-of-type="1"`
-
-            const hogGlobals1 = createHogExecutionGlobals({
-                groups: {},
-                event: {
-                    uuid: 'uuid',
-                    event: '$autocapture',
-                    elements_chain: elementsChain('notfound'),
-                    distinct_id: 'distinct_id',
-                    url: 'http://localhost:8000/events/1',
-                    properties: {
-                        $lib_version: '1.2.3',
-                    },
-                    timestamp: new Date().toISOString(),
-                },
-            })
-
-            const resultsShouldntMatch = await executor.buildHogFunctionInvocations([fn], hogGlobals1)
-            expect(resultsShouldntMatch.invocations).toHaveLength(0)
-            expect(resultsShouldntMatch.metrics).toHaveLength(1)
-
-            const hogGlobals2 = createHogExecutionGlobals({
-                groups: {},
-                event: {
-                    uuid: 'uuid',
-                    event: '$autocapture',
-                    elements_chain: elementsChain('homelink'),
-                    distinct_id: 'distinct_id',
-                    url: 'http://localhost:8000/events/1',
-                    properties: {
-                        $lib_version: '1.2.3',
-                    },
-                    timestamp: new Date().toISOString(),
-                },
-            })
-
-            const resultsShouldMatch = await executor.buildHogFunctionInvocations([fn], hogGlobals2)
-            expect(resultsShouldMatch.invocations).toHaveLength(1)
-            expect(resultsShouldMatch.metrics).toHaveLength(0)
-        })
-    })
-
     describe('mappings', () => {
-        let fn: HogFunctionType
-        beforeEach(() => {
-            fn = createHogFunction({
-                ...HOG_EXAMPLES.simple_fetch,
-                ...HOG_INPUTS_EXAMPLES.simple_fetch,
+        it('rebuilds mapping inputs when an invocation arrives without inputs (rerun path)', async () => {
+            // The rerun path strips `inputs` from the persisted globals and lets
+            // the executor rebuild them. For mapping destinations the mapping's
+            // own inputs (e.g. Google Ads `gclid`) must be re-merged — otherwise
+            // they resolve to nothing and the function early-exits on rerun.
+            const hog = `return inputs.gclid`
+            const mappingFn = createHogFunction({
+                hog,
+                bytecode: await compileHog(hog),
                 ...HOG_FILTERS_EXAMPLES.no_filters,
+                inputs_schema: [],
                 mappings: [
                     {
-                        // Filters for pageview or autocapture
-                        ...HOG_FILTERS_EXAMPLES.pageview_or_autocapture_filter,
+                        ...HOG_FILTERS_EXAMPLES.no_filters,
                         inputs: {
-                            url: {
+                            gclid: {
                                 order: 0,
-                                value: 'https://example.com?q={event.event}',
-                                bytecode: [
-                                    '_H',
-                                    1,
-                                    32,
-                                    'https://example.com?q=',
-                                    32,
-                                    'event',
-                                    32,
-                                    'event',
-                                    1,
-                                    2,
-                                    2,
-                                    'concat',
-                                    2,
-                                ],
+                                value: '{person.properties.gclid ?? person.properties.$initial_gclid}',
+                                bytecode: await compileHog(
+                                    'return person.properties.gclid ?? person.properties.$initial_gclid'
+                                ),
                             },
                         },
                     },
-                    {
-                        // No filters so should match all events
-                        ...HOG_FILTERS_EXAMPLES.no_filters,
-                    },
-
-                    {
-                        // Broken filters so shouldn't match
-                        ...HOG_FILTERS_EXAMPLES.broken_filters,
-                    },
                 ],
             })
-        })
 
-        it('can build mappings', async () => {
-            const pageviewGlobals = createHogExecutionGlobals({
-                event: {
-                    event: '$pageview',
-                    properties: {
-                        $current_url: 'https://posthog.com',
-                    },
-                } as any,
+            const invocation = createExampleInvocation(mappingFn, {
+                person: {
+                    id: 'uuid',
+                    name: 'test',
+                    url: 'http://localhost:8000/persons/1',
+                    properties: { email: 'test@posthog.com', $initial_gclid: 'INITIAL_TOKEN_ABC' },
+                },
             })
+            // Simulate the rerun blob: inputs are stripped before persistence.
+            expect(invocation.state.globals.inputs).toBeUndefined()
 
-            const results1 = await executor.buildHogFunctionInvocations([fn], pageviewGlobals)
-            expect(results1.invocations).toHaveLength(2)
-            expect(results1.metrics).toHaveLength(1)
-            expect(results1.logs).toHaveLength(1)
-            expect(results1.logs[0].message).toMatchInlineSnapshot(
-                `"Error filtering event uuid: Invalid HogQL bytecode, stack is empty, can not pop"`
-            )
-
-            const results2 = await executor.buildHogFunctionInvocations(
-                [fn],
-                createHogExecutionGlobals({
-                    event: {
-                        event: 'test',
-                    } as any,
-                })
-            )
-            expect(results2.invocations).toHaveLength(1)
-            expect(results2.metrics).toHaveLength(2)
-            expect(results2.logs).toHaveLength(1)
-
-            expect(results2.metrics[0].metric_name).toBe('filtered')
-            expect(results2.metrics[1].metric_name).toBe('filtering_failed')
-        })
-
-        it('generates the correct inputs', async () => {
-            const pageviewGlobals = createHogExecutionGlobals({
-                event: {
-                    event: '$pageview',
-                    properties: {
-                        $current_url: 'https://posthog.com',
-                    },
-                } as any,
-            })
-
-            const result = await executor.buildHogFunctionInvocations([fn], pageviewGlobals)
-            // First mapping has input overrides that should be applied
-            expect(result.invocations[0].state.globals.inputs.headers).toEqual({
-                version: 'v=',
-            })
-            expect(result.invocations[0].state.globals.inputs.url).toMatchInlineSnapshot(
-                `"https://example.com?q=$pageview"`
-            )
-            // Second mapping has no input overrides
-            expect(result.invocations[1].state.globals.inputs.headers).toEqual({
-                version: 'v=',
-            })
-            expect(result.invocations[1].state.globals.inputs.url).toMatchInlineSnapshot(
-                `"https://example.com/posthog-webhook"`
-            )
+            const res = await executor.execute(invocation)
+            expect(res.error).toBeUndefined()
+            expect(res.execResult).toBe('INITIAL_TOKEN_ABC')
         })
     })
 
@@ -649,7 +479,6 @@ describe('Hog Executor', () => {
                 },
                 error: undefined,
                 durationMs: 1,
-                waitedForThreadRelief: false,
             })
 
             const res = await executor.execute(createExampleInvocation(fn))
@@ -699,6 +528,30 @@ describe('Hog Executor', () => {
                   },
                 ]
             `)
+        })
+
+        it('falls back to person.id for distinct_id when event.distinct_id is empty (batch invocations)', async () => {
+            const fn = createHogFunction({
+                ...HOG_EXAMPLES.posthog_capture,
+                ...HOG_INPUTS_EXAMPLES.simple_fetch,
+                ...HOG_FILTERS_EXAMPLES.no_filters,
+            })
+
+            const globals = createHogExecutionGlobals({
+                groups: {},
+                event: {
+                    distinct_id: '',
+                } as any,
+                person: {
+                    id: 'person-uuid-123',
+                    name: 'Batch Person',
+                    url: 'http://localhost:8000/persons/1',
+                    properties: { email: 'batch@posthog.com' },
+                },
+            } as any)
+            const result = await executor.execute(createExampleInvocation(fn, globals))
+            expect(result?.capturedPostHogEvents).toHaveLength(1)
+            expect(result?.capturedPostHogEvents[0].distinct_id).toBe('person-uuid-123')
         })
 
         it('allows events that have already used their postHogCapture a maximum of 10 times', async () => {
@@ -770,7 +623,6 @@ describe('Hog Executor', () => {
                 },
                 error: undefined,
                 durationMs: 1,
-                waitedForThreadRelief: false,
             })
         }
 
@@ -785,79 +637,653 @@ describe('Hog Executor', () => {
                 { inputs: {} }
             )
 
-        it('postHogGetTicket queues internal fetch with correct params', async () => {
-            jest.spyOn(hub.teamManager, 'getTeam').mockResolvedValue({
-                id: 1,
-                api_token: 'test-api-token',
-            } as any)
+        const TICKET_UUID = '0198a5c1-2f6e-7c3a-9b41-b6d21c0aa111'
+        const requestModule = require('~/common/utils/request')
 
-            mockExecHogForAsyncFunction('postHogGetTicket', [{ ticket_id: 'test-ticket-123' }])
+        const mockInternalResponse = (status: number, body: unknown) => ({
+            status,
+            headers: {},
+            text: () => Promise.resolve(JSON.stringify(body)),
+            json: () => Promise.resolve(body),
+            dump: () => Promise.resolve(),
+        })
 
-            const result = await executor.execute(createTicketInvocation())
+        // In the test env the secret defaults on (mirroring Django), so the JWT path is the
+        // default; legacy tests opt out the same way an unprovisioned environment does.
+        const disableTicketJwt = () => {
+            ;(executor as any).deps.conversationsTicketsJwt = new ScopedServiceJwt(
+                PosthogJwtAudience.CONVERSATIONS_TICKETS,
+                ''
+            )
+        }
 
-            expect(result.invocation.queueParameters).toEqual({
-                type: 'fetch',
-                url: `${hub.SITE_URL}/api/conversations/external/ticket/test-ticket-123`,
-                method: 'GET',
-                headers: { Authorization: 'Bearer test-api-token' },
+        describe('scoped JWT path', () => {
+            it('postHogGetTicket mints a team+ticket pinned token for the internal route and needs no team secret', async () => {
+                const fetchSpy = jest
+                    .spyOn(requestModule, 'internalFetch')
+                    .mockResolvedValue(mockInternalResponse(200, { id: TICKET_UUID, status: 'new' }))
+                const getTeamSpy = jest.spyOn(hub.teamManager, 'getTeam')
+
+                mockExecHogForAsyncFunction('postHogGetTicket', [{ ticket_id: TICKET_UUID }])
+                const result = await executor.execute(createTicketInvocation())
+
+                expect(fetchSpy).toHaveBeenCalledTimes(1)
+                const [url, options] = fetchSpy.mock.calls[0] as unknown as [string, FetchOptions]
+                expect(url).toEqual(
+                    `${hub.INTERNAL_API_BASE_URL}/api/projects/1/internal/conversations/tickets/${TICKET_UUID}`
+                )
+                expect(options.method).toEqual('GET')
+
+                const headers = options.headers as Record<string, string>
+                const token = headers['Authorization'].replace('Bearer ', '')
+                const claims = new ScopedServiceJwt(
+                    PosthogJwtAudience.CONVERSATIONS_TICKETS,
+                    hub.CONVERSATIONS_TICKETS_JWT_SECRET
+                ).verify(token)
+                expect(claims.team_id).toEqual(1)
+                expect(claims.ticket_id).toEqual(TICKET_UUID)
+                expect(claims.exp! - claims.iat!).toEqual(5 * 60)
+
+                expect(result.invocation.state.vmState!.stack).toEqual([
+                    { status: 200, body: { id: TICKET_UUID, status: 'new' } },
+                ])
+                // No credential is needed or persisted: the team secret is never read and
+                // nothing lands in queueParameters (job rows stay free of auth material).
+                expect(getTeamSpy).not.toHaveBeenCalled()
+                expect(result.invocation.queueParameters).toBeUndefined()
+            })
+
+            it('postHogUpdateTicket forwards the updates body and workflow attribution header', async () => {
+                const fetchSpy = jest
+                    .spyOn(requestModule, 'internalFetch')
+                    .mockResolvedValue(mockInternalResponse(200, { ok: true }))
+
+                mockExecHogForAsyncFunction('postHogUpdateTicket', [
+                    { ticket_id: TICKET_UUID, updates: { status: 'resolved', priority: 'high' } },
+                ])
+                const invocation = createTicketInvocation()
+                ;(invocation as any).hogFlow = { id: 'flow-123' }
+                await executor.execute(invocation)
+
+                const [, options] = fetchSpy.mock.calls[0] as unknown as [string, FetchOptions]
+                expect(options.method).toEqual('PATCH')
+                expect(options.body).toEqual(JSON.stringify({ status: 'resolved', priority: 'high' }))
+                expect((options.headers as Record<string, string>)['X-PostHog-Hog-Flow-Id']).toEqual('flow-123')
+            })
+
+            it.each(['test-ticket-123', '../../../admin', `${TICKET_UUID}/extra`])(
+                'refuses a non-UUID ticket_id (%s) before any token is minted',
+                async (badTicketId) => {
+                    const fetchSpy = jest.spyOn(requestModule, 'internalFetch')
+
+                    mockExecHogForAsyncFunction('postHogGetTicket', [{ ticket_id: badTicketId }])
+                    const result = await executor.execute(createTicketInvocation())
+
+                    expect(result.error).toContain('must be a UUID')
+                    expect(fetchSpy).not.toHaveBeenCalled()
+                }
+            )
+
+            it('lowercases a mixed-case ticket_id for the URL and the claim', async () => {
+                const fetchSpy = jest
+                    .spyOn(requestModule, 'internalFetch')
+                    .mockResolvedValue(mockInternalResponse(200, { id: TICKET_UUID }))
+
+                mockExecHogForAsyncFunction('postHogGetTicket', [{ ticket_id: TICKET_UUID.toUpperCase() }])
+                await executor.execute(createTicketInvocation())
+
+                const [url, options] = fetchSpy.mock.calls[0] as unknown as [string, FetchOptions]
+                expect(url).toContain(`/tickets/${TICKET_UUID}`)
+                const headers = options.headers as Record<string, string>
+                const claims = new ScopedServiceJwt(
+                    PosthogJwtAudience.CONVERSATIONS_TICKETS,
+                    hub.CONVERSATIONS_TICKETS_JWT_SECRET
+                ).verify(headers['Authorization'].replace('Bearer ', ''))
+                expect(claims.ticket_id).toEqual(TICKET_UUID)
+            })
+
+            it('passes a 4xx through to the Hog response without retrying', async () => {
+                const fetchSpy = jest
+                    .spyOn(requestModule, 'internalFetch')
+                    .mockResolvedValue(mockInternalResponse(404, { error: 'Ticket not found' }))
+
+                mockExecHogForAsyncFunction('postHogGetTicket', [{ ticket_id: TICKET_UUID }])
+                const result = await executor.execute(createTicketInvocation())
+
+                expect(fetchSpy).toHaveBeenCalledTimes(1)
+                expect(result.invocation.state.vmState!.stack).toEqual([
+                    { status: 404, body: { error: 'Ticket not found' } },
+                ])
+            })
+
+            it('retries a dropped connection and returns the eventual response', async () => {
+                const fetchSpy = jest
+                    .spyOn(requestModule, 'internalFetch')
+                    .mockRejectedValueOnce(new Error('socket hang up'))
+                    .mockResolvedValue(mockInternalResponse(200, { id: TICKET_UUID }))
+
+                mockExecHogForAsyncFunction('postHogGetTicket', [{ ticket_id: TICKET_UUID }])
+                const result = await executor.execute(createTicketInvocation())
+
+                expect(fetchSpy).toHaveBeenCalledTimes(2)
+                expect(result.invocation.state.vmState!.stack).toEqual([{ status: 200, body: { id: TICKET_UUID } }])
+                expect(result.logs.some((log) => log.message.includes('Retrying'))).toBe(true)
+            })
+
+            it('pushes a status-500 response after exhausting connection retries', async () => {
+                const fetchSpy = jest
+                    .spyOn(requestModule, 'internalFetch')
+                    .mockRejectedValue(new Error('connect ECONNREFUSED'))
+
+                mockExecHogForAsyncFunction('postHogGetTicket', [{ ticket_id: TICKET_UUID }])
+                const result = await executor.execute(createTicketInvocation())
+
+                expect(fetchSpy).toHaveBeenCalledTimes(3)
+                const [pushed] = result.invocation.state.vmState!.stack as [{ status: number; body: string }]
+                expect(pushed.status).toEqual(500)
+                expect(pushed.body).toContain('ECONNREFUSED')
+            })
+
+            it('retries and then fails loudly when the body stream fails after a 200 header', async () => {
+                const fetchSpy = jest.spyOn(requestModule, 'internalFetch').mockResolvedValue({
+                    status: 200,
+                    headers: {},
+                    text: () => Promise.reject(new Error('other side closed')),
+                    json: () => Promise.reject(new Error('other side closed')),
+                    dump: () => Promise.resolve(),
+                })
+
+                mockExecHogForAsyncFunction('postHogGetTicket', [{ ticket_id: TICKET_UUID }])
+                const result = await executor.execute(createTicketInvocation())
+
+                // A 200 header with an unreadable body is not a success: it retries like any
+                // other failed attempt instead of silently returning an empty ticket.
+                expect(fetchSpy).toHaveBeenCalledTimes(3)
+                const [pushed] = result.invocation.state.vmState!.stack as [{ status: number; body: string }]
+                expect(pushed.status).toEqual(500)
+                expect(pushed.body).toContain('other side closed')
+            })
+
+            it('preserves the upstream body on the final attempt of a retriable status', async () => {
+                const fetchSpy = jest
+                    .spyOn(requestModule, 'internalFetch')
+                    .mockResolvedValue(mockInternalResponse(503, { error: 'database unavailable' }))
+
+                mockExecHogForAsyncFunction('postHogGetTicket', [{ ticket_id: TICKET_UUID }])
+                const result = await executor.execute(createTicketInvocation())
+
+                expect(fetchSpy).toHaveBeenCalledTimes(3)
+                expect(result.invocation.state.vmState!.stack).toEqual([
+                    { status: 503, body: { error: 'database unavailable' } },
+                ])
+            })
+
+            it('retries a transient 500 the same way the legacy fetch path does', async () => {
+                const fetchSpy = jest
+                    .spyOn(requestModule, 'internalFetch')
+                    .mockResolvedValueOnce(mockInternalResponse(500, { error: 'boom' }))
+                    .mockResolvedValue(mockInternalResponse(200, { id: TICKET_UUID }))
+
+                mockExecHogForAsyncFunction('postHogGetTicket', [{ ticket_id: TICKET_UUID }])
+                const result = await executor.execute(createTicketInvocation())
+
+                expect(fetchSpy).toHaveBeenCalledTimes(2)
+                expect(result.invocation.state.vmState!.stack).toEqual([{ status: 200, body: { id: TICKET_UUID } }])
+            })
+
+            it('rejects a second inline ticket call once the per-invocation async budget is spent', async () => {
+                const fetchSpy = jest
+                    .spyOn(requestModule, 'internalFetch')
+                    .mockResolvedValue(mockInternalResponse(200, { id: TICKET_UUID }))
+
+                const bytecode = await compileHog(`
+                    let a := postHogGetTicket({'ticket_id': '${TICKET_UUID}'})
+                    let b := postHogGetTicket({'ticket_id': '${TICKET_UUID}'})
+                    return b
+                `)
+                const invocation = createExampleInvocation(createHogFunction({ bytecode }), { inputs: {} })
+
+                const result = await executor.executeWithAsyncFunctions(invocation)
+
+                // Neither ticket call sets queueParameters, so without a shared budget both
+                // would run inline in the same worker slot regardless of maxAsyncFunctions.
+                expect(fetchSpy).toHaveBeenCalledTimes(1)
+                expect(result.error).toContain('Max async functions reached')
+                expect(result.finished).toBe(true)
             })
         })
 
-        it('postHogUpdateTicket queues internal fetch with correct params', async () => {
-            jest.spyOn(hub.teamManager, 'getTeam').mockResolvedValue({
-                id: 1,
-                api_token: 'test-api-token',
-            } as any)
+        describe('legacy secret_api_token fallback (JWT secret unprovisioned)', () => {
+            it('postHogGetTicket queues the external fetch with the team secret', async () => {
+                disableTicketJwt()
+                jest.spyOn(hub.teamManager, 'getTeam').mockResolvedValue({
+                    id: 1,
+                    secret_api_token: 'test-secret-token',
+                } as any)
 
-            mockExecHogForAsyncFunction('postHogUpdateTicket', [
-                { ticket_id: 'test-ticket-456', updates: { status: 'resolved', priority: 'high' } },
-            ])
+                mockExecHogForAsyncFunction('postHogGetTicket', [{ ticket_id: 'test-ticket-123' }])
+
+                const result = await executor.execute(createTicketInvocation())
+
+                expect(result.invocation.queueParameters).toEqual({
+                    type: 'fetch',
+                    url: `${hub.SITE_URL}/api/conversations/external/ticket/test-ticket-123`,
+                    method: 'GET',
+                    headers: { Authorization: 'Bearer test-secret-token' },
+                })
+            })
+
+            it('postHogUpdateTicket queues the external fetch with the team secret', async () => {
+                disableTicketJwt()
+                jest.spyOn(hub.teamManager, 'getTeam').mockResolvedValue({
+                    id: 1,
+                    secret_api_token: 'test-secret-token',
+                } as any)
+
+                mockExecHogForAsyncFunction('postHogUpdateTicket', [
+                    { ticket_id: 'test-ticket-456', updates: { status: 'resolved', priority: 'high' } },
+                ])
+
+                const result = await executor.execute(createTicketInvocation())
+
+                expect(result.invocation.queueParameters).toEqual({
+                    type: 'fetch',
+                    url: `${hub.SITE_URL}/api/conversations/external/ticket/test-ticket-456`,
+                    method: 'PATCH',
+                    body: JSON.stringify({ status: 'resolved', priority: 'high' }),
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: 'Bearer test-secret-token',
+                    },
+                })
+            })
+
+            it('postHogGetTicket errors when team is not found', async () => {
+                disableTicketJwt()
+                jest.spyOn(hub.teamManager, 'getTeam').mockResolvedValue(null)
+
+                mockExecHogForAsyncFunction('postHogGetTicket', [{ ticket_id: 'test-ticket-123' }])
+
+                const result = await executor.execute(createTicketInvocation())
+                expect(result.error).toContain('Team 1 not found')
+            })
+
+            it.each([
+                ['postHogGetTicket', { ticket_id: 'test-ticket-123' }],
+                ['postHogUpdateTicket', { ticket_id: 'test-ticket-456', updates: { status: 'new' } }],
+            ])('%s points at the setup step when the team has no secret API token', async (name, args) => {
+                disableTicketJwt()
+                jest.spyOn(hub.teamManager, 'getTeam').mockResolvedValue({
+                    id: 1,
+                    secret_api_token: null,
+                } as any)
+
+                mockExecHogForAsyncFunction(name, [args])
+
+                const result = await executor.execute(createTicketInvocation())
+                // Nothing provisions this token, so the message has to name the setup step rather
+                // than the field - it reaches the customer verbatim in the workflow logs. Square
+                // brackets would be parsed as entity chips by the log viewer and swallowed.
+                expect(result.error).toContain('This project has no secret API key')
+                expect(result.error).toContain('ticket workflow actions')
+                expect(result.error).toContain('Settings > Support > Secret API key')
+                expect(result.error).not.toContain('[')
+            })
+
+            it('captures exception with team_id when the ticket secret API token is missing', async () => {
+                disableTicketJwt()
+                jest.spyOn(hub.teamManager, 'getTeam').mockResolvedValue({
+                    id: 1,
+                    secret_api_token: null,
+                } as any)
+
+                const posthogModule = require('~/common/utils/posthog')
+                const captureExceptionSpy = jest.spyOn(posthogModule, 'captureException')
+
+                mockExecHogForAsyncFunction('postHogUpdateTicket', [
+                    { ticket_id: 'test-ticket-456', updates: { status: 'new' } },
+                ])
+                await executor.execute(createTicketInvocation())
+
+                expect(captureExceptionSpy).toHaveBeenCalledWith(
+                    expect.any(Error),
+                    expect.objectContaining({
+                        tags: expect.objectContaining({ team_id: 1, function: 'postHogUpdateTicket' }),
+                    })
+                )
+            })
+        })
+
+        it.each(['postHogGetTicket', 'postHogUpdateTicket'])('%s errors when ticket_id is missing', async (name) => {
+            mockExecHogForAsyncFunction(name, [name === 'postHogUpdateTicket' ? { updates: { status: 'new' } } : {}])
 
             const result = await executor.execute(createTicketInvocation())
+            expect(result.error).toContain("missing 'ticket_id'")
+        })
+    })
 
-            expect(result.invocation.queueParameters).toEqual({
-                type: 'fetch',
-                url: `${hub.SITE_URL}/api/conversations/external/ticket/test-ticket-456`,
-                method: 'PATCH',
-                body: JSON.stringify({ status: 'resolved', priority: 'high' }),
-                headers: {
-                    'Content-Type': 'application/json',
-                    Authorization: 'Bearer test-api-token',
+    describe('account workflow actions', () => {
+        const mockExecHogForAsyncFunction = (asyncFunctionName: string, asyncFunctionArgs: any[]) => {
+            const hogExecModule = require('../utils/hog-exec')
+            jest.spyOn(hogExecModule, 'execHog').mockResolvedValue({
+                execResult: {
+                    finished: false,
+                    asyncFunctionName,
+                    asyncFunctionArgs,
+                    state: { syncDuration: 1, maxMemUsed: 100, ops: 10, stack: [] },
                 },
+                error: undefined,
+                durationMs: 1,
+            })
+        }
+
+        const createAccountInvocation = () =>
+            createExampleInvocation(
+                createHogFunction({
+                    ...HOG_EXAMPLES.simple_fetch,
+                    ...HOG_INPUTS_EXAMPLES.simple_fetch,
+                    ...HOG_FILTERS_EXAMPLES.no_filters,
+                }),
+                { inputs: {} }
+            )
+
+        const requestModule = require('~/common/utils/request')
+
+        const mockInternalResponse = (status: number, body: unknown) => ({
+            status,
+            headers: {},
+            text: () => Promise.resolve(JSON.stringify(body)),
+            json: () => Promise.resolve(body),
+            dump: () => Promise.resolve(),
+        })
+
+        const verifyAccountClaims = (headers: Record<string, string>) =>
+            new ScopedServiceJwt(
+                PosthogJwtAudience.CUSTOMER_ANALYTICS_ACCOUNTS,
+                hub.CUSTOMER_ANALYTICS_ACCOUNTS_JWT_SECRET
+            ).verify(headers['Authorization'].replace('Bearer ', ''))
+
+        // In the test env the secret defaults on (mirroring Django), so the JWT path is the
+        // default; legacy tests opt out the same way an unprovisioned environment does.
+        const disableAccountJwt = () => {
+            ;(executor as any).deps.customerAnalyticsAccountsJwt = new ScopedServiceJwt(
+                PosthogJwtAudience.CUSTOMER_ANALYTICS_ACCOUNTS,
+                ''
+            )
+        }
+
+        describe('scoped JWT path', () => {
+            // Transport behavior (retries, 4xx pass-through, async budget) is shared with the
+            // ticket actions and covered by their suite; these pin the account-specific wiring.
+
+            it('postHogGetAccount mints a team+account pinned token for the internal route and needs no team secret', async () => {
+                const fetchSpy = jest
+                    .spyOn(requestModule, 'internalFetch')
+                    .mockResolvedValue(mockInternalResponse(200, { external_id: 'acme corp/1', name: 'Acme' }))
+                const getTeamSpy = jest.spyOn(hub.teamManager, 'getTeam')
+
+                mockExecHogForAsyncFunction('postHogGetAccount', [{ external_id: 'acme corp/1' }])
+                const result = await executor.execute(createAccountInvocation())
+
+                expect(fetchSpy).toHaveBeenCalledTimes(1)
+                const [url, options] = fetchSpy.mock.calls[0] as unknown as [string, FetchOptions]
+                // URL-encoded in the query string; the claim carries the raw value Django reads
+                // back from the decoded query param.
+                expect(url).toEqual(
+                    `${hub.INTERNAL_API_BASE_URL}/api/projects/1/internal/customer_analytics/account?external_id=acme%20corp%2F1`
+                )
+                expect(options.method).toEqual('GET')
+
+                const claims = verifyAccountClaims(options.headers as Record<string, string>)
+                expect(claims.team_id).toEqual(1)
+                expect(claims.external_id).toEqual('acme corp/1')
+                expect(claims.exp! - claims.iat!).toEqual(5 * 60)
+
+                expect(result.invocation.state.vmState!.stack).toEqual([
+                    { status: 200, body: { external_id: 'acme corp/1', name: 'Acme' } },
+                ])
+                // No credential is needed or persisted: the team secret is never read and
+                // nothing lands in queueParameters (job rows stay free of auth material).
+                expect(getTeamSpy).not.toHaveBeenCalled()
+                expect(result.invocation.queueParameters).toBeUndefined()
+            })
+
+            it('postHogUpdateAccount pins the claimed external_id over the updates body', async () => {
+                const fetchSpy = jest
+                    .spyOn(requestModule, 'internalFetch')
+                    .mockResolvedValue(mockInternalResponse(200, { ok: true }))
+
+                mockExecHogForAsyncFunction('postHogUpdateAccount', [
+                    // A Hog-provided updates.external_id must not redirect the write away from
+                    // the account the token is pinned to.
+                    { external_id: 'acme-1', updates: { tags: ['enterprise'], external_id: 'other-account' } },
+                ])
+                const invocation = createAccountInvocation()
+                ;(invocation as any).hogFlow = { id: 'flow-123' }
+                await executor.execute(invocation)
+
+                const [url, options] = fetchSpy.mock.calls[0] as unknown as [string, FetchOptions]
+                expect(url).toEqual(`${hub.INTERNAL_API_BASE_URL}/api/projects/1/internal/customer_analytics/account`)
+                expect(options.method).toEqual('PATCH')
+                expect(options.body).toEqual(JSON.stringify({ tags: ['enterprise'], external_id: 'acme-1' }))
+                expect((options.headers as Record<string, string>)['X-PostHog-Hog-Flow-Id']).toEqual('flow-123')
+                const claims = verifyAccountClaims(options.headers as Record<string, string>)
+                expect(claims.external_id).toEqual('acme-1')
+            })
+
+            it('postHogSetAccountProperties sends an explicit property clear as API null', async () => {
+                const fetchSpy = jest
+                    .spyOn(requestModule, 'internalFetch')
+                    .mockResolvedValue(mockInternalResponse(200, { ok: true }))
+
+                mockExecHogForAsyncFunction('postHogSetAccountProperties', [
+                    { external_id: 'acme-1', properties: { 'def-1': { __posthog_clear_property: true } } },
+                ])
+                await executor.execute(createAccountInvocation())
+
+                const [url, options] = fetchSpy.mock.calls[0] as unknown as [string, FetchOptions]
+                expect(url).toEqual(
+                    `${hub.INTERNAL_API_BASE_URL}/api/projects/1/internal/customer_analytics/account/custom_property_values`
+                )
+                expect(options.method).toEqual('PATCH')
+                expect(options.body).toEqual(JSON.stringify({ external_id: 'acme-1', properties: { 'def-1': null } }))
+            })
+
+            it('postHogCreateAccount posts the claimed external_id with workflow attribution', async () => {
+                const fetchSpy = jest
+                    .spyOn(requestModule, 'internalFetch')
+                    .mockResolvedValue(mockInternalResponse(201, { external_id: 'acme-new' }))
+
+                mockExecHogForAsyncFunction('postHogCreateAccount', [{ external_id: 'acme-new' }])
+                const invocation = createAccountInvocation()
+                ;(invocation as any).hogFlow = { id: 'flow-123' }
+                const result = await executor.execute(invocation)
+
+                const [url, options] = fetchSpy.mock.calls[0] as unknown as [string, FetchOptions]
+                expect(url).toEqual(`${hub.INTERNAL_API_BASE_URL}/api/projects/1/internal/customer_analytics/account`)
+                expect(options.method).toEqual('POST')
+                expect(options.body).toEqual(JSON.stringify({ external_id: 'acme-new' }))
+                expect((options.headers as Record<string, string>)['X-PostHog-Hog-Flow-Id']).toEqual('flow-123')
+                const claims = verifyAccountClaims(options.headers as Record<string, string>)
+                expect(claims.external_id).toEqual('acme-new')
+                expect(result.invocation.state.vmState!.stack).toEqual([
+                    { status: 201, body: { external_id: 'acme-new' } },
+                ])
             })
         })
 
-        it('postHogGetTicket errors when ticket_id is missing', async () => {
-            jest.spyOn(hub.teamManager, 'getTeam').mockResolvedValue({
-                id: 1,
-                api_token: 'test-api-token',
-            } as any)
+        describe('legacy secret_api_token fallback (JWT secret unprovisioned)', () => {
+            it('postHogGetAccount queues external fetch with the external_id query param', async () => {
+                disableAccountJwt()
+                jest.spyOn(hub.teamManager, 'getTeam').mockResolvedValue({
+                    id: 1,
+                    secret_api_token: 'test-secret-token',
+                } as any)
 
-            mockExecHogForAsyncFunction('postHogGetTicket', [{}])
+                mockExecHogForAsyncFunction('postHogGetAccount', [{ external_id: 'acme corp/1' }])
 
-            const result = await executor.execute(createTicketInvocation())
-            expect(result.error).toContain("missing 'ticket_id'")
+                const result = await executor.execute(createAccountInvocation())
+
+                expect(result.invocation.queueParameters).toEqual({
+                    type: 'fetch',
+                    url: `${hub.SITE_URL}/api/customer_analytics/external/account?external_id=acme%20corp%2F1`,
+                    method: 'GET',
+                    headers: { Authorization: 'Bearer test-secret-token' },
+                })
+            })
+
+            it('postHogGetAccount errors when team is not found', async () => {
+                disableAccountJwt()
+                jest.spyOn(hub.teamManager, 'getTeam').mockResolvedValue(null)
+
+                mockExecHogForAsyncFunction('postHogGetAccount', [{ external_id: 'acme-1' }])
+
+                const result = await executor.execute(createAccountInvocation())
+                expect(result.error).toContain('Team 1 not found')
+            })
+
+            it('postHogGetAccount errors when the team has no secret API token', async () => {
+                disableAccountJwt()
+                jest.spyOn(hub.teamManager, 'getTeam').mockResolvedValue({
+                    id: 1,
+                    secret_api_token: null,
+                } as any)
+
+                mockExecHogForAsyncFunction('postHogGetAccount', [{ external_id: 'acme-1' }])
+
+                const result = await executor.execute(createAccountInvocation())
+                // The message reaches the customer verbatim in the workflow logs, so it has to name
+                // the setup step rather than the field.
+                expect(result.error).toContain('This project has no secret API key')
+                expect(result.error).toContain('account workflow actions')
+                expect(result.error).toContain('Settings > Support > Secret API key')
+            })
+
+            it('captures exception with team_id when secret API token is missing', async () => {
+                disableAccountJwt()
+                jest.spyOn(hub.teamManager, 'getTeam').mockResolvedValue({
+                    id: 1,
+                    secret_api_token: null,
+                } as any)
+
+                const posthogModule = require('~/common/utils/posthog')
+                const captureExceptionSpy = jest.spyOn(posthogModule, 'captureException')
+
+                mockExecHogForAsyncFunction('postHogGetAccount', [{ external_id: 'acme-1' }])
+                await executor.execute(createAccountInvocation())
+
+                expect(captureExceptionSpy).toHaveBeenCalledWith(
+                    expect.any(Error),
+                    expect.objectContaining({ tags: expect.objectContaining({ team_id: 1 }) })
+                )
+            })
+
+            it('does not capture exception when queue is set up successfully', async () => {
+                disableAccountJwt()
+                jest.spyOn(hub.teamManager, 'getTeam').mockResolvedValue({
+                    id: 1,
+                    secret_api_token: 'test-secret-token',
+                } as any)
+
+                const posthogModule = require('~/common/utils/posthog')
+                const captureExceptionSpy = jest.spyOn(posthogModule, 'captureException')
+
+                mockExecHogForAsyncFunction('postHogGetAccount', [{ external_id: 'acme-1' }])
+                await executor.execute(createAccountInvocation())
+
+                expect(captureExceptionSpy).not.toHaveBeenCalled()
+            })
+
+            it('rejects a null custom property value rather than queueing a clear', async () => {
+                disableAccountJwt()
+                const getTeamSpy = jest.spyOn(hub.teamManager, 'getTeam')
+
+                mockExecHogForAsyncFunction('postHogSetAccountProperties', [
+                    { external_id: 'acme-1', properties: { 'def-1': null } },
+                ])
+                const result = await executor.execute(createAccountInvocation())
+
+                expect(result.error).toContain("received null for property 'def-1'")
+                expect(result.error).toContain('Use Clear property in the workflow editor')
+                expect(result.invocation.queueParameters).toBeUndefined()
+                expect(getTeamSpy).not.toHaveBeenCalled()
+            })
+
+            it('postHogUpdateAccount queues a PATCH with external_id merged into the body', async () => {
+                disableAccountJwt()
+                jest.spyOn(hub.teamManager, 'getTeam').mockResolvedValue({
+                    id: 1,
+                    secret_api_token: 'test-secret-token',
+                } as any)
+
+                mockExecHogForAsyncFunction('postHogUpdateAccount', [
+                    { external_id: 'acme-1', updates: { tags: ['enterprise'], tags_mode: 'add' } },
+                ])
+
+                const result = await executor.execute(createAccountInvocation())
+
+                expect(result.invocation.queueParameters).toEqual({
+                    type: 'fetch',
+                    url: `${hub.SITE_URL}/api/customer_analytics/external/account`,
+                    method: 'PATCH',
+                    body: JSON.stringify({ external_id: 'acme-1', tags: ['enterprise'], tags_mode: 'add' }),
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: 'Bearer test-secret-token',
+                    },
+                })
+            })
         })
 
-        it('postHogUpdateTicket errors when ticket_id is missing', async () => {
-            jest.spyOn(hub.teamManager, 'getTeam').mockResolvedValue({
-                id: 1,
-                api_token: 'test-api-token',
-            } as any)
+        it.each(['postHogGetAccount', 'postHogUpdateAccount', 'postHogSetAccountProperties', 'postHogCreateAccount'])(
+            '%s errors when external_id is missing',
+            async (name) => {
+                mockExecHogForAsyncFunction(name, [{}])
 
-            mockExecHogForAsyncFunction('postHogUpdateTicket', [{ updates: { status: 'resolved' } }])
+                const result = await executor.execute(createAccountInvocation())
+                expect(result.error).toContain("missing 'external_id'")
+            }
+        )
+    })
 
-            const result = await executor.execute(createTicketInvocation())
-            expect(result.error).toContain("missing 'ticket_id'")
+    describe('produceToWarehouseWebhooks', () => {
+        const buildInvocation = async (code: string): Promise<CyclotronJobInvocationHogFunction> => {
+            const bytecode = await compileHog(code)
+            return createExampleInvocation(createHogFunction({ bytecode }), { inputs: {} })
+        }
+
+        // Regression test for a stack-empty crash when an async function with no
+        // meaningful return value is called as an expression statement.
+        // The bytecode compiler emits a trailing POP after every expression
+        // statement, but the generic async function path in execute() never pushed
+        // a return value onto the resumed VM stack — so when the cyclotron worker
+        // resumed the invocation, the POP fired against an empty stack and raised
+        // "Invalid HogQL bytecode, stack is empty, can not pop".
+        it('finishes cleanly when called as an expression statement', async () => {
+            const invocation = await buildInvocation(`produceToWarehouseWebhooks({'foo': 'bar'}, 'test-schema-id')`)
+
+            const result = await executor.executeWithAsyncFunctions(invocation)
+
+            expect(result.error).toBeUndefined()
+            expect(result.finished).toBe(true)
+            expect(result.warehouseWebhookPayloads).toHaveLength(1)
+            expect(result.warehouseWebhookPayloads[0]).toMatchObject({
+                schema_id: 'test-schema-id',
+                payload: { foo: 'bar' },
+            })
         })
 
-        it('postHogGetTicket errors when team is not found', async () => {
-            jest.spyOn(hub.teamManager, 'getTeam').mockResolvedValue(null)
+        it('finishes cleanly when followed by another statement', async () => {
+            const invocation = await buildInvocation(
+                `produceToWarehouseWebhooks({'foo': 'bar'}, 'test-schema-id')
+                 print('after produce')`
+            )
 
-            mockExecHogForAsyncFunction('postHogGetTicket', [{ ticket_id: 'test-ticket-123' }])
+            const result = await executor.executeWithAsyncFunctions(invocation)
 
-            const result = await executor.execute(createTicketInvocation())
-            expect(result.error).toContain('Team 1 not found')
+            expect(result.error).toBeUndefined()
+            expect(result.finished).toBe(true)
+            expect(result.warehouseWebhookPayloads).toHaveLength(1)
         })
     })
 
@@ -885,7 +1311,6 @@ describe('Hog Executor', () => {
         let server: any
         let baseUrl: string
         const mockRequest = jest.fn()
-        let timeoutHandle: NodeJS.Timeout | undefined
         let hogFunction: HogFunctionType
 
         beforeAll(async () => {
@@ -908,10 +1333,6 @@ describe('Hog Executor', () => {
                 ...HOG_INPUTS_EXAMPLES.simple_fetch,
                 ...HOG_FILTERS_EXAMPLES.no_filters,
             })
-        })
-
-        afterEach(() => {
-            clearTimeout(timeoutHandle)
         })
 
         afterAll(async () => {
@@ -1014,7 +1435,7 @@ describe('Hog Executor', () => {
             // Should be scheduled for retry
             expect(result.invocation.state.attempts).toBe(1)
             expect(result.logs.map((log) => log.message)).toEqual([
-                'HTTP fetch failed on attempt 1 with status code 500. Retrying in 1500ms.',
+                'HTTP fetch failed on attempt 1 with status code 500. Retrying.',
             ])
             expect(result.invocation.queuePriority).toBe(1) // Priority decreased
             expect(result.invocation.queueScheduledAt?.toISO()).toMatchInlineSnapshot(`"2025-01-01T00:00:01.500Z"`)
@@ -1024,7 +1445,7 @@ describe('Hog Executor', () => {
             result = await executor.executeFetch(result.invocation)
             expect(result.invocation.state.attempts).toBe(2)
             expect(result.logs.map((log) => log.message)).toEqual([
-                'HTTP fetch failed on attempt 2 with status code 500. Retrying in 2500ms.',
+                'HTTP fetch failed on attempt 2 with status code 500. Retrying.',
             ])
             expect(result.invocation.queuePriority).toBe(2) // Priority decreased
             expect(result.invocation.queueScheduledAt?.toISO()).toMatchInlineSnapshot(`"2025-01-01T00:00:02.500Z"`)
@@ -1032,7 +1453,7 @@ describe('Hog Executor', () => {
             // Execute the final retry
             result = await executor.executeFetch(result.invocation)
             expect(result.logs.map((log) => log.message)).toEqual([
-                'HTTP fetch failed on attempt 3 with status code 500. Retrying in 3500ms.',
+                'HTTP fetch failed on attempt 3 with status code 500.',
             ])
             // All values reset due to no longer retrying
             expect(result.invocation.state.attempts).toBe(0)
@@ -1061,7 +1482,7 @@ describe('Hog Executor', () => {
                 method: 'GET',
             })
 
-            const maxRetries = hub.CDP_FETCH_RETRIES
+            const maxRetries = executor['config'].fetchRetries
             let result = await executor.executeFetch(invocation)
 
             for (let attempt = 1; attempt < maxRetries; attempt++) {
@@ -1074,6 +1495,336 @@ describe('Hog Executor', () => {
             expect(result.error).toBeInstanceOf(Error)
             expect(result.error.message).toContain(`HTTP fetch failed on attempt ${maxRetries}`)
             expect(result.error.message).toContain('with status code 500')
+            expect(result.invocation.queueScheduledAt).toBeUndefined()
+        })
+
+        describe('aws_sigv4', () => {
+            // `secret: true` HogFunction inputs land in `encrypted_inputs` after
+            // Django's `move_secret_inputs` runs on save. The Node manager decrypts
+            // `encrypted_inputs` in memory before the executor sees the function, so
+            // by the time we reach the fetch path it's a plaintext map keyed by
+            // input name. Seed *that* field — not `inputs` — so the tests mirror the
+            // production data shape for the Kinesis template.
+            const seedAwsCredentialInputs = (invocation: CyclotronJobInvocationHogFunction) => {
+                invocation.hogFunction.encrypted_inputs = {
+                    ...(invocation.hogFunction.encrypted_inputs ?? {}),
+                    aws_access_key_id: { value: 'AKIDEXAMPLE' },
+                    aws_secret_access_key: { value: 'wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY' },
+                } as any
+            }
+
+            const sigv4Refs = {
+                service: 'kinesis',
+                region: 'us-east-1',
+                access_key_id_input: 'aws_access_key_id',
+                secret_access_key_input: 'aws_secret_access_key',
+            }
+
+            it('signs the request and Authorization header arrives at the upstream', async () => {
+                let receivedAuth: string | undefined
+                let receivedAmzDate: string | undefined
+                mockRequest.mockImplementation((req: any, res: any) => {
+                    receivedAuth = req.headers.authorization
+                    receivedAmzDate = req.headers['x-amz-date']
+                    res.writeHead(200, { 'Content-Type': 'text/plain' })
+                    res.end('ok')
+                })
+
+                const invocation = await createFetchInvocation({
+                    url: `${baseUrl}/`,
+                    method: 'POST',
+                    body: '{}',
+                    headers: { 'Content-Type': 'application/x-amz-json-1.1' },
+                    aws_sigv4: sigv4Refs,
+                })
+                seedAwsCredentialInputs(invocation)
+
+                await executor.executeFetch(invocation)
+
+                expect(receivedAmzDate).toBe('20250101T000000Z')
+                expect(receivedAuth).toMatch(
+                    /^AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE\/20250101\/us-east-1\/kinesis\/aws4_request, SignedHeaders=[a-z0-9;-]+, Signature=[a-f0-9]{64}$/
+                )
+            })
+
+            // Customer impact this prevents: the original bug ticket had a request
+            // signed at T, queued behind a timed-out attempt, then retried >5 min
+            // later — AWS rejected the retry with InvalidSignatureException because
+            // the X-Amz-Date inside the Authorization no longer matched server time.
+            it('produces a fresh signature on retry instead of reusing the original', async () => {
+                const receivedAuthHeaders: string[] = []
+                const receivedAmzDates: string[] = []
+                let callCount = 0
+                mockRequest.mockImplementation((req: any, res: any) => {
+                    receivedAuthHeaders.push(req.headers.authorization)
+                    receivedAmzDates.push(req.headers['x-amz-date'])
+                    callCount++
+                    if (callCount === 1) {
+                        res.writeHead(500, { 'Content-Type': 'text/plain' })
+                        res.end('first attempt fails')
+                    } else {
+                        res.writeHead(200, { 'Content-Type': 'text/plain' })
+                        res.end('second attempt ok')
+                    }
+                })
+
+                const invocation = await createFetchInvocation({
+                    url: `${baseUrl}/`,
+                    method: 'POST',
+                    body: '{}',
+                    headers: { 'Content-Type': 'application/x-amz-json-1.1' },
+                    aws_sigv4: sigv4Refs,
+                })
+                seedAwsCredentialInputs(invocation)
+
+                let result = await executor.executeFetch(invocation)
+                expect(result.invocation.state.attempts).toBe(1)
+
+                // Simulate the cyclotron queue + backoff: by the time the retry
+                // actually runs, >6 minutes have passed. With the old "sign once
+                // in Hog" path this would push the signature past AWS's 5-minute
+                // window and the retry would 400 with InvalidSignatureException.
+                const retryTime = DateTime.fromObject({ year: 2025, month: 1, day: 1 }, { zone: 'UTC' }).plus({
+                    minutes: 6,
+                })
+                jest.spyOn(Date, 'now').mockReturnValue(retryTime.toMillis())
+
+                result = await executor.executeFetch(result.invocation)
+
+                expect(receivedAmzDates[0]).toBe('20250101T000000Z')
+                expect(receivedAmzDates[1]).toBe('20250101T000600Z')
+                expect(receivedAuthHeaders[0]).not.toBe(receivedAuthHeaders[1])
+                expect(result.error).toBeUndefined()
+            })
+
+            // Defense in depth: queue payloads should never carry a stale
+            // Authorization, but if one ever leaks in (e.g. through a custom
+            // template that sets it directly), it must not be used.
+            it('overwrites any stale Authorization header sitting in the queue payload', async () => {
+                let receivedAuth: string | undefined
+                mockRequest.mockImplementation((req: any, res: any) => {
+                    receivedAuth = req.headers.authorization
+                    res.writeHead(200, { 'Content-Type': 'text/plain' })
+                    res.end('ok')
+                })
+
+                const invocation = await createFetchInvocation({
+                    url: `${baseUrl}/`,
+                    method: 'POST',
+                    body: '{}',
+                    headers: {
+                        'Content-Type': 'application/x-amz-json-1.1',
+                        Authorization: 'AWS4-HMAC-SHA256 Credential=STALE/19700101/us-east-1/kinesis/aws4_request, ...',
+                        'X-Amz-Date': '19700101T000000Z',
+                    },
+                    aws_sigv4: sigv4Refs,
+                })
+                seedAwsCredentialInputs(invocation)
+
+                await executor.executeFetch(invocation)
+
+                expect(receivedAuth).not.toContain('STALE')
+                expect(receivedAuth).toContain('AKIDEXAMPLE/20250101/us-east-1/kinesis/aws4_request')
+            })
+
+            // Defense in depth for an unusual case: if a custom template wires
+            // up the credential as a non-secret input (`secret: false`), the value
+            // will live on `inputs` rather than `encrypted_inputs`. The lookup
+            // must fall through to `inputs` so signing still works.
+            it('falls back to plaintext inputs when encrypted_inputs does not carry the credential', async () => {
+                let receivedAuth: string | undefined
+                mockRequest.mockImplementation((req: any, res: any) => {
+                    receivedAuth = req.headers.authorization
+                    res.writeHead(200, { 'Content-Type': 'text/plain' })
+                    res.end('ok')
+                })
+
+                const invocation = await createFetchInvocation({
+                    url: `${baseUrl}/`,
+                    method: 'POST',
+                    body: '{}',
+                    headers: { 'Content-Type': 'application/x-amz-json-1.1' },
+                    aws_sigv4: sigv4Refs,
+                })
+                invocation.hogFunction.inputs = {
+                    ...(invocation.hogFunction.inputs ?? {}),
+                    aws_access_key_id: { value: 'AKIDEXAMPLE' },
+                    aws_secret_access_key: { value: 'wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY' },
+                } as any
+
+                await executor.executeFetch(invocation)
+
+                expect(receivedAuth).toContain('AKIDEXAMPLE/20250101/us-east-1/kinesis/aws4_request')
+            })
+
+            // If the input referenced by `*_input` is missing or non-string we must
+            // NOT fall through and ship an unsigned request to AWS — that'd 403 and
+            // potentially leak the request body in error logs.
+            it('errors loudly when the referenced credential input is missing', async () => {
+                mockRequest.mockImplementation((req: any, res: any) => {
+                    res.writeHead(200, { 'Content-Type': 'text/plain' })
+                    res.end('ok')
+                })
+
+                const invocation = await createFetchInvocation({
+                    url: `${baseUrl}/`,
+                    method: 'POST',
+                    body: '{}',
+                    headers: { 'Content-Type': 'application/x-amz-json-1.1' },
+                    aws_sigv4: sigv4Refs,
+                })
+                // Intentionally do NOT seed inputs.
+
+                const result = await executor.executeFetch(invocation)
+
+                expect(mockRequest).not.toHaveBeenCalled()
+                expect(result.error).toBeInstanceOf(Error)
+                expect(result.error.message).toContain('AWS SigV4 signing failed')
+                expect(result.error.message).toContain('aws_access_key_id')
+                expect(result.error.message).toContain('aws_secret_access_key')
+            })
+        })
+
+        describe('standard_webhooks', () => {
+            // Secret from the Standard Webhooks spec's reference example. The tests
+            // recompute the expected signature with the base64-decoded key, exactly
+            // as a receiver's verification library would.
+            const KEY = Buffer.from('MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw', 'base64')
+            const BODY = '{"test": 2432232314}'
+            // Shaped like what the fetch async function puts on the queue payload.
+            const SIGNING_REFS = {
+                secret_input: 'signing_secret',
+                webhook_id: '4f6c9f2a-5b1e-4f5b-9d3c-2a7e8c1d0b64',
+            }
+
+            const seedSigningSecretInput = (invocation: CyclotronJobInvocationHogFunction) => {
+                invocation.hogFunction.encrypted_inputs = {
+                    ...(invocation.hogFunction.encrypted_inputs ?? {}),
+                    signing_secret: { value: 'whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw' },
+                } as any
+            }
+
+            const expectedSignature = (webhookId: string, timestamp: string): string =>
+                `v1,${createHmac('sha256', KEY).update(`${webhookId}.${timestamp}.${BODY}`).digest('base64')}`
+
+            it('signs the request so the reference verification succeeds upstream', async () => {
+                let receivedId: string | undefined
+                let receivedTimestamp: string | undefined
+                let receivedSignature: string | undefined
+                mockRequest.mockImplementation((req: any, res: any) => {
+                    receivedId = req.headers['webhook-id']
+                    receivedTimestamp = req.headers['webhook-timestamp']
+                    receivedSignature = req.headers['webhook-signature']
+                    res.writeHead(200, { 'Content-Type': 'text/plain' })
+                    res.end('ok')
+                })
+
+                const invocation = await createFetchInvocation({
+                    url: `${baseUrl}/`,
+                    method: 'POST',
+                    body: BODY,
+                    headers: { 'Content-Type': 'application/json' },
+                    standard_webhooks: SIGNING_REFS,
+                })
+                seedSigningSecretInput(invocation)
+
+                const result = await executor.executeFetch(invocation)
+
+                expect(result.error).toBeUndefined()
+                expect(receivedId).toBe(SIGNING_REFS.webhook_id)
+                // Date.now is mocked to 2025-01-01T00:00:00Z in beforeEach
+                expect(receivedTimestamp).toBe('1735689600')
+                expect(receivedSignature).toBe(expectedSignature(receivedId!, receivedTimestamp!))
+            })
+
+            // The spec wants webhook-id constant across retries (the receiver's
+            // idempotency key) while the timestamp must be fresh so the retry
+            // stays within the receiver's tolerance window.
+            it('keeps webhook-id constant across retries while refreshing the timestamp and signature', async () => {
+                const receivedIds: string[] = []
+                const receivedTimestamps: string[] = []
+                const receivedSignatures: string[] = []
+                let callCount = 0
+                mockRequest.mockImplementation((req: any, res: any) => {
+                    receivedIds.push(req.headers['webhook-id'])
+                    receivedTimestamps.push(req.headers['webhook-timestamp'])
+                    receivedSignatures.push(req.headers['webhook-signature'])
+                    callCount++
+                    if (callCount === 1) {
+                        res.writeHead(500, { 'Content-Type': 'text/plain' })
+                        res.end('first attempt fails')
+                    } else {
+                        res.writeHead(200, { 'Content-Type': 'text/plain' })
+                        res.end('second attempt ok')
+                    }
+                })
+
+                const invocation = await createFetchInvocation({
+                    url: `${baseUrl}/`,
+                    method: 'POST',
+                    body: BODY,
+                    headers: { 'Content-Type': 'application/json' },
+                    standard_webhooks: SIGNING_REFS,
+                })
+                seedSigningSecretInput(invocation)
+
+                let result = await executor.executeFetch(invocation)
+                expect(result.invocation.state.attempts).toBe(1)
+
+                const retryTime = DateTime.fromObject({ year: 2025, month: 1, day: 1 }, { zone: 'UTC' }).plus({
+                    minutes: 6,
+                })
+                jest.spyOn(Date, 'now').mockReturnValue(retryTime.toMillis())
+
+                result = await executor.executeFetch(result.invocation)
+
+                expect(result.error).toBeUndefined()
+                expect(receivedIds[0]).toBe(receivedIds[1])
+                expect(receivedTimestamps).toEqual(['1735689600', '1735689960'])
+                expect(receivedSignatures[0]).not.toBe(receivedSignatures[1])
+                expect(receivedSignatures[1]).toBe(expectedSignature(receivedIds[1], receivedTimestamps[1]))
+            })
+
+            it('errors loudly instead of sending an unsigned request when the secret input is missing', async () => {
+                mockRequest.mockImplementation((req: any, res: any) => {
+                    res.writeHead(200, { 'Content-Type': 'text/plain' })
+                    res.end('ok')
+                })
+
+                const invocation = await createFetchInvocation({
+                    url: `${baseUrl}/`,
+                    method: 'POST',
+                    body: BODY,
+                    headers: { 'Content-Type': 'application/json' },
+                    standard_webhooks: SIGNING_REFS,
+                })
+                // Intentionally do NOT seed inputs.
+
+                const result = await executor.executeFetch(invocation)
+
+                expect(mockRequest).not.toHaveBeenCalled()
+                expect(result.error).toBeInstanceOf(Error)
+                expect(result.error.message).toContain('Standard Webhooks signing failed')
+                expect(result.error.message).toContain('signing_secret')
+            })
+        })
+
+        it('respects maxFetchRetries option to disable retries', async () => {
+            mockRequest.mockImplementation((req: any, res: any) => {
+                res.writeHead(500, { 'Content-Type': 'text/plain' })
+                res.end('server error')
+            })
+
+            const invocation = await createFetchInvocation({
+                url: `${baseUrl}/test`,
+                method: 'GET',
+            })
+
+            const result = await executor.executeWithAsyncFunctions(invocation, { maxFetchRetries: 0 })
+
+            expect(result.finished).toBe(true)
+            expect(result.error).toBeInstanceOf(Error)
+            expect(result.error!.message).toContain('HTTP fetch failed on attempt 1')
             expect(result.invocation.queueScheduledAt).toBeUndefined()
         })
 
@@ -1090,13 +1841,13 @@ describe('Hog Executor', () => {
             expect(result.invocation.queueScheduledAt).toMatchInlineSnapshot(`"2025-01-01T00:00:01.500Z"`)
             expect(result.logs.map((log) => log.message)).toMatchInlineSnapshot(`
                 [
-                  "HTTP fetch failed on attempt 1 with status code (none). Error: Invalid hostname. Retrying in 1500ms.",
+                  "HTTP fetch failed on attempt 1 with status code (none). Error: Invalid hostname. Retrying.",
                 ]
             `)
         })
 
         it('handles security errors', async () => {
-            process.env.NODE_ENV = 'production' // Make sure the security features are enabled
+            jest.mocked(fetch).mockRejectedValueOnce(new SecureRequestError('Hostname is not allowed'))
 
             const invocation = await createFetchInvocation({
                 url: 'http://localhost',
@@ -1105,7 +1856,7 @@ describe('Hog Executor', () => {
 
             const result = await executor.executeFetch(invocation)
 
-            // Should be scheduled for retry
+            // Should not be scheduled for retry
             expect(result.invocation.queue).toBe('hog')
             expect(result.invocation.queueScheduledAt).toBeUndefined()
             expect(result.logs.map((log) => log.message)).toMatchInlineSnapshot(`
@@ -1113,24 +1864,15 @@ describe('Hog Executor', () => {
                   "HTTP fetch failed on attempt 1 with status code (none). Error: Hostname is not allowed.",
                 ]
             `)
-
-            process.env.NODE_ENV = 'test'
         })
 
         it('handles timeouts', async () => {
-            mockRequest.mockImplementation((_req: any, res: any) => {
-                // Never send response
-                clearTimeout(timeoutHandle)
-                timeoutHandle = setTimeout(() => res.end(), 10000)
-            })
+            jest.mocked(fetch).mockRejectedValueOnce(new Error('The operation was aborted due to timeout'))
 
             const invocation = await createFetchInvocation({
                 url: `${baseUrl}/test`,
                 method: 'GET',
             })
-
-            // Set a very short timeout
-            hub.EXTERNAL_REQUEST_TIMEOUT_MS = 100
 
             const result = await executor.executeFetch(invocation)
 
@@ -1138,7 +1880,7 @@ describe('Hog Executor', () => {
             expect(result.invocation.queueScheduledAt).toMatchInlineSnapshot(`"2025-01-01T00:00:01.500Z"`)
             expect(result.logs.map((log) => log.message)).toMatchInlineSnapshot(`
                 [
-                  "HTTP fetch failed on attempt 1 with status code (none). Error: The operation was aborted due to timeout. Retrying in 1500ms.",
+                  "HTTP fetch failed on attempt 1 with status code (none). Error: The operation was aborted due to timeout. Retrying.",
                 ]
             `)
         })
@@ -1263,7 +2005,7 @@ describe('Hog Executor', () => {
                 })
             })
 
-            hub.CDP_GOOGLE_ADWORDS_DEVELOPER_TOKEN = 'ADWORDS_TOKEN'
+            executor['config'].googleAdwordsDeveloperToken = 'ADWORDS_TOKEN'
 
             let invocation = await createFetchInvocation({
                 url: 'https://googleads.googleapis.com/1234',
@@ -1298,6 +2040,17 @@ describe('Hog Executor', () => {
         })
 
         it('replaces access token placeholders in body, headers, and url', async () => {
+            jest.mocked(fetch).mockImplementation(() => {
+                return Promise.resolve({
+                    status: 200,
+                    body: 'Hello, world!',
+                    headers: {},
+                    json: () => Promise.resolve({}),
+                    text: () => Promise.resolve(''),
+                    dump: () => Promise.resolve(),
+                })
+            })
+
             const mockIntegrationInputs = {
                 oauth: {
                     value: {
@@ -1306,7 +2059,9 @@ describe('Hog Executor', () => {
                 },
             }
 
-            jest.spyOn(executor['hogInputsService'], 'loadIntegrationInputs').mockResolvedValue(mockIntegrationInputs)
+            jest.spyOn(executor['deps'].hogInputsService, 'loadIntegrationInputs').mockResolvedValue(
+                mockIntegrationInputs
+            )
 
             const invocation = createExampleInvocation()
             invocation.state.globals.inputs = mockIntegrationInputs
@@ -1341,71 +2096,555 @@ describe('Hog Executor', () => {
                 ]
             `)
         })
-    })
 
-    describe('shadowFetchContext', () => {
-        beforeEach(() => {
-            jest.mocked(fetch).mockClear()
-        })
-
-        it('returns no-op response when inside shadow context', async () => {
-            const result = await shadowFetchContext.run(true, () =>
-                cdpTrackedFetch({
-                    url: 'http://should-not-be-called.example.com/test',
-                    fetchParams: { method: 'GET' },
-                    templateId: 'test-template',
-                })
-            )
-
-            expect(result.fetchError).toBeNull()
-            expect(result.fetchResponse?.status).toBe(200)
-            expect(result.fetchDuration).toBe(0)
-            expect(fetch).not.toHaveBeenCalled()
-        })
-
-        it('makes real HTTP request when outside shadow context', async () => {
-            jest.mocked(fetch).mockResolvedValueOnce({
-                status: 200,
-                headers: {},
-            } as any)
-
-            const result = await cdpTrackedFetch({
-                url: 'http://example.com/test',
-                fetchParams: { method: 'GET' },
-                templateId: 'test-template',
+        describe('with non_failure_status_codes', () => {
+            beforeEach(() => {
+                const actualRequest = jest.requireActual('~/common/utils/request') as { fetch: typeof fetch }
+                jest.mocked(fetch).mockImplementation((url, options) => actualRequest.fetch(url, options))
             })
 
-            expect(fetch).toHaveBeenCalledWith('http://example.com/test', { method: 'GET' })
-            expect(result.fetchResponse?.status).toBe(200)
+            const setNonFailureConfig = (
+                invocation: CyclotronJobInvocationHogFunction,
+                value: Array<number | string>
+            ): void => {
+                invocation.hogFunction.inputs_schema = [
+                    ...(invocation.hogFunction.inputs_schema ?? []),
+                    {
+                        key: 'non_failure_status_codes',
+                        type: 'non_failure_status_codes',
+                        label: 'Non-failure response codes',
+                        required: false,
+                    },
+                ]
+                invocation.hogFunction.inputs = {
+                    ...(invocation.hogFunction.inputs ?? {}),
+                    non_failure_status_codes: { value },
+                }
+            }
+
+            it('treats matched non-retriable 4xx as success (exact match)', async () => {
+                mockRequest.mockImplementation((req: any, res: any) => {
+                    res.writeHead(400, { 'Content-Type': 'text/plain' })
+                    res.end('backdated consent')
+                })
+
+                const invocation = await createFetchInvocation({
+                    url: `${baseUrl}/test`,
+                    method: 'GET',
+                })
+                setNonFailureConfig(invocation, [400])
+
+                const result = await executor.executeFetch(invocation)
+
+                expect(result.error).toBeUndefined()
+                expect(result.invocation.queueScheduledAt).toBeUndefined()
+                expect(result.invocation.state.vmState!.stack.slice(-1)[0]).toEqual({
+                    status: 400,
+                    body: 'backdated consent',
+                })
+                expect(result.logs.map((l) => ({ level: l.level, message: l.message }))).toEqual([
+                    {
+                        level: 'info',
+                        message: expect.stringContaining('status code 400'),
+                    },
+                ])
+            })
+
+            it('treats matched 4xx as success via wildcard', async () => {
+                mockRequest.mockImplementation((req: any, res: any) => {
+                    res.writeHead(404, { 'Content-Type': 'text/plain' })
+                    res.end('not found')
+                })
+
+                const invocation = await createFetchInvocation({
+                    url: `${baseUrl}/test`,
+                    method: 'GET',
+                })
+                setNonFailureConfig(invocation, ['4xx'])
+
+                const result = await executor.executeFetch(invocation)
+
+                expect(result.error).toBeUndefined()
+                expect(result.invocation.state.vmState!.stack.slice(-1)[0]).toEqual({
+                    status: 404,
+                    body: 'not found',
+                })
+            })
+
+            it('does not match when ignore list does not cover the status', async () => {
+                mockRequest.mockImplementation((req: any, res: any) => {
+                    res.writeHead(401, { 'Content-Type': 'text/plain' })
+                    res.end('unauthorized')
+                })
+
+                const invocation = await createFetchInvocation({
+                    url: `${baseUrl}/test`,
+                    method: 'GET',
+                })
+                setNonFailureConfig(invocation, [400, 403])
+
+                const result = await executor.executeFetch(invocation)
+
+                expect(result.error).toBeInstanceOf(Error)
+                expect(result.error.message).toContain('status code 401')
+                expect(result.logs[0].level).toBe('error')
+            })
+
+            it('still retries a retriable status that is in the ignore list, then succeeds without setting result.error', async () => {
+                mockRequest.mockImplementation((req: any, res: any) => {
+                    res.writeHead(500, { 'Content-Type': 'text/plain' })
+                    res.end('server error')
+                })
+
+                const invocation = await createFetchInvocation({
+                    url: `${baseUrl}/test`,
+                    method: 'GET',
+                })
+                setNonFailureConfig(invocation, [500])
+
+                const maxRetries = executor['config'].fetchRetries
+                let result = await executor.executeFetch(invocation)
+                // Verify every intermediate attempt also logged at 'info' — regression guard
+                // against any future change that re-raises retry logs to 'error' when the
+                // status is in the non-failure list.
+                expect(result.logs.every((l) => l.level === 'info')).toBe(true)
+
+                for (let attempt = 1; attempt < maxRetries; attempt++) {
+                    expect(result.error).toBeUndefined()
+                    expect(result.invocation.queueScheduledAt).not.toBeUndefined()
+                    expect(result.invocation.state.attempts).toBe(attempt)
+                    result = await executor.executeFetch(result.invocation)
+                    expect(result.logs.every((l) => l.level === 'info')).toBe(true)
+                }
+
+                expect(result.error).toBeUndefined()
+                expect(result.invocation.queueScheduledAt).toBeUndefined()
+                expect(result.invocation.state.vmState!.stack.slice(-1)[0]).toEqual({
+                    status: 500,
+                    body: 'server error',
+                })
+                expect(result.logs.every((l) => l.level === 'info')).toBe(true)
+            })
+
+            it('mixed wildcard and number ignores both 4xx and the specific 5xx', async () => {
+                mockRequest.mockImplementation((req: any, res: any) => {
+                    res.writeHead(404, { 'Content-Type': 'text/plain' })
+                    res.end('a')
+                })
+                let invocation = await createFetchInvocation({ url: `${baseUrl}/test`, method: 'GET' })
+                setNonFailureConfig(invocation, ['4xx', 500])
+
+                let result = await executor.executeFetch(invocation)
+                expect(result.error).toBeUndefined()
+                expect(result.invocation.state.vmState!.stack.slice(-1)[0]).toEqual({ status: 404, body: 'a' })
+
+                mockRequest.mockImplementation((req: any, res: any) => {
+                    res.writeHead(500, { 'Content-Type': 'text/plain' })
+                    res.end('b')
+                })
+                invocation = await createFetchInvocation({ url: `${baseUrl}/test`, method: 'GET' })
+                setNonFailureConfig(invocation, ['4xx', 500])
+
+                // 500 is retriable — drain retries until terminal
+                const maxRetries = executor['config'].fetchRetries
+                result = await executor.executeFetch(invocation)
+                for (let attempt = 1; attempt < maxRetries; attempt++) {
+                    result = await executor.executeFetch(result.invocation)
+                }
+                expect(result.error).toBeUndefined()
+                expect(result.invocation.state.vmState!.stack.slice(-1)[0]).toEqual({ status: 500, body: 'b' })
+            })
+
+            it('does not ignore a 502 when config is [4xx, 500]', async () => {
+                mockRequest.mockImplementation((req: any, res: any) => {
+                    res.writeHead(502, { 'Content-Type': 'text/plain' })
+                    res.end('bad gateway')
+                })
+                const invocation = await createFetchInvocation({ url: `${baseUrl}/test`, method: 'GET' })
+                setNonFailureConfig(invocation, ['4xx', 500])
+
+                const maxRetries = executor['config'].fetchRetries
+                let result = await executor.executeFetch(invocation)
+                for (let attempt = 1; attempt < maxRetries; attempt++) {
+                    result = await executor.executeFetch(result.invocation)
+                }
+                expect(result.error).toBeInstanceOf(Error)
+                expect(result.error.message).toContain('status code 502')
+            })
+
+            it('does not affect successful responses', async () => {
+                mockRequest.mockImplementation((req: any, res: any) => {
+                    res.writeHead(200, { 'Content-Type': 'text/plain' })
+                    res.end('ok')
+                })
+                const invocation = await createFetchInvocation({ url: `${baseUrl}/test`, method: 'GET' })
+                setNonFailureConfig(invocation, ['4xx', 500])
+
+                const result = await executor.executeFetch(invocation)
+                expect(result.error).toBeUndefined()
+                expect(result.invocation.state.vmState!.stack.slice(-1)[0]).toEqual({ status: 200, body: 'ok' })
+            })
+
+            it('is a no-op when ignore config is empty', async () => {
+                mockRequest.mockImplementation((req: any, res: any) => {
+                    res.writeHead(400, { 'Content-Type': 'text/plain' })
+                    res.end('bad')
+                })
+                const invocation = await createFetchInvocation({ url: `${baseUrl}/test`, method: 'GET' })
+                setNonFailureConfig(invocation, [])
+
+                const result = await executor.executeFetch(invocation)
+                expect(result.error).toBeInstanceOf(Error)
+                expect(result.error.message).toContain('status code 400')
+            })
         })
 
-        it('isolates shadow context from concurrent non-shadow fetches', async () => {
-            jest.mocked(fetch).mockResolvedValue({
-                status: 200,
-                headers: {},
-            } as any)
+        describe('self-loop guard', () => {
+            const OWN_TOKEN = 'phc_synthetic_own_0000000000000000'
+            const INGEST_URL = 'https://us.i.posthog.com/capture/'
 
-            const [shadowResult, normalResult] = await Promise.all([
-                shadowFetchContext.run(true, () =>
-                    cdpTrackedFetch({
-                        url: 'http://shadow.example.com/test',
-                        fetchParams: { method: 'GET' },
-                        templateId: 'shadow-template',
-                    })
-                ),
-                cdpTrackedFetch({
-                    url: 'http://normal.example.com/test',
-                    fetchParams: { method: 'GET' },
-                    templateId: 'normal-template',
-                }),
-            ])
+            const mockOwnTeam = (): void => {
+                jest.spyOn(hub.teamManager, 'getTeam').mockResolvedValue({
+                    id: 1,
+                    api_token: OWN_TOKEN,
+                    secret_api_token: null,
+                } as any)
+            }
 
-            expect(shadowResult.fetchDuration).toBe(0)
-            expect(shadowResult.fetchResponse?.status).toBe(200)
+            const ownTokenCaptureBody = (): string =>
+                JSON.stringify({ api_key: OWN_TOKEN, event: 'replicated', distinct_id: 'u1', properties: {} })
 
-            expect(fetch).toHaveBeenCalledTimes(1)
-            expect(fetch).toHaveBeenCalledWith('http://normal.example.com/test', { method: 'GET' })
-            expect(normalResult.fetchResponse?.status).toBe(200)
+            // Seed this destination's own self-loop depth (keyed by its function id).
+            const setSelfLoopDepth = (invocation: CyclotronJobInvocationHogFunction, depth: number): void => {
+                invocation.state.globals.event.properties = {
+                    ...invocation.state.globals.event.properties,
+                    [SELF_LOOP_DEPTH_PROPERTY]: { [invocation.hogFunction.id]: depth },
+                }
+            }
+
+            // Seed a high depth for a DIFFERENT function - simulates an event that passed
+            // through an unrelated deep chain. Must not count toward this destination.
+            const setOtherFunctionDepth = (invocation: CyclotronJobInvocationHogFunction, depth: number): void => {
+                invocation.state.globals.event.properties = {
+                    ...invocation.state.globals.event.properties,
+                    [SELF_LOOP_DEPTH_PROPERTY]: { 'some-other-function-id': depth },
+                }
+            }
+
+            // Capture the body sent to the (mocked) ingest endpoint without a real network call.
+            const captureIngestFetch = (): { getBody: () => string | undefined } => {
+                let sentBody: string | undefined
+                ;(fetch as jest.Mock).mockImplementationOnce((_url: string, options: any) => {
+                    sentBody = options.body
+                    return Promise.resolve({ status: 200, headers: {}, text: () => Promise.resolve('ok') })
+                })
+                return { getBody: () => sentBody }
+            }
+
+            const readActionCount = async (mode: string, action: string): Promise<number> => {
+                const metric = await selfLoopGuardCounter.get()
+                return metric.values.find((v) => v.labels.mode === mode && v.labels.action === action)?.value ?? 0
+            }
+
+            it('fails open: a team lookup error never breaks the fetch', async () => {
+                jest.spyOn(hub.teamManager, 'getTeam').mockRejectedValue(new Error('db unavailable'))
+                const invocation = await createFetchInvocation({
+                    url: INGEST_URL,
+                    method: 'POST',
+                    body: ownTokenCaptureBody(),
+                })
+                ;(fetch as jest.Mock).mockImplementationOnce(() =>
+                    Promise.resolve({ status: 200, headers: {}, text: () => Promise.resolve('ok') })
+                )
+
+                const result = await executor.executeFetch(invocation)
+
+                // Detection failing must not surface as a destination error.
+                expect(result.error).toBeUndefined()
+            })
+
+            // Every hop under the cap is allowed and its outgoing body stamped with this
+            // destination's next depth - including hop 0 (a fresh external event), which a
+            // legitimate run always is.
+            it.each([
+                { case: 'fresh hop 0 (a legitimate external run)', depth: 0, stampedTo: 1 },
+                { case: 'mid-chain under the cap', depth: 2, stampedTo: 3 },
+                { case: 'the last hop under the cap', depth: 9, stampedTo: 10 },
+            ])('enforce: allows + stamps the next hop ($case)', async ({ depth, stampedTo }) => {
+                mockOwnTeam()
+                const invocation = await createFetchInvocation({
+                    url: INGEST_URL,
+                    method: 'POST',
+                    body: ownTokenCaptureBody(),
+                })
+                setSelfLoopDepth(invocation, depth)
+                const sent = captureIngestFetch()
+                const blockedBefore = await readActionCount('enforce', 'blocked')
+
+                const result = await executor.executeFetch(invocation)
+
+                // Fetch proceeds, body carries this destination's incremented depth, nothing blocked.
+                expect(result.error).toBeUndefined()
+                expect(parseJSON(sent.getBody()!).properties[SELF_LOOP_DEPTH_PROPERTY][invocation.hogFunction.id]).toBe(
+                    stampedTo
+                )
+                expect(await readActionCount('enforce', 'blocked')).toBe(blockedBefore)
+            })
+
+            // The whole point of per-function depth: an event that arrived carrying a huge
+            // depth for a DIFFERENT function is treated as depth 0 here, so a legitimately
+            // running destination is never blocked by an unrelated deep chain.
+            it('enforce: does NOT block when the high depth belongs to another function', async () => {
+                mockOwnTeam()
+                const invocation = await createFetchInvocation({
+                    url: INGEST_URL,
+                    method: 'POST',
+                    body: ownTokenCaptureBody(),
+                })
+                setOtherFunctionDepth(invocation, 50)
+                const sent = captureIngestFetch()
+                const blockedBefore = await readActionCount('enforce', 'blocked')
+
+                const result = await executor.executeFetch(invocation)
+
+                // Allowed, stamped as this destination's first hop, not blocked.
+                expect(result.error).toBeUndefined()
+                expect(parseJSON(sent.getBody()!).properties[SELF_LOOP_DEPTH_PROPERTY][invocation.hogFunction.id]).toBe(
+                    1
+                )
+                expect(await readActionCount('enforce', 'blocked')).toBe(blockedBefore)
+            })
+
+            it('enforce: breaks the chain once it reaches the cap', async () => {
+                mockOwnTeam()
+                const invocation = await createFetchInvocation({
+                    url: INGEST_URL,
+                    method: 'POST',
+                    body: ownTokenCaptureBody(),
+                })
+                setSelfLoopDepth(invocation, 10)
+                mockRequest.mockClear()
+                const blockedBefore = await readActionCount('enforce', 'blocked')
+
+                const result = await executor.executeFetch(invocation)
+
+                // Blocked: error set, finished, no fetch attempted, metric moved.
+                expect(result.error).toBeInstanceOf(Error)
+                expect(result.finished).toBe(true)
+                expect(mockRequest).not.toHaveBeenCalled()
+                expect(await readActionCount('enforce', 'blocked')).toBe(blockedBefore + 1)
+                expect(cleanLogs(result.logs.map((l) => l.message))).toEqual(
+                    expect.arrayContaining([expect.stringContaining('event-forwarding loop has already repeated')])
+                )
+            })
+
+            it('enforce: leaves a normal external fetch untouched', async () => {
+                mockOwnTeam()
+                const invocation = await createFetchInvocation({
+                    url: `${baseUrl}/test`,
+                    method: 'POST',
+                    body: ownTokenCaptureBody(),
+                })
+                mockRequest.mockClear()
+
+                const result = await executor.executeFetch(invocation)
+
+                expect(result.error).toBeUndefined()
+                expect(mockRequest).toHaveBeenCalled()
+            })
+        })
+    })
+
+    describe('isConnectionLevelError', () => {
+        it.each([
+            [{ code: 'UND_ERR_SOCKET', message: 'other side closed' }, true],
+            [{ code: 'ECONNRESET', message: 'read ECONNRESET' }, true],
+            [{ code: 'EPIPE', message: 'write EPIPE' }, true],
+            [{ code: undefined, message: 'other side closed' }, true],
+            [{ code: undefined, message: 'socket hang up' }, true],
+            [{ code: 'ENOTFOUND', message: 'getaddrinfo ENOTFOUND' }, false],
+            [{ code: undefined, message: 'some other error' }, false],
+            [null, false],
+            [undefined, false],
+        ])('returns %s for %j', (error, expected) => {
+            expect(isConnectionLevelError(error)).toBe(expected)
+        })
+    })
+
+    describe('routeEmailToQueue', () => {
+        it('should route the invocation to the email queue', () => {
+            const hogFunction = createHogFunction({
+                name: 'Email function',
+                metadata: { message_category_type: 'marketing' },
+            })
+
+            const invocation: CyclotronJobInvocationHogFunction = {
+                ...createExampleInvocation(hogFunction),
+                queue: 'hogflow',
+                queueParameters: {
+                    type: 'email',
+                    to: { email: 'user@example.com' },
+                    from: { integrationId: 1 },
+                    subject: 'Test',
+                    text: 'Hello',
+                    html: '<p>Hello</p>',
+                },
+            }
+            invocation.state.vmState = { stack: [] } as any
+
+            const result = (executor as any).routeEmailToQueue(invocation, invocation.queuePriority)
+
+            expect(result.finished).toBe(false)
+            expect(result.invocation.queue).toBe('email')
+            expect(result.invocation.queueMetadata?.originQueue).toBe('hogflow')
+            expect(result.invocation.queuePriority).toBe(1)
+            expect(result.invocation.queueMetadata?.originPriority).toBe(invocation.queuePriority)
+            expect(result.metrics).toContainEqual(
+                expect.objectContaining({
+                    metric_name: 'email_queued',
+                    metric_kind: 'email',
+                })
+            )
+        })
+
+        it('should classify transactional sends into the fast priority class', () => {
+            const hogFunction = createHogFunction({
+                name: 'Email function',
+                metadata: { message_category_type: 'transactional' },
+            })
+
+            const invocation: CyclotronJobInvocationHogFunction = {
+                ...createExampleInvocation(hogFunction),
+                queue: 'hogflow',
+                queueParameters: {
+                    type: 'email',
+                    to: { email: 'user@example.com' },
+                    from: { integrationId: 1 },
+                    subject: 'Test',
+                    text: 'Hello',
+                    html: '<p>Hello</p>',
+                },
+            }
+            invocation.state.vmState = { stack: [] } as any
+
+            const result = (executor as any).routeEmailToQueue(invocation, invocation.queuePriority)
+
+            expect(result.invocation.queuePriority).toBe(0)
+        })
+
+        it('should restore the origin priority when routing back from the email queue', () => {
+            const hogFunction = createHogFunction({ name: 'Email function' })
+            const invocation: CyclotronJobInvocationHogFunction = {
+                ...createExampleInvocation(hogFunction),
+                queue: 'email',
+                queuePriority: 1,
+                // originPriority 0 also guards the restore against a `||`-style
+                // fallback that would treat a falsy origin priority as absent.
+                queueMetadata: { originQueue: 'hogflow', originPriority: 0 },
+            }
+
+            const result = (executor as any).routeToQueue(invocation, 'hogflow')
+
+            expect(result.invocation.queue).toBe('hogflow')
+            expect(result.invocation.queuePriority).toBe(0)
+            expect(result.invocation.queueMetadata).toBeUndefined()
+        })
+
+        it('should preserve the same job ID (no new job created)', () => {
+            const hogFunction = createHogFunction({ name: 'Email function' })
+            const invocation: CyclotronJobInvocationHogFunction = {
+                ...createExampleInvocation(hogFunction),
+                queueParameters: {
+                    type: 'email',
+                    to: { email: 'user@example.com' },
+                    from: { integrationId: 1 },
+                    subject: 'Test',
+                    text: 'Hello',
+                    html: '<p>Hello</p>',
+                },
+            }
+            invocation.state.vmState = { stack: [] } as any
+
+            const result = (executor as any).routeEmailToQueue(invocation, invocation.queuePriority)
+
+            expect(result.invocation.id).toBe(invocation.id)
+        })
+    })
+
+    describe('email queue routing', () => {
+        const createEmailInvocation = (): CyclotronJobInvocationHogFunction => {
+            const hogFunction = createHogFunction({ name: 'Email function', team_id: 123 })
+            const invocation: CyclotronJobInvocationHogFunction = {
+                ...createExampleInvocation(hogFunction),
+                teamId: 123,
+                queueParameters: {
+                    type: 'email',
+                    to: { email: 'user@example.com' },
+                    from: { integrationId: 1 },
+                    subject: 'Test',
+                    text: 'Hello',
+                    html: '<p>Hello</p>',
+                },
+            }
+            invocation.state.vmState = { stack: [] } as any
+            return invocation
+        }
+
+        it('should route email sends to the dedicated email queue', async () => {
+            const invocation = createEmailInvocation()
+
+            const result = await executor.executeWithAsyncFunctions(invocation)
+
+            expect(result.invocation.queue).toBe('email')
+            expect(result.invocation.queueMetadata?.originQueue).toBeDefined()
+            expect(result.finished).toBe(false)
+        })
+
+        it('should send inline when isTest is set', async () => {
+            const invocation = createEmailInvocation()
+
+            const result = await executor.executeWithAsyncFunctions(invocation, { isTest: true })
+
+            expect(result.invocation.queue).not.toBe('email')
+            expect(result.finished).toBe(true)
+        })
+
+        it('should stash the origin queue priority when the send happens mid-run', async () => {
+            // A send from the hogflow queue runs the hog program first, which clones the
+            // invocation and resets queuePriority to 0 before the email is detected and routed.
+            // The stashed origin priority must come from the entry invocation, otherwise the job
+            // returns to the hogflow queue at priority 0 and jumps ahead of every other run.
+            const hogFunction = createHogFunction({ name: 'Email function' })
+            const invocation: CyclotronJobInvocationHogFunction = {
+                ...createExampleInvocation(hogFunction, { inputs: {} }, 'hogflow'),
+                queuePriority: 2,
+            }
+            invocation.state.vmState = { stack: [] } as any
+
+            const hogExecModule = require('../utils/hog-exec')
+            jest.spyOn(hogExecModule, 'execHog').mockResolvedValue({
+                execResult: {
+                    finished: false,
+                    asyncFunctionName: 'sendEmail',
+                    asyncFunctionArgs: [
+                        {
+                            to: { email: 'user@example.com' },
+                            from: { integrationId: 1 },
+                            subject: 'Test',
+                            text: 'Hello',
+                            html: '<p>Hello</p>',
+                        },
+                    ],
+                    state: { syncDuration: 1, maxMemUsed: 100, ops: 10, stack: [] },
+                },
+                error: undefined,
+                durationMs: 1,
+            })
+
+            const result = await executor.executeWithAsyncFunctions(invocation)
+
+            expect(result.invocation.queue).toBe('email')
+            expect(result.invocation.queueMetadata?.originPriority).toBe(2)
         })
     })
 })

@@ -1,85 +1,143 @@
-import { useAsyncActions, useValues } from 'kea'
+import { useActions, useAsyncActions, useValues } from 'kea'
+import { useCallback } from 'react'
 
 import { IconArrowRight, IconLock } from '@posthog/icons'
 import { LemonButton, Popover, PopoverProps, Tooltip } from '@posthog/lemon-ui'
 
-import { dayjs } from 'lib/dayjs'
-import { Link } from 'lib/lemon-ui/Link'
-import { maxGlobalLogic } from 'scenes/max/maxGlobalLogic'
+import { organizationLogic } from 'scenes/organizationLogic'
+
+import { AIAccessRequest } from './AIAccessRequest'
+import { getExternalAIProvidersTooltipTitle, openAIConsentLegalDialog } from './aiConsentCopy'
+import { aiConsentLogic } from './aiConsentLogic'
+
+export function AIConsentPopoverContent({
+    onApprove,
+    onDismiss,
+    approvalDisabledReason,
+    hideTrainingDisclaimer,
+}: {
+    onApprove: () => void
+    onDismiss: () => void
+    approvalDisabledReason: string | null
+    /** Omit the "won't be used for training third-party models" line where it doesn't apply. */
+    hideTrainingDisclaimer?: boolean
+}): JSX.Element {
+    const focusOnMount = useCallback((el: HTMLButtonElement | null) => {
+        el?.focus()
+    }, [])
+
+    return (
+        <div className="flex flex-col gap-2 m-1.5 max-w-prose">
+            <p className="font-medium text-pretty">
+                PostHog AI needs your approval to potentially process identifying user data with{' '}
+                <Tooltip title={getExternalAIProvidersTooltipTitle()}>
+                    <dfn>external AI providers</dfn>
+                </Tooltip>
+                .{!hideTrainingDisclaimer && <i> Your data won't be used for training third-party models.</i>}
+            </p>
+            <div className="flex gap-1.5 self-end">
+                <LemonButton data-attr="ai-consent-cancel" type="secondary" size="xsmall" onClick={onDismiss}>
+                    Cancel
+                </LemonButton>
+                <LemonButton
+                    data-attr="ai-consent-approve"
+                    type="primary"
+                    size="xsmall"
+                    onClick={() => openAIConsentLegalDialog({ onConfirm: onApprove })}
+                    sideIcon={approvalDisabledReason ? <IconLock /> : <IconArrowRight />}
+                    disabledReason={approvalDisabledReason}
+                    tooltip={approvalDisabledReason ? undefined : 'You are approving this as an organization admin'}
+                    tooltipPlacement="bottom"
+                    ref={focusOnMount}
+                >
+                    I allow AI analysis in this organization
+                </LemonButton>
+            </div>
+        </div>
+    )
+}
+
+function AIAccessRequestPopoverContent(): JSX.Element {
+    return (
+        <div className="flex flex-col gap-2 m-1.5 max-w-prose">
+            <p className="font-medium text-pretty">
+                PostHog AI access has not been enabled for this organization. You can request access from an
+                organization owner or admin.
+            </p>
+            <div className="flex self-end">
+                <AIAccessRequest />
+            </div>
+        </div>
+    )
+}
 
 export function AIConsentPopoverWrapper({
     hidden,
     children,
+    ignoreDismissal,
     onApprove,
     onDismiss,
+    hideTrainingDisclaimer,
+    pendingRedirectUrl,
     ...popoverProps
 }: Pick<PopoverProps, 'placement' | 'fallbackPlacements' | 'middleware' | 'showArrow'> & {
     children: JSX.Element
     hidden?: boolean
+    /** Always show popover regardless of prior dismissal. */
+    ignoreDismissal?: boolean
     onApprove?: () => void
     onDismiss?: () => void
+    /** Passed through to AIConsentPopoverContent. */
+    hideTrainingDisclaimer?: boolean
+    /**
+     * URL to continue to once consent is approved. Approving can trigger a full-page SSO
+     * reauthentication redirect that unloads the page before the approval request is sent, so the
+     * intent is persisted and `aiConsentLogic` finishes the approval and navigation on return.
+     */
+    pendingRedirectUrl?: string
 }): JSX.Element {
-    const { acceptDataProcessing } = useAsyncActions(maxGlobalLogic)
-    const { dataProcessingApprovalDisabledReason, dataProcessingAccepted } = useValues(maxGlobalLogic)
+    const { acceptDataProcessing } = useAsyncActions(aiConsentLogic)
+    const { dataProcessingApprovalDisabledReason, dataProcessingAccepted, dataProcessingDismissed } =
+        useValues(aiConsentLogic)
+    const { dismissDataProcessing, setPendingApprovalRedirect } = useActions(aiConsentLogic)
+    const { isAdminOrOwner, currentOrganization } = useValues(organizationLogic)
 
-    const handleClickOutside = (): void => {
+    const handleDismiss = (): void => {
+        if (!ignoreDismissal) {
+            dismissDataProcessing()
+        }
         onDismiss?.()
     }
 
     return (
         <Popover
-            // Note: Sync the copy below with organization-ai-consent in SettingsMap.tsx
             overlay={
-                <div className="flex flex-col m-1.5">
-                    <p className="font-medium text-pretty mb-0">
-                        PostHog AI needs your approval to potentially process
-                        <br />
-                        identifying user data with{' '}
-                        <Tooltip title={`As of ${dayjs().format('MMMM YYYY')}: Anthropic and OpenAI`}>
-                            <dfn>external AI providers</dfn>
-                        </Tooltip>
-                        .<br />
-                        <i>Your data won't be used for training models.</i>
-                    </p>
-                    <p className="text-muted text-xs leading-relaxed mb-2">
-                        If your org requires a Data Processing Agreement (DPA)
-                        <br />
-                        for compliance (and your existing DPA doesn't already
-                        <br />
-                        cover AI subprocessors),{' '}
-                        <Link to="https://posthog.com/dpa" target="_blank">
-                            you can get a fresh DPA here
-                        </Link>
-                        .
-                    </p>
-                    <div className="flex gap-1.5 self-end">
-                        <LemonButton type="secondary" size="xsmall" onClick={onDismiss}>
-                            Cancel
-                        </LemonButton>
-                        <LemonButton
-                            type="primary"
-                            size="xsmall"
-                            onClick={() =>
-                                void acceptDataProcessing()
-                                    .then(() => onApprove?.())
-                                    .catch(console.error)
+                isAdminOrOwner ? (
+                    <AIConsentPopoverContent
+                        approvalDisabledReason={dataProcessingApprovalDisabledReason}
+                        hideTrainingDisclaimer={hideTrainingDisclaimer}
+                        onApprove={() => {
+                            if (pendingRedirectUrl && currentOrganization) {
+                                // Cleared by the acceptDataProcessing listener on success or failure.
+                                setPendingApprovalRedirect({
+                                    url: pendingRedirectUrl,
+                                    organizationId: currentOrganization.id,
+                                    setAt: Date.now(),
+                                })
                             }
-                            sideIcon={dataProcessingApprovalDisabledReason ? <IconLock /> : <IconArrowRight />}
-                            disabledReason={dataProcessingApprovalDisabledReason}
-                            tooltip="You are approving this as an organization admin"
-                            tooltipPlacement="bottom"
-                            ref={(el) => {
-                                el?.focus() // Auto-focus the button when the popover is opened, so that you just hit enter to approve
-                            }}
-                        >
-                            I allow AI analysis in this organization
-                        </LemonButton>
-                    </div>
-                </div>
+                            void acceptDataProcessing()
+                                .then(() => onApprove?.())
+                                .catch(console.error)
+                        }}
+                        onDismiss={handleDismiss}
+                    />
+                ) : (
+                    <AIAccessRequestPopoverContent />
+                )
             }
             style={{ zIndex: 'var(--z-modal)' }} // Don't show above the re-authentication modal
-            visible={!hidden && !dataProcessingAccepted}
-            onClickOutside={handleClickOutside}
+            visible={!hidden && !dataProcessingAccepted && (ignoreDismissal || !dataProcessingDismissed)}
+            onClickOutside={handleDismiss}
             {...popoverProps}
         >
             {children}

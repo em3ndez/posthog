@@ -1,12 +1,24 @@
-import { toParams } from 'lib/utils'
+import { toParams } from 'lib/utils/url'
 import { urls } from 'scenes/urls'
 
-import { ExperimentMetric, ProductKey } from '~/queries/schema/schema-general'
-
-import { FileSystemIconColor, ProductManifest } from '../../frontend/src/types'
+import { ExperimentMetric, ProductItemCategory, ProductKey } from '~/queries/schema/schema-general'
+import { ActivityScope, FileSystemIconColor, ProductManifest } from '~/types'
 
 export const manifest: ProductManifest = {
     name: 'Experiments',
+    scenes: {
+        Experiments: {
+            import: () => import('./frontend/scenes/ExperimentsScene'),
+            projectBased: true,
+            name: 'Experiments',
+            activityScope: ActivityScope.EXPERIMENT,
+            description:
+                'Experiments help you test changes to your product to see which changes will lead to optimal results. Automatic statistical calculations let you see if the results are valid or due to chance.',
+            iconType: 'experiment',
+            docsHref: 'https://posthog.com/docs/experiments',
+        },
+    },
+    routes: { '/experiments': ['Experiments', 'experiments'] },
     urls: {
         experiment: (
             id: string | number,
@@ -14,10 +26,12 @@ export const manifest: ProductManifest = {
             options?: {
                 metric?: ExperimentMetric
                 name?: string
+                tab?: string
             }
         ): string => {
             const baseUrl = formMode ? `/experiments/${id}/${formMode}` : `/experiments/${id}`
-            return `${baseUrl}${options ? `?${toParams(options)}` : ''}`
+            const params = options ? toParams(options) : ''
+            return params ? `${baseUrl}?${params}` : baseUrl
         },
         experiments: (): string => '/experiments',
         experimentsSharedMetrics: (): string => '/experiments/shared-metrics',
@@ -47,7 +61,7 @@ export const manifest: ProductManifest = {
         {
             path: `Experiments`,
             intents: [ProductKey.EXPERIMENTS],
-            category: 'Features',
+            category: ProductItemCategory.FEATURES,
             type: 'experiment',
             href: urls.experiments(),
             iconType: 'experiment',

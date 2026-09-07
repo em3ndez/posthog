@@ -10,15 +10,19 @@ export const template: HogFunctionTemplate = {
     icon_url: '/static/services/gitlab.png',
     category: ['Error tracking'],
     code_language: 'hog',
-    code: `let posthog_issue_url := f'{project.url}/error_tracking/{inputs.posthog_issue_id}'
+    code: `let posthog_issue_url := inputs.posthog_issue_url
+if (empty(posthog_issue_url)) {
+    posthog_issue_url := f'{project.url}/error_tracking/{inputs.posthog_issue_id}'
+}
 let payload := {
     'method': 'POST',
     'headers': {
         'PRIVATE-TOKEN': inputs.gitlab_project.access_token,
+        'Content-Type': 'application/json'
     },
     'body': {
         'title': inputs.title,
-        'body': f'{inputs.description}\n\n[View in PostHog]({posthog_issue_url})'
+        'description': f'{inputs.description}\n\n[View in PostHog]({posthog_issue_url})'
     }
 }
 
@@ -62,6 +66,16 @@ if (res.status < 200 or res.status >= 300) {
             hidden: true,
             required: true,
             default: '{event.properties.$exception_issue_id}',
+        },
+        {
+            key: 'posthog_issue_url',
+            type: 'string',
+            label: 'PostHog issue URL',
+            description:
+                'Link back to the PostHog issue. When empty, a link is built from the PostHog issue ID instead.',
+            secret: false,
+            hidden: true,
+            required: false,
         },
     ],
 }

@@ -9,34 +9,13 @@ from posthog.clickhouse.client import sync_execute
 from posthog.models import Team, User
 from posthog.sync import database_sync_to_async
 
+from ee.billing.billing_types import USAGE_TYPE_OPTIONS
 from ee.hogai.context.context import AssistantContextManager
 from ee.hogai.tool import MaxSubtool
 from ee.hogai.tool_errors import MaxToolFatalError
 from ee.hogai.utils.types import AssistantState
 
-from .prompts import BILLING_CONTEXT_PROMPT
-
-# sync with frontend/src/scenes/billing/constants.ts
-USAGE_TYPES = [
-    {"label": "Events", "value": "event_count_in_period"},
-    {"label": "Identified Events", "value": "enhanced_persons_event_count_in_period"},
-    {"label": "Group Analytics", "value": "group_analytics"},
-    {"label": "Recordings", "value": "recording_count_in_period"},
-    {"label": "Mobile Recordings", "value": "mobile_recording_count_in_period"},
-    {"label": "Feature Flag Requests", "value": "billable_feature_flag_requests_count_in_period"},
-    {"label": "Exceptions", "value": "exceptions_captured_in_period"},
-    {"label": "Survey Responses", "value": "survey_responses_count_in_period"},
-    {"label": "LLM Events", "value": "ai_event_count_in_period"},
-    {"label": "Synced Rows", "value": "rows_synced_in_period"},
-    {"label": "Free Synced Rows", "value": "free_historical_rows_synced_in_period"},
-    {"label": "Data Pipelines (deprecated)", "value": "data_pipelines"},
-    {"label": "Destinations Trigger Events", "value": "cdp_billable_invocations_in_period"},
-    {"label": "Rows Exported", "value": "rows_exported_in_period"},
-    {"label": "PostHog AI", "value": "ai_credits_used_in_period"},
-    {"label": "Workflow Emails", "value": "workflow_emails_sent_in_period"},
-    {"label": "Workflow Destinations", "value": "workflow_billable_invocations_in_period"},
-    {"label": "Logs Ingested (MB)", "value": "logs_mb_in_period"},
-]
+from .prompts import BILLING_CONTEXT_PROMPT, BILLING_CONTEXT_UNAVAILABLE_PROMPT
 
 
 class ReadBillingTool(MaxSubtool):
@@ -55,7 +34,7 @@ class ReadBillingTool(MaxSubtool):
     async def execute(self) -> str:
         billing_context = self._context_manager.get_billing_context()
         if not billing_context:
-            return "No billing information available"
+            return BILLING_CONTEXT_UNAVAILABLE_PROMPT
         formatted_billing_context = await self._format_billing_context(billing_context)
         return formatted_billing_context
 
@@ -300,9 +279,9 @@ class ReadBillingTool(MaxSubtool):
 
     def _extract_product_type(self, item) -> str:
         """Extract product type from item label or breakdown_value."""
-        valid_usage_types = {usage_type["value"] for usage_type in USAGE_TYPES}
+        valid_usage_types = {usage_type["value"] for usage_type in USAGE_TYPE_OPTIONS}
 
-        # First try breakdown_value format: find the value that matches USAGE_TYPES
+        # First try breakdown_value format: find the value that matches known usage types
         if item.breakdown_value and isinstance(item.breakdown_value, list):
             for value in item.breakdown_value:
                 if str(value) in valid_usage_types:
@@ -317,13 +296,13 @@ class ReadBillingTool(MaxSubtool):
 
     def _get_clean_product_label(self, product_type: str) -> str:
         """Convert product type to a clean label for display."""
-        # Try to find matching label from USAGE_TYPES
-        for usage_type in USAGE_TYPES:
+        # Try to find matching label from known usage types
+        for usage_type in USAGE_TYPE_OPTIONS:
             if usage_type["value"] == product_type:
                 return usage_type["label"]
 
         # Fall back to formatting the product_type
-        return product_type.replace("_", " ").title()
+        return product_type.replace("_", " ").capitalize()
 
     def _format_single_team_table(self, items: list[UsageHistoryItem] | list[SpendHistoryItem], title: str) -> str:
         """Format a single table for a team or overall data."""

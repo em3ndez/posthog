@@ -1,17 +1,18 @@
 import clsx from 'clsx'
-import equal from 'fast-deep-equal'
+import { deepEqual as equal } from 'fast-equals'
 import { match } from 'ts-pattern'
 
 import { ActivityChange } from 'lib/components/ActivityLog/humanizeActivity'
 import { dayjs } from 'lib/dayjs'
 import { LemonTag } from 'lib/lemon-ui/LemonTag'
 import { Link } from 'lib/lemon-ui/Link'
-import { CONCLUSION_DISPLAY_CONFIG } from 'scenes/experiments/constants'
 import { getExposureConfigDisplayName } from 'scenes/experiments/utils'
 import { urls } from 'scenes/urls'
 
 import type { ExperimentExposureCriteria, ExperimentMetric } from '~/queries/schema/schema-general'
 import { Experiment, ExperimentConclusion } from '~/types'
+
+import { CONCLUSION_DISPLAY_CONFIG } from 'products/experiments/frontend/constants'
 
 import { getMetricChanges } from './metricChangeDescriptions'
 
@@ -37,9 +38,85 @@ export const nameOrLinkToExperiment = (name: string | null, id?: string): JSX.El
  */
 type AllowedExperimentFields = Pick<
     Experiment,
-    'conclusion' | 'start_date' | 'end_date' | 'metrics' | 'metrics_secondary' | 'exposure_criteria'
+    | 'conclusion'
+    | 'conclusion_comment'
+    | 'status'
+    | 'start_date'
+    | 'end_date'
+    | 'metrics'
+    | 'metrics_secondary'
+    | 'exposure_criteria'
+    | 'parameters'
+    | 'running_time_calculation'
+    | 'excluded_variants'
+    | 'primary_metrics_ordered_uuids'
+    | 'secondary_metrics_ordered_uuids'
 > & {
     deleted: boolean
+}
+
+const RUNNING_TIME_CALCULATION_KEYS = [
+    'minimum_detectable_effect',
+    'recommended_running_time',
+    'recommended_sample_size',
+    'exposure_estimate_config',
+]
+
+/** Strip the running-time calculator keys, which are mirrored into `parameters` while that field is deprecated. */
+function withoutRunningTimeCalculationKeys(value: unknown): Record<string, unknown> {
+    return Object.fromEntries(
+        Object.entries((value as Record<string, unknown> | null) ?? {}).filter(
+            ([key]) => !RUNNING_TIME_CALCULATION_KEYS.includes(key)
+        )
+    )
+}
+
+const DERIVED_RUNNING_TIME_KEYS = ['recommended_running_time', 'recommended_sample_size']
+
+/** Strip the derived calculator outputs so only deliberate input edits (MDE, exposure estimate) count. */
+function withoutDerivedRunningTimeKeys(value: unknown): Record<string, unknown> {
+    return Object.fromEntries(
+        Object.entries((value as Record<string, unknown> | null) ?? {}).filter(
+            ([key]) => !DERIVED_RUNNING_TIME_KEYS.includes(key)
+        )
+    )
+}
+
+function describeExcludedVariantsChange(before: string[] | undefined, after: string[] | undefined): string | null {
+    const beforeSet = new Set(before ?? [])
+    const afterSet = new Set(after ?? [])
+    const added = [...afterSet].filter((k) => !beforeSet.has(k))
+    const removed = [...beforeSet].filter((k) => !afterSet.has(k))
+
+    if (added.length === 0 && removed.length === 0) {
+        return null
+    }
+    const parts: string[] = []
+    if (added.length === 1) {
+        parts.push(`excluded variant ${added[0]} from analysis`)
+    } else if (added.length > 1) {
+        parts.push(`excluded variants ${added.join(', ')} from analysis`)
+    }
+    if (removed.length === 1) {
+        parts.push(`re-included variant ${removed[0]} in analysis`)
+    } else if (removed.length > 1) {
+        parts.push(`re-included variants ${removed.join(', ')} in analysis`)
+    }
+    return parts.join(' and ')
+}
+
+/**
+ * Detect a pure metric reorder. Returns the description only when the two
+ * arrays contain the same set of UUIDs in a different order — additions,
+ * removals, and swaps are described by the `metrics` field matcher instead.
+ */
+const describeMetricReorder = (before: unknown, after: unknown, description: string): string | null => {
+    const b = (before as string[] | null) ?? []
+    const a = (after as string[] | null) ?? []
+    if (equal(b, a) || !equal([...b].sort(), [...a].sort())) {
+        return null
+    }
+    return description
 }
 
 export const getExperimentChangeDescription = (
@@ -69,11 +146,11 @@ export const getExperimentChangeDescription = (
                     const duration = dayjs.duration(Math.abs(diff), 'minute')
                     const sign = diff > 0 ? 'moved the start date forward' : 'moved the start date back'
 
-                    return `${sign} by ${duration.humanize()} on`
+                    return `${sign} by ${duration.humanize()}`
                 }
             }
 
-            return 'updated the start date of'
+            return 'changed the start date'
         })
         .with({ field: 'end_date' }, ({ action, before, after }) => {
             /**
@@ -83,7 +160,7 @@ export const getExperimentChangeDescription = (
                 return 'stopped experiment'
             }
 
-            return 'updated the end date of'
+            return 'changed the end date'
         })
         .with({ field: 'conclusion' }, ({ action, before, after }) => {
             /**
@@ -98,7 +175,15 @@ export const getExperimentChangeDescription = (
                 )
             }
 
-            return null
+            if (action === 'changed' && after !== null) {
+                return (
+                    <span>
+                        changed the conclusion to <ExperimentConclusionTag conclusion={after as ExperimentConclusion} />
+                    </span>
+                )
+            }
+
+            return 'changed the conclusion'
         })
         .with({ field: 'metrics', action: 'created', before: null }, () => 'added the first metric to')
         .with({ field: 'metrics', action: 'changed' }, ({ before, after }) =>
@@ -106,6 +191,12 @@ export const getExperimentChangeDescription = (
         )
         .with({ field: 'metrics_secondary', action: 'changed' }, ({ before, after }) =>
             getMetricChanges(before as ExperimentMetric[], after as ExperimentMetric[])
+        )
+        .with({ field: 'primary_metrics_ordered_uuids', action: 'changed' }, ({ before, after }) =>
+            describeMetricReorder(before, after, 'reordered the primary metrics')
+        )
+        .with({ field: 'secondary_metrics_ordered_uuids', action: 'changed' }, ({ before, after }) =>
+            describeMetricReorder(before, after, 'reordered the secondary metrics')
         )
         .with({ field: 'exposure_criteria' }, ({ before, after }) => {
             /**
@@ -156,6 +247,24 @@ export const getExperimentChangeDescription = (
                         }
                         return null
                     })
+                    .with('activation_config', () => {
+                        const afterConfig = typedAfter?.activation_config
+                        const beforeConfig = typedBefore?.activation_config
+
+                        if (equal(afterConfig, beforeConfig)) {
+                            return null
+                        }
+
+                        if (afterConfig) {
+                            const displayName = getExposureConfigDisplayName(afterConfig)
+                            return (
+                                <span>
+                                    set the activation event to <LemonTag color="purple">{displayName}</LemonTag>
+                                </span>
+                            )
+                        }
+                        return null
+                    })
                     .exhaustive()
             )
 
@@ -168,8 +277,55 @@ export const getExperimentChangeDescription = (
                     </span>
                 )
             }
+            if (typedBefore?.activation_config && !typedAfter?.activation_config) {
+                changes.push('removed the activation event')
+            }
 
             return changes.filter(Boolean) as (string | JSX.Element)[]
         })
-        .otherwise(() => null)
+        .with({ field: 'parameters' }, ({ before, after }) => {
+            const summary = describeExcludedVariantsChange(
+                (before as { excluded_variants?: string[] } | null)?.excluded_variants,
+                (after as { excluded_variants?: string[] } | null)?.excluded_variants
+            )
+            if (summary) {
+                return summary
+            }
+            // A pure calculator-key sync is already described by the running_time_calculation change
+            if (equal(withoutRunningTimeCalculationKeys(before), withoutRunningTimeCalculationKeys(after))) {
+                return null
+            }
+            return 'updated parameters'
+        })
+        .with({ field: 'running_time_calculation' }, ({ before, after }) => {
+            // Opening the calculator re-saves the recomputed outputs, so they drift as exposure
+            // data changes — a row only earns its place when a calculator input was edited.
+            if (equal(withoutDerivedRunningTimeKeys(before), withoutDerivedRunningTimeKeys(after))) {
+                return null
+            }
+            return 'updated the running time calculation'
+        })
+        .with({ field: 'excluded_variants' }, () => {
+            // The change is described by the `parameters` matcher, which the backend keeps
+            // mirrored while `parameters` is deprecated — avoid a duplicate line.
+            return null
+        })
+        .with({ field: 'status' }, () => {
+            // Status only moves together with a lifecycle change (launch, stop, pause), and those
+            // already produce their own descriptions, so an "updated status" clause adds nothing.
+            return null
+        })
+        .with({ field: 'conclusion_comment' }, () => {
+            // The describer renders the comment text as the row's extended description instead.
+            return null
+        })
+        .otherwise(({ field, action }) => {
+            // Fallback for unhandled fields - ensures all activity is visible
+            const fieldName = field.replace(/_/g, ' ')
+            return match(action)
+                .with('created', () => `added ${fieldName}`)
+                .with('deleted', () => `removed ${fieldName}`)
+                .with('changed', () => `updated ${fieldName}`)
+                .otherwise(() => `modified ${fieldName}`)
+        })
 }

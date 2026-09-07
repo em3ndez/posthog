@@ -1,4 +1,4 @@
-import isEqual from 'lodash.isequal'
+import { deepEqual as equal } from 'fast-equals'
 import { ReactNode } from 'react'
 
 import { IconWarning } from '@posthog/icons'
@@ -7,24 +7,28 @@ import { LemonButtonProps } from '@posthog/lemon-ui'
 import api from 'lib/api'
 import { DataColorTheme, DataColorToken } from 'lib/colors'
 import { dayjs } from 'lib/dayjs'
-import { ensureStringIsNotBlank, humanFriendlyNumber, isEmptyObject, isObject, objectsEqual } from 'lib/utils'
 import { getCurrentTeamId } from 'lib/utils/getAppContext'
+import { isEmptyObject, isObject } from 'lib/utils/guards'
+import { humanFriendlyNumber } from 'lib/utils/numbers'
+import { objectsEqual } from 'lib/utils/objects'
+import { removeUndefinedAndNull } from 'lib/utils/objects'
+import { ensureStringIsNotBlank } from 'lib/utils/strings'
+import { teamLogic } from 'scenes/teamLogic'
 import { IndexedTrendResult } from 'scenes/trends/types'
 import { urls } from 'scenes/urls'
 
 import { propertyFilterTypeToPropertyDefinitionType } from '~/lib/components/PropertyFilters/utils'
-import { removeUndefinedAndNull } from '~/lib/utils'
 import { FormatPropertyValueForDisplayFunction } from '~/models/propertyDefinitionsModel'
 import { examples } from '~/queries/examples'
 import {
-    ActionsNode,
+    AnyDataWarehouseNode,
+    AnyEntityNode,
     BreakdownFilter,
     DashboardFilter,
-    DataWarehouseNode,
-    EventsNode,
     FileSystemIconType,
     GroupNode,
     HogQLQuery,
+    HogQLQueryModifiers,
     HogQLVariable,
     InsightVizNode,
     Node,
@@ -34,11 +38,12 @@ import {
     ResultCustomizationBy,
     ResultCustomizationByPosition,
     ResultCustomizationByValue,
+    TileFilters,
 } from '~/queries/schema/schema-general'
 import {
     containsHogQLQuery,
     isDataTableNode,
-    isDataWarehouseNode,
+    isAnyDataWarehouseNode,
     isEventsNode,
     isGroupNode,
     isInsightVizNode,
@@ -66,9 +71,9 @@ import {
 
 import { insightLogic } from './insightLogic'
 
-export const isAllEventsEntityFilter = (filter: EntityFilter | ActionFilter | null): boolean => {
+export const isAllEventsEntityFilter = (filter: EntityFilter | ActionFilter | null | undefined): boolean => {
     return (
-        filter !== null &&
+        filter != null &&
         filter.type === EntityTypes.EVENTS &&
         filter.id === null &&
         (!filter.name || filter.name === 'All events')
@@ -95,15 +100,15 @@ export const formatEventName = (name: string | undefined | null): string | undef
 }
 
 export const getDisplayNameFromEntityFilter = (
-    filter: EntityFilter | ActionFilter | null,
+    filter: EntityFilter | ActionFilter | null | undefined,
     isCustom = true
 ): string | null => {
     // Make sure names aren't blank strings
     const customName = ensureStringIsNotBlank(filter?.custom_name)
+
     let name = ensureStringIsNotBlank(filter?.name)
-    if (name && name in CORE_FILTER_DEFINITIONS_BY_GROUP.events) {
-        name = CORE_FILTER_DEFINITIONS_BY_GROUP.events[name].label
-    }
+    name = formatEventName(name) ?? name
+
     if (isAllEventsEntityFilter(filter)) {
         name = 'All events'
     }
@@ -113,7 +118,7 @@ export const getDisplayNameFromEntityFilter = (
 }
 
 export const getDisplayNameFromEntityNode = (
-    node: EventsNode | ActionsNode | DataWarehouseNode | GroupNode,
+    node: AnyEntityNode<AnyDataWarehouseNode> | GroupNode,
     isCustom = true
 ): string | null => {
     // Make sure names aren't blank strings
@@ -135,13 +140,13 @@ export const getDisplayNameFromEntityNode = (
         name = 'All events'
     }
 
-    const id = isDataWarehouseNode(node)
+    const id = isAnyDataWarehouseNode(node)
         ? node.table_name
         : isEventsNode(node)
           ? node.event
           : isGroupNode(node)
             ? undefined
-            : node.id
+            : node?.id
 
     // Return custom name. If that doesn't exist then the name, then the id, then just null.
     return (isCustom ? customName : null) ?? name ?? (id ? `${id}` : null)
@@ -249,13 +254,14 @@ export function formatAggregationValue(
     return Array.isArray(formattedValue) ? formattedValue[0] : formattedValue
 }
 
-// NB! Sync this with breakdown_values.py
+// NB! Sync this with breakdown_values.py and hogql_queries/utils/breakdowns.py
 export const BREAKDOWN_OTHER_STRING_LABEL = '$$_posthog_breakdown_other_$$'
 export const BREAKDOWN_OTHER_NUMERIC_LABEL = 9007199254740991 // pow(2, 53) - 1
 export const BREAKDOWN_OTHER_DISPLAY = 'Other (i.e. all remaining values)'
 export const BREAKDOWN_NULL_STRING_LABEL = '$$_posthog_breakdown_null_$$'
 export const BREAKDOWN_NULL_NUMERIC_LABEL = 9007199254740990 // pow(2, 53) - 2
 export const BREAKDOWN_NULL_DISPLAY = 'None (i.e. no value)'
+export const BREAKDOWN_BASELINE_STRING_LABEL = '$$_posthog_breakdown_baseline_$$'
 
 export function isOtherBreakdown(breakdown_value: string | number | bigint | null | undefined | ReactNode): boolean {
     return (
@@ -323,16 +329,34 @@ function formatNumericBreakdownLabel(
     return String(breakdown_value)
 }
 
+// Keep in sync with NOT_IN_COHORT_ID in posthog/hogql_queries/utils/breakdowns.py
+export const NOT_IN_COHORT_ID = 2 ** 52
+
 export function getCohortNameFromId(
     cohortId: string | number | null | undefined,
     cohorts: CohortType[] | null | undefined
 ): string {
     // :TRICKY: Different endpoints represent the all users cohort breakdown differently
-    if (cohortId === 'all' || cohortId === 0) {
+    if (cohortId === 'all' || cohortId === 0 || cohortId === '0') {
         return 'All Users'
     }
 
-    return cohorts?.filter((c) => c.id == cohortId)[0]?.name ?? (cohortId || '').toString()
+    if (Number(cohortId) === NOT_IN_COHORT_ID) {
+        return 'Not in cohort'
+    }
+
+    const cohortName = cohorts?.filter((c) => c.id == cohortId)[0]?.name
+    if (cohortName) {
+        return cohortName
+    }
+
+    // The cohorts list may not be loaded yet (or the cohort was deleted). Fall back to a
+    // human-readable label rather than leaking a bare numeric id into pills/axis labels.
+    // Keep in sync with BreakdownTag's `Cohort ${id}` convention.
+    if (cohortId == null || cohortId === '') {
+        return ''
+    }
+    return `Cohort ${cohortId}`
 }
 
 export function formatBreakdownLabel(
@@ -341,11 +365,22 @@ export function formatBreakdownLabel(
     cohorts: CohortType[] | undefined,
     formatPropertyValueForDisplay: FormatPropertyValueForDisplayFunction | undefined,
     multipleBreakdownIndex?: number,
-    itemLabel?: string
+    itemLabel?: string,
+    truncateLabel: boolean = true
 ): string {
     if (Array.isArray(breakdown_value)) {
         return breakdown_value
-            .map((v, index) => formatBreakdownLabel(v, breakdownFilter, cohorts, formatPropertyValueForDisplay, index))
+            .map((v, index) =>
+                formatBreakdownLabel(
+                    v,
+                    breakdownFilter,
+                    cohorts,
+                    formatPropertyValueForDisplay,
+                    index,
+                    undefined,
+                    truncateLabel
+                )
+            )
             .join('::')
     }
 
@@ -358,14 +393,18 @@ export function formatBreakdownLabel(
             breakdownFilter,
             cohorts,
             formatPropertyValueForDisplay,
-            multipleBreakdownIndex
+            multipleBreakdownIndex,
+            undefined,
+            truncateLabel
         )
         const formattedBucketEnd = formatBreakdownLabel(
             bucketEnd,
             breakdownFilter,
             cohorts,
             formatPropertyValueForDisplay,
-            multipleBreakdownIndex
+            multipleBreakdownIndex,
+            undefined,
+            truncateLabel
         )
         if (formattedBucketStart === formattedBucketEnd) {
             return formattedBucketStart
@@ -379,6 +418,17 @@ export function formatBreakdownLabel(
     if (breakdownFilter?.breakdown_type === 'cohort' || breakdownType === 'cohort') {
         if (breakdown_value === 'all' || breakdown_value === 0) {
             return 'All Users'
+        }
+        if (Number(breakdown_value) === NOT_IN_COHORT_ID) {
+            const selectedCohorts = Array.isArray(breakdownFilter?.breakdown) ? breakdownFilter.breakdown : []
+            const selectedCohortId = selectedCohorts.find((id) => id !== 'all' && Number(id) !== NOT_IN_COHORT_ID)
+            if (selectedCohortId != null && cohorts) {
+                const cohortName = cohorts.find((c) => c.id == selectedCohortId)?.name
+                if (cohortName) {
+                    return `Not in ${cohortName}`
+                }
+            }
+            return 'Not in cohort'
         }
         if (cohorts == null || cohorts.length === 0) {
             if (itemLabel != null) {
@@ -419,7 +469,7 @@ export function formatBreakdownLabel(
                   ? BREAKDOWN_NULL_DISPLAY
                   : breakdown_value
 
-        if (label.length > 200) {
+        if (truncateLabel && label.length > 200) {
             return label.slice(0, 200) + '…'
         }
         return label
@@ -465,6 +515,7 @@ export const INSIGHT_TYPE_URLS: Record<InsightType | string, string> = {
     [InsightType.FUNNELS]: urls.insightNew({ type: InsightType.FUNNELS }),
     [InsightType.RETENTION]: urls.insightNew({ type: InsightType.RETENTION }),
     [InsightType.PATHS]: urls.insightNew({ type: InsightType.PATHS }),
+    [InsightType.JOURNEYS]: urls.insightNew({ type: InsightType.JOURNEYS }),
     [InsightType.WEB_ANALYTICS]: urls.insightNew({ type: InsightType.WEB_ANALYTICS }),
     JSON: urls.insightNew({ query: examples.EventsTableFull }),
     HOG: urls.insightNew({ query: examples.Hoggonacci }),
@@ -530,7 +581,7 @@ export function insightUrlForEvent(event: Pick<EventType, 'event' | 'properties'
     return query ? urls.insightNew({ query }) : undefined
 }
 
-export function getFunnelDatasetKey(dataset: FlattenedFunnelStepByBreakdown | FunnelStepWithConversionMetrics): string {
+export function getFunnelDatasetKey(dataset: { breakdown_value?: BreakdownKeyType }): string {
     const breakdown_value =
         Array.isArray(dataset.breakdown_value) && dataset.breakdown_value.length == 1
             ? dataset.breakdown_value[0]
@@ -540,28 +591,35 @@ export function getFunnelDatasetKey(dataset: FlattenedFunnelStepByBreakdown | Fu
     return JSON.stringify(payload)
 }
 
+/** Identifies the base series — deliberately excludes `compare_label`, so that current and
+ * previous period datasets share a single result customization. */
 export function getTrendDatasetKey(dataset: IndexedTrendResult): string {
+    // for formulas, the position (not seriesIndex) identifies the base series: with compare
+    // enabled, previous-period datasets have offset series indexes, but share the position
+    // with their current-period counterpart
+    const formulaPosition = getTrendDatasetPosition(dataset)
     const payload = {
         series: Number.isInteger(dataset.action?.order)
             ? dataset.action?.order
-            : dataset.seriesIndex > 0
-              ? `formula${dataset.seriesIndex + 1}`
+            : formulaPosition > 0
+              ? `formula${formulaPosition + 1}`
               : 'formula',
         breakdown_value:
             dataset.breakdown_value !== undefined && !Array.isArray(dataset.breakdown_value)
                 ? [dataset.breakdown_value]
                 : dataset.breakdown_value,
-        compare_label: dataset.compare_label,
     }
 
     return JSON.stringify(payload)
 }
 
 export function getTrendDatasetPosition(dataset: IndexedTrendResult): number {
-    return dataset.seriesIndex ?? dataset.colorIndex ?? ((dataset as any).index as number)
+    // colorIndex is shared by current/previous period pairs, so position-based
+    // customizations apply to the base series rather than each period separately
+    return dataset.colorIndex ?? dataset.seriesIndex ?? ((dataset as any).index as number)
 }
 
-/** Type guard to determine wether we have a FunnelStepWithConversionMetrics or a FlattenedFunnelStepByBreakdown */
+/** Type guard to determine whether we have a FunnelStepWithConversionMetrics or a FlattenedFunnelStepByBreakdown */
 function isFunnelStepWithConversionMetrics(
     dataset: FlattenedFunnelStepByBreakdown | FunnelStepWithConversionMetrics
 ): dataset is FunnelStepWithConversionMetrics {
@@ -578,7 +636,7 @@ export function getFunnelDatasetPosition(
         return disableFunnelBreakdownBaseline ? (dataset.order ?? 0) + 1 : (dataset.order ?? 0)
     }
 
-    return dataset?.breakdownIndex ?? 0
+    return dataset?.colorIndex ?? dataset?.breakdownIndex ?? 0
 }
 
 export function getTrendResultCustomizationKey(
@@ -627,15 +685,9 @@ export function getTrendResultCustomizationColorToken(
     const resultCustomization = getTrendResultCustomization(resultCustomizationBy, dataset, resultCustomizations)
 
     // for result customizations without a configuration, the color is determined
-    // by the position in the dataset. colors repeat after all options
-    // have been exhausted.
-    // For comparison data (current vs previous periods), use colorIndex to ensure
-    // they get the same base color when customizing by value
-    const isValueBasedCustomization = !resultCustomizationBy || resultCustomizationBy === ResultCustomizationBy.Value
-    const datasetPosition =
-        isValueBasedCustomization && dataset.colorIndex !== undefined
-            ? dataset.colorIndex
-            : getTrendDatasetPosition(dataset)
+    // by the position in the dataset (shared by current/previous period pairs).
+    // colors repeat after all options have been exhausted.
+    const datasetPosition = getTrendDatasetPosition(dataset)
     const tokenIndex = (datasetPosition % Object.keys(theme).length) + 1
 
     return resultCustomization && resultCustomization.color
@@ -692,6 +744,13 @@ export function crushDraftQueryForURL(query: Node<Record<string, any>>): string 
     return JSON.stringify(query)
 }
 
+/**
+ * Query plumbing rather than editor sections: the schema version stamp, the query log tags, and
+ * the typing-only response. A suggested query arrives without them, so comparing them reports a
+ * change nobody made. `modifiers` are handled separately below.
+ */
+const IGNORED_SOURCE_FIELDS = ['version', 'tags', 'response']
+
 const SOURCE_FIELD_LABELS: Record<string, string> = {
     breakdownFilter: 'Breakdowns',
     compareFilter: 'Compare filter',
@@ -703,6 +762,7 @@ const SOURCE_FIELD_LABELS: Record<string, string> = {
     samplingFactor: 'Sampling',
     series: 'Series',
     trendsFilter: 'Display options',
+    modifiers: 'Query modifiers',
 }
 
 function arraysEqual(arr1: any[], arr2: any[]): boolean {
@@ -716,7 +776,7 @@ function arraysEqual(arr1: any[], arr2: any[]): boolean {
 
     // Compare each element
     for (let i = 0; i < sorted1.length; i++) {
-        if (!isEqual(sorted1[i], sorted2[i])) {
+        if (!equal(sorted1[i], sorted2[i])) {
             return false
         }
     }
@@ -727,18 +787,54 @@ function deepEqual(val1: any, val2: any): boolean {
     if (Array.isArray(val1) && Array.isArray(val2)) {
         return arraysEqual(val1, val2)
     }
-    return isEqual(val1, val2)
+    return equal(val1, val2)
+}
+
+/**
+ * Resolve a query's modifiers the way the backend does: explicit query modifiers win, then the
+ * team overrides, then the PostHog defaults. Absent and default-equal modifiers both resolve to
+ * the team's effective set, so comparing resolved modifiers skips changes nobody made.
+ */
+function resolveModifiersForComparison(
+    modifiers: HogQLQueryModifiers | undefined,
+    teamModifiers: HogQLQueryModifiers | undefined
+): HogQLQueryModifiers {
+    return { ...teamModifiers, ...removeUndefinedAndNull(modifiers ?? {}) }
+}
+
+/**
+ * Clean the source of an insight query for comparison. Handles both InsightVizNode (with source)
+ * and InsightQueryNode (without source). `cleanInsightQuery` only strips empty values one level
+ * deep, so it must run on the source — given the wrapping node it leaves `source.trendsFilter: {}`
+ * behind, which then reads as a changed section.
+ */
+function cleanSourceForComparison(node: any, teamModifiers: HogQLQueryModifiers | undefined): Record<string, any> {
+    const withoutNullish = removeUndefinedAndNull(node)
+    const source = withoutNullish?.source ?? withoutNullish
+    if (!source || typeof source !== 'object') {
+        return {}
+    }
+    const cleaned = cleanInsightQuery(source) as Record<string, any>
+    for (const field of IGNORED_SOURCE_FIELDS) {
+        delete cleaned[field]
+    }
+    const resolvedModifiers = resolveModifiersForComparison(cleaned.modifiers, teamModifiers)
+    if (Object.keys(resolvedModifiers).length > 0) {
+        cleaned.modifiers = resolvedModifiers
+    } else {
+        delete cleaned.modifiers
+    }
+    return cleaned
 }
 
 export function compareInsightTopLevelSections(obj1: any, obj2: any): string[] {
     const changedLabels = new Set<string>()
 
-    const cleanObj1 = cleanInsightQuery(removeUndefinedAndNull(obj1)) as Record<string, any>
-    const cleanObj2 = cleanInsightQuery(removeUndefinedAndNull(obj2)) as Record<string, any>
+    const currentTeam = teamLogic.findMounted()?.values.currentTeam
+    const teamModifiers = { ...currentTeam?.default_modifiers, ...currentTeam?.modifiers }
 
-    // Handle both InsightVizNode (with source) and InsightQueryNode (without source)
-    const source1 = cleanObj1.source || cleanObj1
-    const source2 = cleanObj2.source || cleanObj2
+    const source1 = cleanSourceForComparison(obj1, teamModifiers)
+    const source2 = cleanSourceForComparison(obj2, teamModifiers)
 
     if (!objectsEqual(source1, source2)) {
         const keys = new Set([...Object.keys(source1 || {}), ...Object.keys(source2 || {})])
@@ -808,4 +904,29 @@ export const getOverrideWarningPropsForButton = (
               tooltip: `This insight is being viewed with dashboard ${overrideType}. These will be discarded on edit.`,
           }
         : {}
+}
+
+/** Checks for breakdown features that are unsupported by trend insights with a
+ * data warehouse series. Mirrors backend `ValidateDataWarehouseBreakdown`. */
+export const hasUnsupportedBreakdownForDataWarehouseTrends = (
+    filtersOverride: DashboardFilter | TileFilters | null | undefined
+): boolean => {
+    const breakdownFilter = filtersOverride?.breakdown_filter
+
+    if (!breakdownFilter) {
+        return false
+    }
+
+    const supportedTypes = new Set(['data_warehouse', 'hogql'])
+
+    if (breakdownFilter.breakdowns?.length) {
+        return breakdownFilter.breakdowns.some((b) => !b.type || !supportedTypes.has(b.type))
+    }
+
+    return !!(
+        !breakdownFilter.breakdown ||
+        Array.isArray(breakdownFilter.breakdown) ||
+        !breakdownFilter.breakdown_type ||
+        !supportedTypes.has(breakdownFilter.breakdown_type)
+    )
 }

@@ -1,8 +1,8 @@
-import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/OnboardingDocsContentWrapper'
+import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/shared/OnboardingDocsContentWrapper'
 
 import { StepDefinition } from '../steps'
 
-export const getGoSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
+export const getGoInstallSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
     const { CodeBlock, Markdown, dedent } = ctx
 
     return [
@@ -31,7 +31,7 @@ export const getGoSteps = (ctx: OnboardingComponentsContext): StepDefinition[] =
             badge: 'required',
             content: (
                 <>
-                    <Markdown>Initialize the PostHog client with your API key and host:</Markdown>
+                    <Markdown>Initialize the PostHog client with your project token and host:</Markdown>
                     <CodeBlock
                         blocks={[
                             {
@@ -45,7 +45,7 @@ export const getGoSteps = (ctx: OnboardingComponentsContext): StepDefinition[] =
                                 )
 
                                 func main() {
-                                    client, _ := posthog.NewWithConfig("<ph_project_api_key>", posthog.Config{Endpoint: "<ph_client_api_host>"})
+                                    client, _ := posthog.NewWithConfig("<ph_project_token>", posthog.Config{Endpoint: "<ph_client_api_host>"})
                                     defer client.Close()
                                 }
                             `,
@@ -55,18 +55,24 @@ export const getGoSteps = (ctx: OnboardingComponentsContext): StepDefinition[] =
                 </>
             ),
         },
-        {
-            title: 'Send events',
-            badge: 'recommended',
-            content: (
-                <>
-                    <Markdown>Once installed, you can manually send events to test your integration:</Markdown>
-                    <CodeBlock
-                        blocks={[
-                            {
-                                language: 'go',
-                                file: 'Go',
-                                code: dedent`
+    ]
+}
+
+export const getGoEventStep = (ctx: OnboardingComponentsContext): StepDefinition => {
+    const { CodeBlock, Markdown, dedent } = ctx
+
+    return {
+        title: 'Send events',
+        badge: 'recommended',
+        content: (
+            <>
+                <Markdown>Once installed, you can manually send events to test your integration:</Markdown>
+                <CodeBlock
+                    blocks={[
+                        {
+                            language: 'go',
+                            file: 'Go',
+                            code: dedent`
                                 client.Enqueue(posthog.Capture{
                                     DistinctId: "user_123",
                                     Event: "button_clicked",
@@ -74,13 +80,17 @@ export const getGoSteps = (ctx: OnboardingComponentsContext): StepDefinition[] =
                                         Set("button_name", "signup"),
                                 })
                             `,
-                            },
-                        ]}
-                    />
-                </>
-            ),
-        },
-    ]
+                        },
+                    ]}
+                />
+            </>
+        ),
+    }
 }
+
+export const getGoSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => [
+    ...getGoInstallSteps(ctx),
+    getGoEventStep(ctx),
+]
 
 export const GoInstallation = createInstallation(getGoSteps)

@@ -1,11 +1,10 @@
-import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/OnboardingDocsContentWrapper'
+import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/shared/OnboardingDocsContentWrapper'
 
 import { StepDefinition } from '../steps'
+import { SDK_DEFAULTS_DATE } from './_snippets/sdkDefaults'
 
-export const getRemixSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
-    const { CodeBlock, Markdown, CalloutBox, dedent, snippets } = ctx
-
-    const JSEventCapture = snippets?.JSEventCapture
+export const getRemixInstallSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
+    const { CodeBlock, Markdown, CalloutBox, dedent } = ctx
 
     return [
         {
@@ -43,6 +42,13 @@ export const getRemixSteps = (ctx: OnboardingComponentsContext): StepDefinition[
                                     pnpm add posthog-js
                                 `,
                             },
+                            {
+                                language: 'bash',
+                                file: 'bun',
+                                code: dedent`
+                                    bun add posthog-js
+                                `,
+                            },
                         ]}
                     />
                 </>
@@ -54,7 +60,7 @@ export const getRemixSteps = (ctx: OnboardingComponentsContext): StepDefinition[
             content: (
                 <>
                     <Markdown>
-                        Add `posthog-js` and `posthog-js/react` to `ssr.noExternal` in your `vite.config.ts` so they get
+                        Add `posthog-js` and `@posthog/react` to `ssr.noExternal` in your `vite.config.ts` so they get
                         bundled for SSR:
                     </Markdown>
                     <CodeBlock
@@ -79,7 +85,7 @@ export const getRemixSteps = (ctx: OnboardingComponentsContext): StepDefinition[
                                         tsconfigPaths(),
                                       ],
                                       ssr: {
-                                        noExternal: ["posthog-js", "posthog-js/react"],
+                                        noExternal: ["posthog-js", "@posthog/react"],
                                       },
                                     });
                                 `,
@@ -106,15 +112,15 @@ export const getRemixSteps = (ctx: OnboardingComponentsContext): StepDefinition[
                                 code: dedent`
                                     import { useEffect, useState } from "react";
                                     import posthog from "posthog-js";
-                                    import { PostHogProvider } from "posthog-js/react";
+                                    import { PostHogProvider } from "@posthog/react";
 
                                     export function PHProvider({ children }: { children: React.ReactNode }) {
                                       const [hydrated, setHydrated] = useState(false);
 
                                       useEffect(() => {
-                                        posthog.init("<ph_project_api_key>", {
+                                        posthog.init("<ph_project_token>", {
                                           api_host: "<ph_client_api_host>",
-                                          defaults: "2026-01-30"
+                                          defaults: "${SDK_DEFAULTS_DATE}"
                                         });
 
                                         setHydrated(true);
@@ -179,12 +185,24 @@ export const getRemixSteps = (ctx: OnboardingComponentsContext): StepDefinition[
                 </>
             ),
         },
-        {
-            title: 'Send events',
-            badge: undefined,
-            content: <>{JSEventCapture && <JSEventCapture />}</>,
-        },
     ]
 }
+
+export const getRemixEventStep = (ctx: OnboardingComponentsContext): StepDefinition => {
+    const { snippets } = ctx
+
+    const JSEventCapture = snippets?.JSEventCapture
+
+    return {
+        title: 'Send events',
+        badge: undefined,
+        content: <>{JSEventCapture && <JSEventCapture />}</>,
+    }
+}
+
+export const getRemixSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => [
+    ...getRemixInstallSteps(ctx),
+    getRemixEventStep(ctx),
+]
 
 export const RemixInstallation = createInstallation(getRemixSteps)

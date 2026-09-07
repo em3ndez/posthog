@@ -1,29 +1,45 @@
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, overload
 
 import posthoganalytics
-from pydantic import ValidationError
 
-from posthog.schema import (
+from posthog.cloud_utils import is_cloud
+from posthog.schema_enums import (
     BounceRatePageViewMode,
-    CustomChannelRule,
-    HogQLQueryModifiers,
     InCohortVia,
+    InlineCohortCalculation,
     MaterializationMode,
     PersonsArgMaxVersion,
+    PersonsOnEventsMode,
     PropertyGroupsMode,
     SessionsV2JoinMode,
     SessionTableVersion,
 )
 
-from posthog.cloud_utils import is_cloud
-
+# This module loads at django.setup() via Team; posthog.schema (the pydantic models) is
+# runtime-imported in the functions that build modifier objects to keep it off that path.
 if TYPE_CHECKING:
+    from posthog.schema import HogQLQueryModifiers
+
     from posthog.models import Team, User
 
 
+@overload
+def alias_poe_mode_for_legacy(persons_on_events_mode: PersonsOnEventsMode) -> PersonsOnEventsMode: ...
+@overload
+def alias_poe_mode_for_legacy(persons_on_events_mode: PersonsOnEventsMode | None) -> PersonsOnEventsMode | None: ...
+def alias_poe_mode_for_legacy(persons_on_events_mode: PersonsOnEventsMode | None) -> PersonsOnEventsMode | None:
+    if persons_on_events_mode == PersonsOnEventsMode.PERSON_ID_OVERRIDE_PROPERTIES_JOINED:
+        # PERSON_ID_OVERRIDE_PROPERTIES_JOINED is not implemented in legacy insights
+        # It's functionally the same as DISABLED, just slower - hence aliasing to DISABLED
+        return PersonsOnEventsMode.DISABLED
+    return persons_on_events_mode
+
+
 def create_default_modifiers_for_user(
-    user: "User", team: "Team", modifiers: Optional[HogQLQueryModifiers] = None
-) -> HogQLQueryModifiers:
+    user: "User", team: "Team", modifiers: Optional["HogQLQueryModifiers"] = None
+) -> "HogQLQueryModifiers":
+    from posthog.schema import HogQLQueryModifiers  # noqa: PLC0415
+
     if modifiers is None:
         modifiers = HogQLQueryModifiers()
     else:
@@ -43,8 +59,12 @@ def create_default_modifiers_for_user(
 
 
 def create_default_modifiers_for_team(
-    team: "Team", modifiers: Optional[HogQLQueryModifiers] = None
-) -> HogQLQueryModifiers:
+    team: "Team", modifiers: Optional["HogQLQueryModifiers"] = None
+) -> "HogQLQueryModifiers":
+    from pydantic import ValidationError  # noqa: PLC0415
+
+    from posthog.schema import CustomBotDefinition, CustomChannelRule, HogQLQueryModifiers  # noqa: PLC0415
+
     if modifiers is None:
         modifiers = HogQLQueryModifiers()
     else:
@@ -64,35 +84,33 @@ def create_default_modifiers_for_team(
                             setattr(modifiers, key, value)
                     except ValidationError:
                         pass
+                elif key == "customBotDefinitions":
+                    # drop the definitions that don't parse, keep the rest — one bad entry should
+                    # not take a project's whole bot list out of every query. A non-dict entry
+                    # (from a hand-edited modifiers JSON) is unparseable, so drop it too rather than
+                    # let it reach compile_definitions and crash every classification query.
+                    if isinstance(value, list):
+                        definitions = []
+                        for definition in value:
+                            if not isinstance(definition, dict):
+                                continue
+                            try:
+                                definitions.append(CustomBotDefinition(**definition))
+                            except ValidationError:
+                                pass
+                        setattr(modifiers, key, definitions)
                 else:
                     setattr(modifiers, key, value)
 
     if modifiers.optimizeProjections is None:
-        modifiers.optimizeProjections = posthoganalytics.feature_enabled(
-            "projection-pushdown",
-            str(team.uuid),
-            groups={
-                "organization": str(team.organization_id),
-                "project": str(team.id),
-            },
-            group_properties={
-                "organization": {
-                    "id": str(team.organization_id),
-                },
-                "project": {
-                    "id": str(team.id),
-                },
-            },
-            only_evaluate_locally=True,
-            send_feature_flag_events=False,
-        )
+        modifiers.optimizeProjections = True
 
     set_default_modifier_values(modifiers, team)
 
     return modifiers
 
 
-def set_default_modifier_values(modifiers: HogQLQueryModifiers, team: "Team"):
+def set_default_modifier_values(modifiers: "HogQLQueryModifiers", team: "Team"):
     if modifiers.personsOnEventsMode is None:
         modifiers.personsOnEventsMode = team.person_on_events_mode_flag_based_default
 
@@ -107,6 +125,12 @@ def set_default_modifier_values(modifiers: HogQLQueryModifiers, team: "Team"):
 
     if modifiers.optimizeJoinedFilters is None:
         modifiers.optimizeJoinedFilters = False
+
+    # typeAwareCastSimplification deliberately gets no explicit default: None is falsy at the
+    # printer gate, stays out of the serialized cache payload (an explicit False would change every
+    # query's cache key on deploy for zero behavior change), and remains overridable per team via
+    # team.modifiers. Flipping the default on is a deliberate follow-up that carries the emitted-SQL
+    # snapshot churn for review.
 
     if modifiers.bounceRatePageViewMode is None:
         modifiers.bounceRatePageViewMode = BounceRatePageViewMode.COUNT_PAGEVIEWS
@@ -126,11 +150,17 @@ def set_default_modifier_values(modifiers: HogQLQueryModifiers, team: "Team"):
     if modifiers.convertToProjectTimezone is None:
         modifiers.convertToProjectTimezone = True
 
-    if modifiers.optimizeProjections is None:
-        modifiers.optimizeProjections = False
+    if modifiers.inlineCohortCalculation is None:
+        modifiers.inlineCohortCalculation = InlineCohortCalculation.AUTO
+
+    if modifiers.sessionIdPushdown is None:
+        modifiers.sessionIdPushdown = False
+
+    if modifiers.sessionPropertyPreAggregation is None:
+        modifiers.sessionPropertyPreAggregation = False
 
 
-def set_default_in_cohort_via(modifiers: HogQLQueryModifiers) -> HogQLQueryModifiers:
+def set_default_in_cohort_via(modifiers: "HogQLQueryModifiers") -> "HogQLQueryModifiers":
     if modifiers.inCohortVia is None or modifiers.inCohortVia == InCohortVia.AUTO:
         modifiers.inCohortVia = InCohortVia.SUBQUERY
 

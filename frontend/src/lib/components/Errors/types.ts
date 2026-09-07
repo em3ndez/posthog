@@ -24,6 +24,7 @@ export type ErrorTrackingRuntime =
     | 'ruby'
     | 'php'
     | 'java'
+    | 'kotlin'
     | 'react-native'
     | 'android'
     | 'ios'
@@ -62,6 +63,12 @@ export type ErrorTrackingStackFrameContext = {
 }
 export type ErrorTrackingStackFrameContextLine = { number: number; line: string }
 
+export interface ErrorTrackingStackFrameJunkDrawer {
+    raw_frame?: {
+        instruction_addr?: string | null
+    }
+}
+
 export interface ErrorTrackingStackFrame {
     raw_id: string
     mangled_name: string
@@ -75,6 +82,7 @@ export interface ErrorTrackingStackFrame {
     resolve_failure: string | null
     module: string | null
     code_variables?: Record<string, unknown>
+    junk_drawer?: ErrorTrackingStackFrameJunkDrawer
 }
 
 export interface ErrorTrackingFingerprint {
@@ -89,8 +97,8 @@ export interface ErrorTrackingSymbolSet {
     team_id: number
     last_used: string
     created_at: string
-    storage_ptr: string | null
     failure_reason: string | null
+    has_uploaded_file: boolean
     release: ErrorTrackingRelease | null
 }
 
@@ -153,6 +161,27 @@ export interface ErrorTrackingSpikeDetectionConfig {
     snooze_duration_minutes: number
     multiplier: number
     threshold: number
+}
+
+export interface ErrorTrackingSettings {
+    project_rate_limit_value: number | null
+    project_rate_limit_bucket_size_minutes: number | null
+    per_issue_rate_limit_value: number | null
+    per_issue_rate_limit_bucket_size_minutes: number | null
+}
+
+export interface ErrorTrackingSpikeEventIssue {
+    id: string
+    name: string | null
+    description: string | null
+}
+
+export interface ErrorTrackingSpikeEvent {
+    id: string
+    issue: ErrorTrackingSpikeEventIssue
+    detected_at: string
+    computed_baseline: number
+    current_bucket_value: number
 }
 
 export type SymbolSetStatus = 'valid' | 'invalid'

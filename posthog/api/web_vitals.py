@@ -6,25 +6,25 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 
 from posthog.api.routing import TeamAndOrgViewSetMixin
-from posthog.auth import TemporaryTokenAuthentication
+from posthog.event_usage import get_request_analytics_properties
 from posthog.hogql_queries.query_runner import ExecutionMode, get_query_runner
-from posthog.rbac.user_access_control import UserAccessControlError
+
+from products.access_control.backend.facade.user_access_control import UserAccessControlError
 
 
-# This is a simple wrapper around a basic query, so that's why `scope_object = "query"`
-# This `Viewset` does need to exist, however, because we need to support the `TemporaryTokenAuthentication` method
 class WebVitalsViewSet(TeamAndOrgViewSetMixin, viewsets.GenericViewSet):
-    scope_object = "query"
-    authentication_classes = [TemporaryTokenAuthentication]
-
     """
     Get web vitals for a specific pathname.
+    Toolbar accesses this via OAuth (handled by TeamAndOrgViewSetMixin.get_authenticators).
     """
+
+    scope_object = "query"
 
     @extend_schema(
         parameters=[
             OpenApiParameter("pathname", OpenApiTypes.STR, description="Filter web vitals by pathname", required=True),
-        ]
+        ],
+        responses={200: OpenApiTypes.OBJECT},
     )
     def list(self, request: Request, *args, **kwargs):
         if not request.user.is_authenticated:  # for mypy
@@ -45,6 +45,7 @@ class WebVitalsViewSet(TeamAndOrgViewSetMixin, viewsets.GenericViewSet):
                 ],
                 "series": [
                     {
+                        "kind": "EventsNode",
                         "event": "$web_vitals",
                         "name": "INP",
                         "custom_name": "INP",
@@ -52,6 +53,7 @@ class WebVitalsViewSet(TeamAndOrgViewSetMixin, viewsets.GenericViewSet):
                         "math_property": "$web_vitals_INP_value",
                     },
                     {
+                        "kind": "EventsNode",
                         "event": "$web_vitals",
                         "name": "LCP",
                         "custom_name": "LCP",
@@ -59,6 +61,7 @@ class WebVitalsViewSet(TeamAndOrgViewSetMixin, viewsets.GenericViewSet):
                         "math_property": "$web_vitals_LCP_value",
                     },
                     {
+                        "kind": "EventsNode",
                         "event": "$web_vitals",
                         "name": "CLS",
                         "custom_name": "CLS",
@@ -66,6 +69,7 @@ class WebVitalsViewSet(TeamAndOrgViewSetMixin, viewsets.GenericViewSet):
                         "math_property": "$web_vitals_CLS_value",
                     },
                     {
+                        "kind": "EventsNode",
                         "event": "$web_vitals",
                         "name": "FCP",
                         "custom_name": "FCP",
@@ -81,7 +85,10 @@ class WebVitalsViewSet(TeamAndOrgViewSetMixin, viewsets.GenericViewSet):
         )
 
         try:
-            result = query_runner.run(execution_mode=ExecutionMode.RECENT_CACHE_CALCULATE_BLOCKING_IF_STALE)
+            result = query_runner.run(
+                execution_mode=ExecutionMode.RECENT_CACHE_CALCULATE_BLOCKING_IF_STALE,
+                analytics_props=get_request_analytics_properties(request),
+            )
         except UserAccessControlError as e:
             raise ValidationError(str(e))
 

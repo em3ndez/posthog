@@ -12,7 +12,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -20,7 +20,7 @@
          plus(dateTrunc(%(hogql_val_3)s, start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff(%(hogql_val_4)s, toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, %(hogql_val_5)s)), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff(%(hogql_val_6)s, start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff(%(hogql_val_6)s, start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, %(hogql_val_7)s), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, %(hogql_val_8)s), toDateTime64('today', 6, 'UTC')), globalIn(s.session_id,
                                                                                                                                                                                                                                                                                (SELECT events.`$session_id` AS session_id
@@ -50,7 +50,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -58,7 +58,7 @@
          plus(dateTrunc(%(hogql_val_3)s, start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff(%(hogql_val_4)s, toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, %(hogql_val_5)s)), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff(%(hogql_val_6)s, start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff(%(hogql_val_6)s, start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, %(hogql_val_7)s), toDateTime64('explicit_redacted_timestamp', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, %(hogql_val_8)s), toDateTime64('today', 6, 'UTC')), globalIn(s.session_id,
                                                                                                                                                                                                                                                                                 (SELECT events.`$session_id` AS session_id
@@ -100,7 +100,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -108,7 +108,7 @@
          plus(dateTrunc(%(hogql_val_3)s, start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff(%(hogql_val_4)s, toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, %(hogql_val_5)s)), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff(%(hogql_val_6)s, start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff(%(hogql_val_6)s, start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, %(hogql_val_7)s), toDateTime64('explicit_redacted_timestamp', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, %(hogql_val_8)s), toDateTime64('today', 6, 'UTC')), globalIn(s.session_id,
                                                                                                                                                                                                                                                                                 (SELECT events.`$session_id` AS session_id
@@ -150,7 +150,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -158,7 +158,7 @@
          plus(dateTrunc(%(hogql_val_3)s, start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff(%(hogql_val_4)s, toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, %(hogql_val_5)s)), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff(%(hogql_val_6)s, start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff(%(hogql_val_6)s, start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, %(hogql_val_7)s), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, %(hogql_val_8)s), toDateTime64('today', 6, 'UTC')), globalIn(s.session_id,
                                                                                                                                                                                                                                                                                (SELECT events.`$session_id` AS session_id
@@ -188,7 +188,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -196,7 +196,7 @@
          plus(dateTrunc(%(hogql_val_3)s, start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff(%(hogql_val_4)s, toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, %(hogql_val_5)s)), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff(%(hogql_val_6)s, start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff(%(hogql_val_6)s, start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, %(hogql_val_7)s), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, %(hogql_val_8)s), toDateTime64('today', 6, 'UTC')), globalIn(s.session_id,
                                                                                                                                                                                                                                                                                (SELECT events.`$session_id` AS session_id
@@ -226,7 +226,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -234,7 +234,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')))
   GROUP BY s.session_id
@@ -244,7 +244,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -266,7 +265,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -274,7 +273,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')), globalIn(s.session_id,
                                                                                                                                                                                                                                                            (SELECT events.`$session_id` AS session_id
@@ -291,7 +290,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -313,7 +311,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -321,7 +319,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')))
   GROUP BY s.session_id
@@ -331,7 +329,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -353,7 +350,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -361,7 +358,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')), globalIn(s.session_id,
                                                                                                                                                                                                                                                            (SELECT events.`$session_id` AS session_id
@@ -378,7 +375,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -400,7 +396,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -408,7 +404,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')))
   GROUP BY s.session_id
@@ -418,7 +414,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -440,7 +435,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -448,7 +443,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')), globalIn(s.session_id,
                                                                                                                                                                                                                                                            (SELECT events.`$session_id` AS session_id
@@ -465,7 +460,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -487,7 +481,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -495,7 +489,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')))
   GROUP BY s.session_id
@@ -505,7 +499,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -527,7 +520,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -535,7 +528,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')), globalIn(s.session_id,
                                                                                                                                                                                                                                                            (SELECT events.`$session_id` AS session_id
@@ -552,7 +545,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -574,7 +566,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -582,7 +574,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')))
   GROUP BY s.session_id
@@ -592,7 +584,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -614,7 +605,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -622,7 +613,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('explicit_redacted_timestamp', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')), globalIn(s.session_id,
                                                                                                                                                                                                                                                             (SELECT events.`$session_id` AS session_id
@@ -654,7 +645,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -676,7 +666,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -684,7 +674,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')))
   GROUP BY s.session_id
@@ -694,7 +684,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -716,7 +705,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -724,7 +713,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('explicit_redacted_timestamp', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')), globalIn(s.session_id,
                                                                                                                                                                                                                                                             (SELECT events.`$session_id` AS session_id
@@ -756,7 +745,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -778,7 +766,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -786,7 +774,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')))
   GROUP BY s.session_id
@@ -796,7 +784,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -818,7 +805,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -826,7 +813,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('explicit_redacted_timestamp', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')), globalIn(s.session_id,
                                                                                                                                                                                                                                                             (SELECT events.`$session_id` AS session_id
@@ -858,7 +845,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -880,7 +866,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -888,7 +874,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')))
   GROUP BY s.session_id
@@ -898,7 +884,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -920,7 +905,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -928,7 +913,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('explicit_redacted_timestamp', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')), globalIn(s.session_id,
                                                                                                                                                                                                                                                             (SELECT events.`$session_id` AS session_id
@@ -960,7 +945,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -982,7 +966,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -990,7 +974,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')))
   GROUP BY s.session_id
@@ -1000,7 +984,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -1022,7 +1005,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -1030,7 +1013,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')), globalIn(s.session_id,
                                                                                                                                                                                                                                                            (SELECT events.`$session_id` AS session_id
@@ -1047,7 +1030,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -1069,7 +1051,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -1077,7 +1059,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')))
   GROUP BY s.session_id
@@ -1087,7 +1069,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -1109,7 +1090,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -1117,7 +1098,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')), globalIn(s.session_id,
                                                                                                                                                                                                                                                            (SELECT events.`$session_id` AS session_id
@@ -1134,7 +1115,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -1156,7 +1136,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -1164,7 +1144,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')))
   GROUP BY s.session_id
@@ -1174,7 +1154,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -1196,7 +1175,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -1204,7 +1183,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')), globalIn(s.session_id,
                                                                                                                                                                                                                                                            (SELECT events.`$session_id` AS session_id
@@ -1221,7 +1200,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -1243,7 +1221,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -1251,7 +1229,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')))
   GROUP BY s.session_id
@@ -1261,7 +1239,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -1283,7 +1260,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -1291,7 +1268,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), greaterOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('2020-12-29 00:00:00.000000', 6, 'UTC')), lessOrEquals(toTimeZone(s.min_first_timestamp, 'UTC'), toDateTime64('today', 6, 'UTC')), globalIn(s.session_id,
                                                                                                                                                                                                                                                            (SELECT events.`$session_id` AS session_id
@@ -1308,7 +1285,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -1330,7 +1306,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -1338,7 +1314,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), globalIn(s.session_id,
                                                  (SELECT DISTINCT events.`$session_id` AS `$session_id`
@@ -1351,7 +1327,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -1373,7 +1348,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -1381,7 +1356,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), globalIn(s.session_id,
                                                  (SELECT DISTINCT events.`$session_id` AS `$session_id`
@@ -1394,7 +1369,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -1416,7 +1390,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -1424,7 +1398,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), globalIn(s.session_id,
                                                  (SELECT DISTINCT events.`$session_id` AS `$session_id`
@@ -1437,7 +1411,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -1459,7 +1432,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -1467,7 +1440,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), globalIn(s.session_id,
                                                  (SELECT DISTINCT events.`$session_id` AS `$session_id`
@@ -1480,7 +1453,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -1502,7 +1474,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -1510,7 +1482,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), globalIn(s.session_id,
                                                  (SELECT DISTINCT events.`$session_id` AS `$session_id`
@@ -1529,7 +1501,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -1551,7 +1522,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -1559,7 +1530,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), globalIn(s.session_id,
                                                  (SELECT DISTINCT events.`$session_id` AS `$session_id`
@@ -1578,7 +1549,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -1600,7 +1570,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -1608,7 +1578,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), globalIn(s.session_id,
                                                  (SELECT DISTINCT events.`$session_id` AS `$session_id`
@@ -1627,7 +1597,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -1649,7 +1618,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -1657,7 +1626,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), globalIn(s.session_id,
                                                  (SELECT DISTINCT events.`$session_id` AS `$session_id`
@@ -1676,7 +1645,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -1698,7 +1666,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -1706,7 +1674,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), globalIn(s.session_id,
                                                  (SELECT DISTINCT events.`$session_id` AS `$session_id`
@@ -1725,7 +1693,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -1747,7 +1714,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -1755,7 +1722,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), globalIn(s.session_id,
                                                  (SELECT DISTINCT events.`$session_id` AS `$session_id`
@@ -1774,7 +1741,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -1796,7 +1762,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -1804,7 +1770,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), globalIn(s.session_id,
                                                  (SELECT DISTINCT events.`$session_id` AS `$session_id`
@@ -1823,7 +1789,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,
@@ -1845,7 +1810,7 @@
          sum(s.keypress_count) AS keypress_count,
          sum(s.mouse_activity_count) AS mouse_activity_count,
          divide(sum(s.active_milliseconds), 1000) AS active_seconds,
-         minus(duration, active_seconds) AS inactive_seconds,
+         greatest(minus(duration, active_seconds), 0) AS inactive_seconds,
          sum(s.console_log_count) AS console_log_count,
          sum(s.console_warn_count) AS console_warn_count,
          sum(s.console_error_count) AS console_error_count,
@@ -1853,7 +1818,7 @@
          plus(dateTrunc('DAY', start_time), toIntervalDay(coalesce(retention_period_days, 21))) AS expiry_time,
          dateDiff('DAY', toDateTime64('today', 6, 'UTC'), expiry_time) AS recording_ttl,
          greaterOrEquals(max(toTimeZone(s._timestamp, 'UTC')), toDateTime64('today', 6, 'UTC')) AS ongoing,
-         round(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 2) AS activity_score
+         round(least(greatest(multiply(divide(plus(plus(plus(divide(sum(s.active_milliseconds), 1000), sum(s.click_count)), sum(s.keypress_count)), sum(s.console_error_count)), plus(plus(plus(plus(sum(s.mouse_activity_count), dateDiff('SECOND', start_time, end_time)), sum(s.console_error_count)), sum(s.console_log_count)), sum(s.console_warn_count))), 100), 0), 100), 2) AS activity_score
   FROM session_replay_events AS s
   WHERE and(equals(s.team_id, 99999), globalIn(s.session_id,
                                                  (SELECT DISTINCT events.`$session_id` AS `$session_id`
@@ -1872,7 +1837,6 @@
   LIMIT 51 SETTINGS readonly=2,
                     max_execution_time=60,
                     allow_experimental_object_type=1,
-                    format_csv_allow_double_quotes=0,
                     max_ast_elements=4000000,
                     max_expanded_ast_elements=4000000,
                     max_bytes_before_external_group_by=0,

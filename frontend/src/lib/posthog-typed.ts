@@ -661,10 +661,27 @@ interface EventSchemas {
     'dashboard refreshed': Record<string, any>
     'dashboard renamed': Record<string, any>
     'dashboard share toggled': Record<string, any>
+    'dashboard subscribe nudge check failed': {
+        dashboard_id?: number
+        step?: string
+        error_name?: string
+        error_status?: number
+        error_message?: string
+    }
+    'dashboard subscribe nudge clicked': {
+        dashboard_id?: number
+        prefilled?: boolean
+        via?: string
+    }
+    'dashboard subscribe nudge shown': {
+        dashboard_id?: number
+        view_count_7d?: number
+    }
     'dashboard subscription created': Record<string, any>
     'dashboard subscription updated': Record<string, any>
     'dashboard updated': Record<string, any>
     'dashboard whitelabel toggled': Record<string, any>
+    'dashboard widget copied to other dashboard': Record<string, any>
     'data_attributes team setting updated': Record<string, any>
     'data pipelines notice clicked': Record<string, any>
     'data pipelines notice dismissed': Record<string, any>
@@ -682,6 +699,7 @@ interface EventSchemas {
     'definition save failed': Record<string, any>
     'definition save succeeded': Record<string, any>
     'delete person': Record<string, any>
+    detached_elements: Record<string, any>
     demo_requested: Record<string, any>
     'demo time': Record<string, any>
     'demo warning dismissed': Record<string, any>
@@ -1237,7 +1255,6 @@ interface EventSchemas {
     "EWjjW6Pc')) OR 407=(SELECT 407 FROM PG_SLEEP(15))--": Record<string, any>
     'exceeded max page limit loading toolbar element stats pages': Record<string, any>
     EXLwcYuf: Record<string, any>
-    'experiment archived': Record<string, any>
     'experimentation call prompt action': Record<string, any>
     'experiment completed': Record<string, any>
     'experiment created': Record<string, any>
@@ -1249,7 +1266,6 @@ interface EventSchemas {
     'experiment feature flag selected': Record<string, any>
     'experiment holdout assigned': Record<string, any>
     'experiment holdout created': Record<string, any>
-    'experiment launched': Record<string, any>
     'experiment load insight failed': Record<string, any>
     'experiment metric timeout': Record<string, any>
     'experiment_recalculation_time team setting updated': Record<string, any>
@@ -3196,6 +3212,16 @@ interface EventSchemas {
     'renewal pipeline closed won': Record<string, any>
     'renewal pipeline onboarding': Record<string, any>
     'renewal pipeline onboarding complete': Record<string, any>
+    'replay vision analysis nudge dismissed': {
+        analyzed_count?: number
+    }
+    'replay vision analysis nudge shown': {
+        analyzed_count?: number
+    }
+    'replay vision analysis nudge submitted': {
+        analyzed_count?: number
+        goal_length?: number
+    }
     'replayer error swallowed': Record<string, any>
     'report ingestion third party plugin installed': Record<string, any>
     'resource access level updated': Record<string, any>
@@ -3536,7 +3562,15 @@ interface EventSchemas {
     'subscribed during onboarding': Record<string, any>
     subscribe_to_product_updates: Record<string, any>
     'subscription cancelled': Record<string, any>
-    'subscription created': Record<string, any>
+    'subscription created': {
+        creation_source?: 'editor' | 'wizard'
+        resource_type?: string
+        dashboard_id?: number
+        insight_short_id?: string
+        subscription_id?: number
+        target_type?: string
+        ai_summary_prefilled?: boolean
+    }
     subscription_intent: Record<string, any>
     'subscription updated': Record<string, any>
     'Substack subscribe error': Record<string, any>

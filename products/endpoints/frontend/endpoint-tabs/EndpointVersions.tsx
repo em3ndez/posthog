@@ -5,8 +5,9 @@ import { LemonButton, LemonTable, LemonTag } from '@posthog/lemon-ui'
 import type { LemonTableColumns } from '@posthog/lemon-ui'
 
 import { More } from 'lib/lemon-ui/LemonButton/More'
+import { atColumn } from 'lib/lemon-ui/LemonTable/columnUtils'
 import { LemonTableLink } from 'lib/lemon-ui/LemonTable/LemonTableLink'
-import { createdAtColumn, createdByColumn } from 'lib/lemon-ui/LemonTable/columnUtils'
+import { ProfilePicture } from 'lib/lemon-ui/ProfilePicture'
 import { urls } from 'scenes/urls'
 
 import { SceneSection } from '~/layout/scenes/components/SceneSection'
@@ -14,10 +15,6 @@ import type { EndpointVersionType } from '~/types'
 
 import { endpointLogic } from '../endpointLogic'
 import { EndpointTab, endpointSceneLogic } from '../endpointSceneLogic'
-
-interface EndpointVersionsProps {
-    tabId: string
-}
 
 function getStatusTagType(status: string | undefined): 'success' | 'danger' | 'warning' | 'default' {
     if (!status) {
@@ -35,10 +32,10 @@ function getStatusTagType(status: string | undefined): 'success' | 'danger' | 'w
     }
 }
 
-export function EndpointVersions({ tabId }: EndpointVersionsProps): JSX.Element {
-    const { endpoint, versions, versionsLoading } = useValues(endpointLogic({ tabId }))
-    const { updateEndpoint } = useActions(endpointLogic({ tabId }))
-    const { viewingVersion } = useValues(endpointSceneLogic({ tabId }))
+export function EndpointVersions(): JSX.Element {
+    const { endpoint, versions, versionsLoading } = useValues(endpointLogic)
+    const { updateEndpoint } = useActions(endpointLogic)
+    const { viewingVersion } = useValues(endpointSceneLogic)
 
     if (!endpoint) {
         return <></>
@@ -110,8 +107,20 @@ export function EndpointVersions({ tabId }: EndpointVersionsProps): JSX.Element 
                 )
             },
         },
-        createdAtColumn<EndpointVersionType>() as any,
-        createdByColumn<EndpointVersionType>() as any,
+        atColumn<EndpointVersionType>('version_created_at', 'Created') as any,
+        {
+            title: 'Created by',
+            dataIndex: 'version_created_by',
+            render: function RenderCreatedBy(_, record) {
+                return (
+                    <div className="flex flex-row items-center flex-nowrap">
+                        {record.version_created_by && (
+                            <ProfilePicture user={record.version_created_by} size="md" showName />
+                        )}
+                    </div>
+                )
+            },
+        },
         {
             key: 'actions',
             width: 0,

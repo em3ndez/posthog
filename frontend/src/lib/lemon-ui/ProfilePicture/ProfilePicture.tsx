@@ -2,17 +2,18 @@ import './ProfilePicture.scss'
 
 import clsx from 'clsx'
 import { useValues } from 'kea'
-import md5 from 'md5'
 import React, { useEffect, useMemo, useRef, useState } from 'react'
 
 import { HedgehogModeProfile } from 'lib/components/HedgehogMode/HedgehogModeStatic'
-import { fullName, inStorybookTestRunner } from 'lib/utils'
+import { inStorybookTestRunner } from 'lib/utils/dom'
+import { gravatarUrl as buildGravatarUrl } from 'lib/utils/gravatar'
+import { fullName } from 'lib/utils/strings'
 import { userLogic } from 'scenes/userLogic'
 
 import { HedgehogConfig, MinimalHedgehogConfig, UserBasicType } from '~/types'
 
-import { Lettermark, LettermarkColor } from '../Lettermark/Lettermark'
 import { IconRobot } from '../icons'
+import { Lettermark, LettermarkColor } from '../Lettermark/Lettermark'
 
 export interface ProfilePictureProps {
     user?:
@@ -27,10 +28,12 @@ export interface ProfilePictureProps {
     title?: string
     index?: number
     type?: 'person' | 'bot' | 'system'
+    /** Change this value to fetch the Gravatar again, bypassing the browser cache. */
+    refreshKey?: number
 }
 
 export const ProfilePicture = React.forwardRef<HTMLSpanElement, ProfilePictureProps>(function ProfilePicture(
-    { user, name, size = 'lg', showName, className, index, title, type = 'person' },
+    { user, name, size = 'lg', showName, className, index, title, type = 'person', refreshKey },
     ref
 ) {
     const { user: currentUser } = useValues(userLogic)
@@ -55,10 +58,9 @@ export const ProfilePicture = React.forwardRef<HTMLSpanElement, ProfilePicturePr
         // Check if Gravatar exists
         const identifier = email || (name?.includes('@') ? name : undefined)
         if (identifier) {
-            const hash = md5(identifier.trim().toLowerCase())
-            return `https://www.gravatar.com/avatar/${hash}?s=96&d=404`
+            return buildGravatarUrl(identifier, refreshKey)
         }
-    }, [email, hedgehogProfile, name])
+    }, [email, hedgehogProfile, name, refreshKey])
 
     useEffect(() => {
         const controller = new AbortController()

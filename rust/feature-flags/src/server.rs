@@ -1,29 +1,139 @@
-use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::billing_limiters::{FeatureFlagsLimiter, SessionReplayLimiter};
+use crate::billing::{BillingAggregator, FeatureFlagsLimiter, SessionReplayLimiter, UsageReporter};
 use crate::cohorts::cohort_cache_manager::CohortCacheManager;
-use crate::config::Config;
+use crate::cohorts::membership::{
+    CachedCohortMembershipProvider, CohortMembershipProvider, NoOpCohortMembershipProvider,
+    RealtimeCohortMembershipProvider,
+};
+use crate::config::{Config, TeamIdCollection};
 use crate::database_pools::DatabasePools;
 use crate::db_monitor::DatabasePoolMonitor;
+use crate::flags::flag_definitions_cache::FlagDefinitionsCache;
+use crate::flags::flag_group_type_mapping::GroupTypeCacheManager;
+use crate::rayon_dispatcher::RayonDispatcher;
 use crate::router;
+use crate::tokio_monitor::TokioRuntimeMonitor;
+use common_cache::NegativeCache;
 use common_cookieless::CookielessManager;
 use common_geoip::GeoIpClient;
-use common_hypercache::{HyperCacheConfig, HyperCacheReader};
+use common_hypercache::{HyperCacheConfig, HyperCacheReader, S3Client};
 use common_redis::{
     Client, CompressionConfig, ReadWriteClient, ReadWriteClientConfig, RedisClient,
 };
-use health::{HealthHandle, HealthRegistry};
+use governor::clock;
+use lifecycle::{ComponentOptions, Handle, LivenessHandler, Manager, ReadinessHandler};
 use limiters::redis::QUOTA_LIMITER_CACHE_KEY;
 use tokio::net::TcpListener;
 use tokio_retry::strategy::{jitter, ExponentialBackoff};
 use tokio_retry::Retry;
 
-pub async fn serve<F>(config: Config, listener: TcpListener, shutdown: F)
-where
-    F: Future<Output = ()> + Send + 'static,
+/// Handles for every lifecycle component this service registers, plus the readiness
+/// and liveness handlers the HTTP router needs. Produced by [`register_components`]
+/// and passed into [`serve`].
+pub struct LifecycleHandles {
+    pub http: Handle,
+    pub db_monitor: Handle,
+    pub cohort_cache_monitor: Handle,
+    pub flag_defs_cache_monitor: Handle,
+    pub tokio_monitor: Handle,
+    pub readiness: ReadinessHandler,
+    pub liveness: LivenessHandler,
+}
+
+/// Register the feature-flags lifecycle components and return handles for use by
+/// `serve()` (and by the test harness). Call this exactly once per Manager, before
+/// `manager.monitor_background()`.
+///
+/// `/_liveness` is hardcoded to 200 (see `lifecycle::LivenessHandler`) and no
+/// component opts into `with_liveness_deadline`. For this service, if the tokio
+/// runtime can serve the endpoint the process is alive — there's no meaningful
+/// internal signal beyond that, and a heartbeat loop would just be checking that
+/// the heartbeat itself still runs. Do not add deadlines or `report_healthy()`
+/// calls here unless a real signal appears (e.g. the way capture feeds kafka
+/// producer health into its handle).
+pub fn register_components(manager: &mut Manager) -> LifecycleHandles {
+    let http = manager.register(
+        "http-server",
+        ComponentOptions::new().with_graceful_shutdown(Duration::from_secs(30)),
+    );
+    let db_monitor = manager.register(
+        "db-pool-monitor",
+        ComponentOptions::new().with_graceful_shutdown(Duration::from_secs(2)),
+    );
+    let cohort_cache_monitor = manager.register(
+        "cohort-cache-monitor",
+        ComponentOptions::new().with_graceful_shutdown(Duration::from_secs(2)),
+    );
+    let flag_defs_cache_monitor = manager.register(
+        "flag-definitions-cache-monitor",
+        ComponentOptions::new().with_graceful_shutdown(Duration::from_secs(2)),
+    );
+    let tokio_monitor = manager.register(
+        "tokio-runtime-monitor",
+        ComponentOptions::new().with_graceful_shutdown(Duration::from_secs(2)),
+    );
+    let readiness = manager.readiness_handler();
+    let liveness = manager.liveness_handler();
+    LifecycleHandles {
+        http,
+        db_monitor,
+        cohort_cache_monitor,
+        flag_defs_cache_monitor,
+        tokio_monitor,
+        readiness,
+        liveness,
+    }
+}
+
+impl LifecycleHandles {
+    /// Surface an init-time error to the lifecycle manager as a `Failure` on the http
+    /// component (so the trigger log reads `trigger_reason="failure" reason="…"` instead
+    /// of a misleading `Died { tag: "http-server" }`), and pre-complete the unstarted
+    /// monitor handles so their drops don't fan out "died during shutdown" warnings in
+    /// Phase 2. Call before each early `return` from `serve()`.
+    fn fail_init(&self, reason: impl Into<String>) {
+        self.http.signal_failure(reason);
+        self.http.work_completed();
+        self.db_monitor.work_completed();
+        self.cohort_cache_monitor.work_completed();
+        self.flag_defs_cache_monitor.work_completed();
+        self.tokio_monitor.work_completed();
+    }
+}
+
+pub async fn serve(
+    config: Config,
+    listener: TcpListener,
+    rayon_dispatcher: RayonDispatcher,
+    handles: LifecycleHandles,
+    // Test-only override for the flags-with-cohorts reader's S3 client. `None` in
+    // production; tests inject a dummy so a cache miss classifies as CacheMiss without
+    // a real object store. Uses the `new_with_s3_client` testing seam on HyperCacheReader.
+    flags_with_cohorts_s3: Option<Arc<dyn S3Client + Send + Sync>>,
+) {
+    serve_with_rate_limiter_clock(
+        config,
+        listener,
+        rayon_dispatcher,
+        handles,
+        flags_with_cohorts_s3,
+        clock::DefaultClock::default(),
+    )
+    .await;
+}
+
+pub async fn serve_with_rate_limiter_clock<C>(
+    config: Config,
+    listener: TcpListener,
+    rayon_dispatcher: RayonDispatcher,
+    handles: LifecycleHandles,
+    flags_with_cohorts_s3: Option<Arc<dyn S3Client + Send + Sync>>,
+    rate_limiter_clock: C,
+) where
+    C: clock::Clock + Clone + Send + Sync + 'static,
 {
     // Configure compression based on environment variable
     let compression_config = if *config.redis_compression_enabled {
@@ -52,6 +162,7 @@ where
     )
     .await
     else {
+        handles.fail_init("shared redis init failed");
         return;
     };
 
@@ -86,6 +197,7 @@ where
                 error = %e,
                 "Failed to create database pools"
             );
+            handles.fail_init(format!("database pools init failed: {e}"));
             return;
         }
     };
@@ -98,6 +210,7 @@ where
                 config.get_maxmind_db_path().display(),
                 e
             );
+            handles.fail_init(format!("geoip init failed: {e}"));
             return;
         }
     };
@@ -108,32 +221,50 @@ where
         Some(config.cache_ttl_seconds),
     ));
 
-    let health = HealthRegistry::new("liveness");
+    let flag_definitions_cache = Arc::new(FlagDefinitionsCache::new(
+        Some(config.flag_definitions_cache_capacity_bytes),
+        Some(config.flag_definitions_cache_ttl_seconds),
+    ));
 
-    // Liveness checks only verify the process is alive (simple heartbeat loop).
-    // Readiness checks (in router.rs) verify DB connectivity before accepting traffic.
-    let simple_loop = health
-        .register(
-            "simple_loop".to_string(),
-            Duration::from_secs(config.health_check_interval_secs),
-        )
-        .await;
-    tokio::spawn(liveness_loop(simple_loop));
+    let group_type_cache = Arc::new(GroupTypeCacheManager::new(
+        database_pools.persons_reader.clone(),
+        Some(config.group_type_cache_max_entries),
+        Some(config.group_type_cache_ttl_seconds),
+    ));
 
-    // Start database pool monitoring
-    let db_monitor = DatabasePoolMonitor::new(database_pools.clone(), &config);
-    tokio::spawn(async move {
-        db_monitor.start_monitoring().await;
-    });
-
-    // Start cohort cache monitoring
-    let cohort_cache_clone = cohort_cache.clone();
-    let cohort_cache_monitor_interval = config.cohort_cache_monitor_interval_secs;
-    tokio::spawn(async move {
-        cohort_cache_clone
-            .start_monitoring(cohort_cache_monitor_interval)
-            .await;
-    });
+    // Initialize the cohort membership provider for realtime/behavioral cohorts.
+    // Requires both the behavioral cohorts DB pool AND a non-empty team ID collection.
+    // When "none" (default), NoOp is used regardless of DB availability,
+    // so no realtime cohort queries hit the hot path.
+    let cohort_membership_provider: Arc<dyn CohortMembershipProvider> =
+        if config.realtime_cohort_evaluation_team_ids != TeamIdCollection::None {
+            if let Some(pool) = database_pools.behavioral_cohorts_reader.clone() {
+                tracing::info!(
+                    cache_ttl_seconds = config.cohort_membership_cache_ttl_seconds,
+                    cache_max_entries = config.cohort_membership_cache_max_entries,
+                    lookup_timeout_ms = config.realtime_cohort_lookup_timeout_ms,
+                    "Realtime cohort evaluation enabled with behavioral cohorts DB"
+                );
+                let realtime = RealtimeCohortMembershipProvider::with_lookup_timeout(
+                    pool,
+                    Duration::from_millis(config.realtime_cohort_lookup_timeout_ms),
+                );
+                Arc::new(CachedCohortMembershipProvider::new(
+                    realtime,
+                    Some(config.cohort_membership_cache_ttl_seconds),
+                    Some(config.cohort_membership_cache_max_entries),
+                ))
+            } else {
+                tracing::warn!(
+                    "REALTIME_COHORT_EVALUATION_TEAM_IDS is set but \
+                     BEHAVIORAL_COHORTS_READ_DATABASE_URL is not configured; realtime \
+                     cohort lookups will treat everyone as a non-member"
+                );
+                Arc::new(NoOpCohortMembershipProvider)
+            }
+        } else {
+            Arc::new(NoOpCohortMembershipProvider)
+        };
 
     let feature_flags_billing_limiter = match FeatureFlagsLimiter::new(
         Duration::from_secs(config.billing_limiter_cache_ttl_secs),
@@ -144,6 +275,7 @@ where
         Ok(limiter) => limiter,
         Err(e) => {
             tracing::error!("Failed to create feature flags billing limiter: {}", e);
+            handles.fail_init(format!("feature flags billing limiter init failed: {e}"));
             return;
         }
     };
@@ -157,6 +289,7 @@ where
         Ok(limiter) => limiter,
         Err(e) => {
             tracing::error!("Failed to create session replay billing limiter: {}", e);
+            handles.fail_init(format!("session replay billing limiter init failed: {e}"));
             return;
         }
     };
@@ -171,6 +304,7 @@ where
     )
     .await
     else {
+        handles.fail_init("cookieless redis init failed");
         return;
     };
 
@@ -191,6 +325,8 @@ where
         config.object_storage_region.clone(),
         config.object_storage_bucket.clone(),
     );
+    // Etag-paired on the Django writer side, which makes HyperCacheReader refuse read repair.
+    flags_hypercache_config.enable_etag = true;
 
     if !config.object_storage_endpoint.is_empty() {
         flags_hypercache_config.s3_endpoint = Some(config.object_storage_endpoint.clone());
@@ -204,8 +340,21 @@ where
             }
             Err(e) => {
                 tracing::error!("Failed to create flags HyperCacheReader: {:?}", e);
+                handles.fail_init(format!("flags hypercache init failed: {e:?}"));
                 return;
             }
+        };
+
+    // Read repair for the hypercaches that are read straight through to Redis on every
+    // request. Both feature_flags readers are left out: each carries a companion `:etag` key
+    // that a payload-only repair would leave stale, and FlagDefinitionsCache already absorbs
+    // repeat reads of a cold flags.json in process. team_metadata is left out too, below,
+    // for a different reason: it gates token authentication.
+    let read_repair_ttl_seconds =
+        if config.hypercache_read_repair_ttl_seconds == 0 || *config.skip_writes {
+            None
+        } else {
+            Some(config.hypercache_read_repair_ttl_seconds)
         };
 
     // Create HyperCacheReader for team metadata at startup
@@ -221,6 +370,12 @@ where
         config.object_storage_bucket.clone(),
     );
     team_hypercache_config.token_based = true;
+    // Left out of read repair: a hit here is trusted as proof of a valid token (see
+    // get_team_from_cache_or_pg), with no Postgres re-check. Team deletion clears Redis
+    // before S3, so a request landing in that gap reads the deleted team from S3; repairing
+    // it would resurrect that team in Redis for up to the repair TTL, instead of the single
+    // stale response an unrepaired hit gives the one caller that landed in the gap.
+    team_hypercache_config.read_repair_ttl_seconds = None;
 
     if !config.object_storage_endpoint.is_empty() {
         team_hypercache_config.s3_endpoint = Some(config.object_storage_endpoint.clone());
@@ -234,14 +389,14 @@ where
             }
             Err(e) => {
                 tracing::error!("Failed to create team HyperCacheReader: {:?}", e);
+                handles.fail_init(format!("team hypercache init failed: {e:?}"));
                 return;
             }
         };
 
     // Create HyperCacheReader for flags with cohorts (used by /flags/definitions endpoint)
-    let flags_with_cohorts_redis_client = dedicated_redis_client
-        .clone()
-        .unwrap_or_else(|| redis_client.clone());
+    // Uses the shared cache (redis_client) - same cache Django writes to via HyperCache
+    let flags_with_cohorts_redis_client = redis_client.clone();
 
     let mut flags_with_cohorts_config = HyperCacheConfig::new(
         "feature_flags".to_string(),
@@ -249,27 +404,38 @@ where
         config.object_storage_region.clone(),
         config.object_storage_bucket.clone(),
     );
+    // Etag-paired, same as flags.json above.
+    flags_with_cohorts_config.enable_etag = true;
 
     if !config.object_storage_endpoint.is_empty() {
         flags_with_cohorts_config.s3_endpoint = Some(config.object_storage_endpoint.clone());
     }
 
-    let flags_with_cohorts_hypercache_reader =
-        match HyperCacheReader::new(flags_with_cohorts_redis_client, flags_with_cohorts_config)
-            .await
-        {
-            Ok(reader) => {
-                tracing::info!("Created HyperCacheReader for flags with cohorts");
-                Arc::new(reader)
+    let flags_with_cohorts_hypercache_reader = match flags_with_cohorts_s3 {
+        Some(s3) => Arc::new(HyperCacheReader::new_with_s3_client(
+            flags_with_cohorts_redis_client,
+            s3,
+            flags_with_cohorts_config,
+        )),
+        None => {
+            match HyperCacheReader::new(flags_with_cohorts_redis_client, flags_with_cohorts_config)
+                .await
+            {
+                Ok(reader) => {
+                    tracing::info!("Created HyperCacheReader for flags with cohorts");
+                    Arc::new(reader)
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to create flags with cohorts HyperCacheReader: {:?}",
+                        e
+                    );
+                    handles.fail_init(format!("flags with cohorts hypercache init failed: {e:?}"));
+                    return;
+                }
             }
-            Err(e) => {
-                tracing::error!(
-                    "Failed to create flags with cohorts HyperCacheReader: {:?}",
-                    e
-                );
-                return;
-            }
-        };
+        }
+    };
 
     // Create HyperCacheReader for remote config (array/config.json)
     // This reads the pre-computed config blob from Python's RemoteConfig.build_config()
@@ -285,6 +451,7 @@ where
         config.object_storage_bucket.clone(),
     );
     config_hypercache_config.token_based = true;
+    config_hypercache_config.read_repair_ttl_seconds = read_repair_ttl_seconds;
 
     if !config.object_storage_endpoint.is_empty() {
         config_hypercache_config.s3_endpoint = Some(config.object_storage_endpoint.clone());
@@ -298,9 +465,51 @@ where
             }
             Err(e) => {
                 tracing::error!("Failed to create config HyperCacheReader: {:?}", e);
+                handles.fail_init(format!("config hypercache init failed: {e:?}"));
                 return;
             }
         };
+
+    let team_negative_cache = NegativeCache::new(
+        config.team_negative_cache_capacity,
+        config.team_negative_cache_ttl_seconds,
+    );
+    tracing::info!(
+        capacity = config.team_negative_cache_capacity,
+        ttl_seconds = config.team_negative_cache_ttl_seconds,
+        "Created team negative cache for invalid API tokens"
+    );
+
+    // Auth token cache: read-through cache for secret + personal API key validation.
+    // Uses the flags Redis client for cache reads/writes. No in-memory negative cache —
+    // Python signal handlers invalidate Redis on scope/key changes, but cannot reach
+    // Rust's in-memory cache, which would cause stale denials.
+    let auth_redis = dedicated_redis_client
+        .clone()
+        .unwrap_or_else(|| redis_client.clone());
+    let auth_token_inner = Arc::new(common_cache::ReadThroughCache::new(
+        auth_redis.clone(),
+        auth_redis,
+        common_cache::CacheConfig::with_ttl(
+            crate::api::auth::TOKEN_CACHE_PREFIX,
+            config.auth_token_cache_ttl_seconds,
+        ),
+        None,
+    ));
+    let auth_token_cache = Arc::new(common_cache::ReadThroughCacheWithMetrics::new(
+        auth_token_inner,
+        "auth",
+        "token",
+        &[],
+    ));
+    tracing::info!("Created auth token read-through cache (no negative cache)");
+
+    if *config.skip_writes {
+        tracing::warn!(
+            "SKIP_WRITES is enabled: all writes to PostgreSQL and Redis are disabled. \
+             This instance is running in read-only mode for safe performance testing."
+        );
+    }
 
     // Warn about deprecated environment variables
     if std::env::var("TEAM_CACHE_TTL_SECONDS").is_ok() {
@@ -316,31 +525,120 @@ where
         );
     }
 
-    let app = router::router(
+    let service_mode = config.service_mode.clone();
+
+    // Spawn monitor tasks only after all fallible init succeeds. If an early return
+    // fired above, the manager has already seen the real `Failure` reason and the
+    // unstarted monitors are pre-completed.
+    let LifecycleHandles {
+        http: http_handle,
+        db_monitor: db_monitor_handle,
+        cohort_cache_monitor: cohort_cache_monitor_handle,
+        flag_defs_cache_monitor: flag_defs_cache_monitor_handle,
+        tokio_monitor: tokio_monitor_handle,
+        readiness,
+        liveness,
+    } = handles;
+
+    let db_monitor = DatabasePoolMonitor::new(database_pools.clone(), &config);
+    tokio::spawn(async move {
+        db_monitor.start_monitoring(db_monitor_handle).await;
+    });
+
+    let cohort_cache_clone = cohort_cache.clone();
+    let cohort_cache_monitor_interval = config.cohort_cache_monitor_interval_secs;
+    tokio::spawn(async move {
+        cohort_cache_clone
+            .start_monitoring(cohort_cache_monitor_interval, cohort_cache_monitor_handle)
+            .await;
+    });
+
+    let flag_defs_cache_clone = flag_definitions_cache.clone();
+    let flag_defs_cache_monitor_interval = config.flag_definitions_cache_monitor_interval_secs;
+    tokio::spawn(async move {
+        flag_defs_cache_clone
+            .start_monitoring(
+                flag_defs_cache_monitor_interval,
+                flag_defs_cache_monitor_handle,
+            )
+            .await;
+    });
+
+    let tokio_monitor = TokioRuntimeMonitor::new(&tokio::runtime::Handle::current());
+    tokio::spawn(async move {
+        tokio_monitor.start_monitoring(tokio_monitor_handle).await;
+    });
+
+    let usage_reporter = UsageReporter::new(
+        &config.usage_ingestion_addr,
+        config.usage_ingestion_tls,
+        config.usage_ingestion_teams.clone(),
+        config.usage_ingestion_timeout_ms,
+    )
+    .expect("invalid usage-ingestion configuration");
+    let billing_aggregator: Arc<BillingAggregator> = BillingAggregator::start_with_usage_reporter(
+        redis_client.clone(),
+        config.get_billing_aggregator_config(),
+        usage_reporter,
+    );
+
+    let app = router::router_with_rate_limiter_clock(
         redis_client,
         dedicated_redis_client,
         database_pools,
         cohort_cache,
+        group_type_cache,
         geoip_service,
-        health,
+        readiness,
+        liveness,
         feature_flags_billing_limiter,
         session_replay_billing_limiter,
         cookieless_manager,
         flags_hypercache_reader,
+        flag_definitions_cache,
         flags_with_cohorts_hypercache_reader,
         team_hypercache_reader,
         config_hypercache_reader,
+        rayon_dispatcher,
+        team_negative_cache,
+        auth_token_cache,
+        cohort_membership_provider,
+        billing_aggregator.clone(),
         config,
+        rate_limiter_clock,
     );
 
-    tracing::info!("listening on {:?}", listener.local_addr().unwrap());
-    axum::serve(
+    tracing::info!(
+        service_mode = ?service_mode,
+        "listening on {:?}",
+        listener.local_addr().unwrap()
+    );
+
+    // Always signal HTTP completion (success or failure) so the manager's
+    // background monitor can complete shutdown. Skipping either arm would wedge
+    // `monitor_guard.wait()` in the caller.
+    let serve_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown)
-    .await
-    .unwrap()
+    .with_graceful_shutdown(http_handle.shutdown_signal())
+    .await;
+
+    // Must run *after* `axum::serve(...).await` resolves so axum has drained
+    // in-flight requests; flushing earlier would miss late-arriving records.
+    billing_aggregator.shutdown().await;
+
+    match serve_result {
+        Ok(()) => http_handle.work_completed(),
+        Err(e) => {
+            tracing::error!("HTTP server error: {e}");
+            http_handle.signal_failure(e.to_string());
+            // Mark completed so HandleInner::Drop emits WorkCompleted instead of
+            // racing the manager's processing of the Failure event and emitting
+            // a duplicate Died (which oncall would read as a second failure).
+            http_handle.work_completed();
+        }
+    }
 }
 
 /// Create a ReadWriteClient that automatically routes reads to replica and writes to primary
@@ -493,7 +791,7 @@ async fn create_dedicated_readwrite_client(
 /// - Overrides: InvalidClientConfig and AuthenticationFailed always treated as permanent (no retry)
 /// - In practice, most connection errors (DNS, connection refused) are also permanent
 /// - Uses exponential backoff with jitter when retrying transient errors
-async fn create_redis_client(
+pub async fn create_redis_client(
     url: &str,
     client_type: &str,
     compression_config: CompressionConfig,
@@ -575,16 +873,41 @@ async fn create_redis_client(
     }
 }
 
-async fn liveness_loop(handle: HealthHandle) {
-    loop {
-        handle.report_healthy().await;
-        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lifecycle::LifecycleError;
+
+    /// Locks in the contract that drives the early-return paths in `serve()`:
+    /// `fail_init` must surface a `ComponentFailure { tag: "http-server", reason }` —
+    /// not a misleading `ComponentDied { tag: "http-server" }` from the http handle's
+    /// drop, which is the easy regression mode if a future component is added to
+    /// `LifecycleHandles` without being wired into `fail_init`.
+    #[tokio::test]
+    async fn fail_init_reports_failure_not_died() {
+        let mut manager = Manager::builder("test")
+            .with_trap_signals(false)
+            .with_prestop_check(false)
+            .with_global_shutdown_timeout(Duration::from_secs(5))
+            .build();
+        let handles = register_components(&mut manager);
+        let guard = manager.monitor_background();
+
+        handles.fail_init("redis init failed");
+        drop(handles);
+
+        let result = tokio::time::timeout(Duration::from_secs(3), guard.wait())
+            .await
+            .expect("monitor did not finish within timeout");
+        assert!(
+            matches!(
+                &result,
+                Err(LifecycleError::ComponentFailure { tag, reason })
+                    if tag == "http-server" && reason == "redis init failed"
+            ),
+            "expected ComponentFailure {{ tag: \"http-server\", reason: \"redis init failed\" }}, got {result:?}"
+        );
+    }
 
     #[tokio::test]
     async fn test_create_dedicated_readwrite_client_no_config() {

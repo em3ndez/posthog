@@ -7,10 +7,13 @@ import { LemonButton, LemonModal } from '@posthog/lemon-ui'
 
 import { exportsLogic } from 'lib/components/ExportButton/exportsLogic'
 import { SpinnerOverlay } from 'lib/lemon-ui/Spinner/Spinner'
-import { capitalizeFirstLetter, isGroupType, percentage } from 'lib/utils'
+import { getAccessControlDisabledReason } from 'lib/utils/accessControlUtils'
+import { isGroupType } from 'lib/utils/guards'
+import { percentage } from 'lib/utils/numbers'
+import { capitalizeFirstLetter } from 'lib/utils/strings'
 import { insightLogic } from 'scenes/insights/insightLogic'
 import { groupDisplayId } from 'scenes/persons/GroupActorDisplay'
-import { asDisplay } from 'scenes/persons/person-utils'
+import { asDisplay, pickBestPersonDistinctId } from 'scenes/persons/person-utils'
 import { RetentionTableAppearanceType } from 'scenes/retention/types'
 import { MissingPersonsAlert } from 'scenes/trends/persons-modal/PersonsModal'
 import { SaveCohortModal } from 'scenes/trends/persons-modal/SaveCohortModal'
@@ -18,31 +21,38 @@ import { urls } from 'scenes/urls'
 
 import { MAX_SELECT_RETURNED_ROWS, startDownload } from '~/queries/nodes/DataTable/DataTableExport'
 import { DataTableNode, NodeKind } from '~/queries/schema/schema-general'
-import { ExporterFormat } from '~/types'
+import { AccessControlLevel, AccessControlResourceType, ExporterFormat } from '~/types'
 
-import { retentionLogic } from './retentionLogic'
 import { retentionModalLogic } from './retentionModalLogic'
 import { retentionPeopleLogic } from './retentionPeopleLogic'
 import { formatRetentionCohortLabel } from './utils'
 
 export function RetentionModal(): JSX.Element | null {
     const { insightProps } = useValues(insightLogic)
-    const { results } = useValues(retentionLogic(insightProps))
     const { people, peopleLoading, peopleLoadingMore } = useValues(retentionPeopleLogic(insightProps))
     const { loadMorePeople } = useActions(retentionPeopleLogic(insightProps))
     const {
         aggregationTargetLabel,
+        canOpenPersonModal,
         selectedInterval,
         selectedBreakdownValue,
+        selectedRow: row,
         exploreUrl,
         insightEventsQueryUrl,
         actorsQuery,
         isCohortModalOpen,
         theme,
         retentionFilter,
+        selectedColumnIndex,
     } = useValues(retentionModalLogic(insightProps))
     const { closeModal, saveAsCohort, setIsCohortModalOpen } = useActions(retentionModalLogic(insightProps))
     const { startExport } = useActions(exportsLogic)
+
+    // Creating an export requires editor access to the export resource.
+    const exportAccessControlDisabledReason = getAccessControlDisabledReason(
+        AccessControlResourceType.Export,
+        AccessControlLevel.Editor
+    )
 
     const backgroundColor = theme?.['preset-1'] || '#000000' // Default to black if no color found
     const dataTableNodeQuery: DataTableNode | undefined = actorsQuery
@@ -52,23 +62,10 @@ export function RetentionModal(): JSX.Element | null {
           }
         : undefined
 
-    if (!results || selectedInterval === null) {
+    if (!canOpenPersonModal || selectedInterval === null || !row) {
         return null
     }
 
-    // Find the correct row based on both selectedInterval and selectedBreakdownValue
-    const row =
-        selectedBreakdownValue !== null
-            ? (() => {
-                  // Get the target date from the selected interval in the non-breakdown results
-                  const targetLabel = results[selectedInterval]?.label
-                  // Find the row with matching breakdown value and date label
-                  return (
-                      results.find((r) => r.breakdown_value === selectedBreakdownValue && r.label === targetLabel) ||
-                      results[selectedInterval]
-                  )
-              })()
-            : results[selectedInterval]
     const rowLength = row.values.length
     const isEmpty = row.values[0]?.count === 0
 
@@ -85,6 +82,7 @@ export function RetentionModal(): JSX.Element | null {
                             {!!people.result?.length && !exploreUrl && (
                                 <LemonButton
                                     type="secondary"
+                                    disabledReason={exportAccessControlDisabledReason ?? undefined}
                                     onClick={() =>
                                         startExport({
                                             export_format: ExporterFormat.CSV,
@@ -100,6 +98,7 @@ export function RetentionModal(): JSX.Element | null {
                             {!!people.result?.length && !!dataTableNodeQuery && (
                                 <LemonButton
                                     type="secondary"
+                                    disabledReason={exportAccessControlDisabledReason ?? undefined}
                                     onClick={() => {
                                         dataTableNodeQuery && void startDownload(dataTableNodeQuery, true, startExport)
                                     }}
@@ -178,7 +177,13 @@ export function RetentionModal(): JSX.Element | null {
                                         <th>{capitalizeFirstLetter(aggregationTargetLabel.singular)}</th>
                                         {row.values?.map((data: any, index: number) => {
                                             return (
-                                                <th key={index}>
+                                                <th
+                                                    key={index}
+                                                    className={clsx('!pl-2', {
+                                                        'RetentionTable__SelectedColumn--header':
+                                                            index === selectedColumnIndex,
+                                                    })}
+                                                >
                                                     <div>{data.label}</div>
                                                     <div>
                                                         {data.count}
@@ -211,17 +216,20 @@ export function RetentionModal(): JSX.Element | null {
                                                                 personAppearances.person.properties
                                                             )}
                                                         </LemonButton>
-                                                    ) : (
+                                                    ) : 'distinct_ids' in personAppearances.person &&
+                                                      personAppearances.person.distinct_ids?.[0] ? (
                                                         <LemonButton
                                                             size="small"
                                                             to={urls.personByDistinctId(
-                                                                personAppearances.person.distinct_ids?.[0]
+                                                                pickBestPersonDistinctId(
+                                                                    personAppearances.person.distinct_ids
+                                                                ) ?? personAppearances.person.distinct_ids[0]
                                                             )}
                                                             data-attr="retention-person-link"
                                                         >
                                                             {asDisplay(personAppearances.person)}
                                                         </LemonButton>
-                                                    )}
+                                                    ) : null}
                                                 </td>
 
                                                 {personAppearances.appearances
@@ -230,7 +238,13 @@ export function RetentionModal(): JSX.Element | null {
                                                     .map((appearance: number, index: number) => {
                                                         const hasAppearance = !!appearance
                                                         return (
-                                                            <td key={index}>
+                                                            <td
+                                                                key={index}
+                                                                className={clsx({
+                                                                    'RetentionTable__SelectedColumn--cell':
+                                                                        index === selectedColumnIndex,
+                                                                })}
+                                                            >
                                                                 <div
                                                                     className={clsx(
                                                                         'RetentionTable__Tab',

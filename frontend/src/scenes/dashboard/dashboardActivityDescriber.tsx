@@ -2,8 +2,11 @@ import posthog from 'posthog-js'
 import { DashboardFilter, HogQLVariable } from 'src/queries/schema/schema-general'
 
 import { Link } from '@posthog/lemon-ui'
+import {
+    DASHBOARD_GRID_COMPACTION_LABELS,
+    DASHBOARD_TILE_SPACING_LABELS,
+} from '@posthog/products-dashboards/frontend/dashboardCustomization'
 
-import { SentenceList } from 'lib/components/ActivityLog/SentenceList'
 import {
     ActivityChange,
     ActivityLogItem,
@@ -14,6 +17,7 @@ import {
     detectBoolean,
     userNameForLogItem,
 } from 'lib/components/ActivityLog/humanizeActivity'
+import { SentenceList } from 'lib/components/ActivityLog/SentenceList'
 import {
     BreakdownSummary,
     DateRangeSummary,
@@ -21,7 +25,8 @@ import {
     VariablesSummary,
 } from 'lib/components/Cards/InsightCard/InsightDetails'
 import { ObjectTags } from 'lib/components/ObjectTags/ObjectTags'
-import { pluralize } from 'lib/utils'
+import { isKeyOf } from 'lib/utils/guards'
+import { pluralize } from 'lib/utils/strings'
 import { urls } from 'scenes/urls'
 
 import { DashboardType } from '~/types'
@@ -147,6 +152,9 @@ const dashboardActionsMapping: Record<
     breakdown_colors: () => null,
     data_color_theme_id: () => null,
     last_accessed_at: () => null,
+    folder: () => null,
+    file_system_id: () => null,
+    file_system_path: () => null,
     is_shared: () => null,
     creation_mode: () => null,
     user_access_level: () => null,
@@ -154,6 +162,31 @@ const dashboardActionsMapping: Record<
     last_refresh: () => null,
     tiles: () => null,
     last_viewed_at: () => null,
+    quick_filter_ids: () => null,
+    customization: function onChangedCustomization(change) {
+        const before = change?.before as DashboardType['customization']
+        const after = change?.after as DashboardType['customization']
+        const description: Description[] = []
+        if (after?.layout_compaction && after.layout_compaction !== before?.layout_compaction) {
+            description.push(
+                <>
+                    changed tile movement to{' '}
+                    <strong>{DASHBOARD_GRID_COMPACTION_LABELS[after.layout_compaction]}</strong>
+                </>
+            )
+        }
+        if (after?.tile_spacing && after.tile_spacing !== before?.tile_spacing) {
+            if (description.length > 0) {
+                description.push(' and ')
+            }
+            description.push(
+                <>
+                    changed tile density to <strong>{DASHBOARD_TILE_SPACING_LABELS[after.tile_spacing]}</strong>
+                </>
+            )
+        }
+        return description.length > 0 ? { description } : null
+    },
 }
 
 export function dashboardActivityDescriber(logItem: ActivityLogItem, asNotification?: boolean): HumanizedChange {
@@ -185,7 +218,7 @@ export function dashboardActivityDescriber(logItem: ActivityLogItem, asNotificat
 
         try {
             for (const change of logItem.detail.changes || []) {
-                if (!change?.field || !dashboardActionsMapping[change.field]) {
+                if (!change?.field || !isKeyOf(change.field, dashboardActionsMapping)) {
                     continue // dashboard updates have to have a "field" to be described
                 }
 
@@ -222,6 +255,39 @@ export function dashboardActivityDescriber(logItem: ActivityLogItem, asNotificat
                 ),
                 extendedDescription,
             }
+        }
+    }
+
+    if (logItem.activity === 'sharing enabled') {
+        return {
+            description: (
+                <>
+                    <strong className="ph-no-capture">{userNameForLogItem(logItem)}</strong> shared{' '}
+                    {asNotification ? 'your' : 'the'} dashboard {nameAndLink(logItem)}
+                </>
+            ),
+        }
+    }
+
+    if (logItem.activity === 'sharing disabled') {
+        return {
+            description: (
+                <>
+                    <strong className="ph-no-capture">{userNameForLogItem(logItem)}</strong> deleted shared link for{' '}
+                    {asNotification ? 'your' : 'the'} dashboard {nameAndLink(logItem)}
+                </>
+            ),
+        }
+    }
+
+    if (logItem.activity === 'access token refreshed') {
+        return {
+            description: (
+                <>
+                    <strong className="ph-no-capture">{userNameForLogItem(logItem)}</strong> refreshed the shared link
+                    for {asNotification ? 'your' : 'the'} dashboard {nameAndLink(logItem)}
+                </>
+            ),
         }
     }
 

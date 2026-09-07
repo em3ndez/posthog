@@ -1,6 +1,6 @@
 #[path = "common/integration_utils.rs"]
 mod integration_utils;
-use integration_utils::DEFAULT_CONFIG;
+use integration_utils::{test_lifecycle_handlers, DEFAULT_CONFIG};
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -10,18 +10,17 @@ use axum::http::StatusCode;
 use axum::Router;
 use axum_test_helper::TestClient;
 use common_redis::MockRedisClient;
-use health::HealthRegistry;
 use limiters::redis::{QuotaResource, QUOTA_LIMITER_CACHE_KEY};
 use limiters::token_dropper::TokenDropper;
 use serde_json::Value;
 
 use capture::api::CaptureError;
 use capture::config::CaptureMode;
+use capture::outputs::{OutputRegistry, PublishEvents};
 use capture::quota_limiters::{
     is_exception_event, is_llm_event, is_survey_event, CaptureQuotaLimiter, EventInfo,
 };
 use capture::router::router;
-use capture::sinks::Event;
 use capture::time::TimeSource;
 use capture::v0_request::ProcessedEvent;
 use chrono::{DateTime, Utc};
@@ -32,13 +31,8 @@ struct MemorySink {
 }
 
 #[async_trait]
-impl Event for MemorySink {
-    async fn send(&self, event: ProcessedEvent) -> Result<(), CaptureError> {
-        self.events.lock().unwrap().push(event);
-        Ok(())
-    }
-
-    async fn send_batch(&self, events: Vec<ProcessedEvent>) -> Result<(), CaptureError> {
+impl PublishEvents for MemorySink {
+    async fn publish_events(&self, events: Vec<ProcessedEvent>) -> Result<(), CaptureError> {
         self.events.lock().unwrap().extend(events);
         Ok(())
     }
@@ -70,7 +64,8 @@ async fn setup_router_with_limits(
     // resources that will be set limited for the given token for scoped limiters to detect
     resources_to_limit: Vec<QuotaResource>,
 ) -> (Router, MemorySink) {
-    let liveness = HealthRegistry::new("quota_limit_tests");
+    let (readiness, liveness, _monitor) = test_lifecycle_handlers();
+
     let sink = MemorySink::default();
     let timesource = FixedTimeSource {
         time: DateTime::parse_from_rfc3339("2025-07-31T12:00:00Z")
@@ -125,27 +120,37 @@ async fn setup_router_with_limits(
 
     let app = router(
         timesource,
+        readiness,
         liveness,
-        sink.clone(),
+        Arc::new(OutputRegistry::single(sink.clone())),
         redis,
         None,
         quota_limiter,
         TokenDropper::default(),
-        None,  // event_restriction_service
-        false, // metrics
+        None, // event_restriction_service
+        None, // recorder_handle
         CaptureMode::Events,
-        String::from("capture"),
-        None,        // concurrency_limit
-        1024 * 1024, // event_payload_size_limit
-        false,       // enable_historical_rerouting
-        1,           // historical_rerouting_threshold_days
-        false,       // is_mirror_deploy
-        0.0,         // verbose_sample_percent
-        26_214_400,  // ai_max_sum_of_parts_bytes (25MB)
-        None,        // ai_blob_storage
-        Some(10),    // request_timeout_seconds
-        None,        // body_chunk_read_timeout_ms
-        256,         // body_read_chunk_size_kb
+        None,             // concurrency_limit
+        1024 * 1024,      // event_payload_size_limit
+        false,            // enable_historical_rerouting
+        1,                // historical_rerouting_threshold_days
+        false,            // is_mirror_deploy
+        0.0,              // verbose_sample_percent
+        26_214_400,       // ai_max_sum_of_parts_bytes (25MB)
+        983_040,          // ai_max_event_bytes (960KB, the previous hardcoded limit)
+        None,             // body_chunk_read_timeout_ms
+        256,              // body_read_chunk_size_kb
+        10 * 1024 * 1024, // capture_v1_max_compressed_body_bytes
+        50 * 1024 * 1024, // capture_v1_max_decompressed_body_bytes
+        None,             // overflow_limiter
+        None,             // ai_events_overflow_limiter
+        None,             // ai_byte_rate_limiter
+        None,             // replay_overflow_limiter
+        None,             // v1_sink_router
+        8,                // capture_v1_scatter_gather_min_batch
+        None,             // ai_gateway_signing_secret
+        false,            // ai_events_overflow_enabled
+        None,             // ingestion_warning_emitter
     );
 
     (app, sink)
@@ -1145,7 +1150,8 @@ async fn test_survey_quota_allows_events_when_not_limited() {
 #[tokio::test]
 async fn test_survey_quota_cross_batch_first_submission_allowed() {
     let token = "test_token_cross_batch_first";
-    let liveness = HealthRegistry::new("billing_limit_tests");
+    let (readiness, liveness, _monitor) = test_lifecycle_handlers();
+
     let sink = MemorySink::default();
     let timesource = FixedTimeSource {
         time: DateTime::parse_from_rfc3339("2025-07-31T12:00:00Z")
@@ -1169,16 +1175,16 @@ async fn test_survey_quota_cross_batch_first_submission_allowed() {
 
     let app = router(
         timesource,
+        readiness,
         liveness,
-        sink.clone(),
+        Arc::new(OutputRegistry::single(sink.clone())),
         redis,
         None,
         quota_limiter,
         TokenDropper::default(),
         None, // event_restriction_service
-        false,
+        None, // recorder_handle
         CaptureMode::Events,
-        String::from("capture"),
         None,
         1024 * 1024,
         false,
@@ -1186,10 +1192,20 @@ async fn test_survey_quota_cross_batch_first_submission_allowed() {
         false,
         0.0,
         26_214_400,
-        None,     // ai_blob_storage
-        Some(10), // request_timeout_seconds
-        None,     // body_chunk_read_timeout_ms
-        256,      // body_read_chunk_size_kb
+        983_040,          // ai_max_event_bytes (960KB, the previous hardcoded limit)
+        None,             // body_chunk_read_timeout_ms
+        256,              // body_read_chunk_size_kb
+        10 * 1024 * 1024, // capture_v1_max_compressed_body_bytes
+        50 * 1024 * 1024, // capture_v1_max_decompressed_body_bytes
+        None,             // overflow_limiter
+        None,             // ai_events_overflow_limiter
+        None,             // ai_byte_rate_limiter
+        None,             // replay_overflow_limiter
+        None,             // v1_sink_router
+        8,                // capture_v1_scatter_gather_min_batch
+        None,             // ai_gateway_signing_secret
+        false,            // ai_events_overflow_enabled
+        None,             // ingestion_warning_emitter
     );
 
     let client = TestClient::new(app);
@@ -1225,7 +1241,8 @@ async fn test_survey_quota_cross_batch_first_submission_allowed() {
 #[tokio::test]
 async fn test_survey_quota_cross_batch_duplicate_submission_dropped() {
     let token = "test_token_cross_batch_dup";
-    let liveness = HealthRegistry::new("billing_limit_tests");
+    let (readiness, liveness, _monitor) = test_lifecycle_handlers();
+
     let sink = MemorySink::default();
     let timesource = FixedTimeSource {
         time: DateTime::parse_from_rfc3339("2025-07-31T12:00:00Z")
@@ -1251,16 +1268,16 @@ async fn test_survey_quota_cross_batch_duplicate_submission_dropped() {
 
     let app = router(
         timesource,
+        readiness,
         liveness,
-        sink.clone(),
+        Arc::new(OutputRegistry::single(sink.clone())),
         redis,
         None,
         quota_limiter,
         TokenDropper::default(),
         None, // event_restriction_service
-        false,
+        None, // recorder_handle
         CaptureMode::Events,
-        String::from("capture"),
         None,
         1024 * 1024,
         false,
@@ -1268,10 +1285,20 @@ async fn test_survey_quota_cross_batch_duplicate_submission_dropped() {
         false,
         0.0,
         26_214_400,
-        None,     // ai_blob_storage
-        Some(10), // request_timeout_seconds
-        None,     // body_chunk_read_timeout_ms
-        256,      // body_read_chunk_size_kb
+        983_040,          // ai_max_event_bytes (960KB, the previous hardcoded limit)
+        None,             // body_chunk_read_timeout_ms
+        256,              // body_read_chunk_size_kb
+        10 * 1024 * 1024, // capture_v1_max_compressed_body_bytes
+        50 * 1024 * 1024, // capture_v1_max_decompressed_body_bytes
+        None,             // overflow_limiter
+        None,             // ai_events_overflow_limiter
+        None,             // ai_byte_rate_limiter
+        None,             // replay_overflow_limiter
+        None,             // v1_sink_router
+        8,                // capture_v1_scatter_gather_min_batch
+        None,             // ai_gateway_signing_secret
+        false,            // ai_events_overflow_enabled
+        None,             // ingestion_warning_emitter
     );
 
     let client = TestClient::new(app);
@@ -1307,7 +1334,8 @@ async fn test_survey_quota_cross_batch_duplicate_submission_dropped() {
 #[tokio::test]
 async fn test_survey_quota_cross_batch_redis_error_fail_open() {
     let token = "test_token_redis_error";
-    let liveness = HealthRegistry::new("billing_limit_tests");
+    let (readiness, liveness, _monitor) = test_lifecycle_handlers();
+
     let sink = MemorySink::default();
     let timesource = FixedTimeSource {
         time: DateTime::parse_from_rfc3339("2025-07-31T12:00:00Z")
@@ -1337,16 +1365,16 @@ async fn test_survey_quota_cross_batch_redis_error_fail_open() {
 
     let app = router(
         timesource,
+        readiness,
         liveness,
-        sink.clone(),
+        Arc::new(OutputRegistry::single(sink.clone())),
         redis,
         None,
         quota_limiter,
         TokenDropper::default(),
         None, // event_restriction_service
-        false,
+        None, // recorder_handle
         CaptureMode::Events,
-        String::from("capture"),
         None,
         1024 * 1024,
         false,
@@ -1354,10 +1382,20 @@ async fn test_survey_quota_cross_batch_redis_error_fail_open() {
         false,
         0.0,
         26_214_400,
-        None,     // ai_blob_storage
-        Some(10), // request_timeout_seconds
-        None,     // body_chunk_read_timeout_ms
-        256,      // body_read_chunk_size_kb
+        983_040,          // ai_max_event_bytes (960KB, the previous hardcoded limit)
+        None,             // body_chunk_read_timeout_ms
+        256,              // body_read_chunk_size_kb
+        10 * 1024 * 1024, // capture_v1_max_compressed_body_bytes
+        50 * 1024 * 1024, // capture_v1_max_decompressed_body_bytes
+        None,             // overflow_limiter
+        None,             // ai_events_overflow_limiter
+        None,             // ai_byte_rate_limiter
+        None,             // replay_overflow_limiter
+        None,             // v1_sink_router
+        8,                // capture_v1_scatter_gather_min_batch
+        None,             // ai_gateway_signing_secret
+        false,            // ai_events_overflow_enabled
+        None,             // ingestion_warning_emitter
     );
 
     let client = TestClient::new(app);
@@ -1732,7 +1770,8 @@ async fn test_ai_quota_with_empty_batch_returns_bad_request() {
 #[tokio::test]
 async fn test_ai_quota_cross_batch_redis_error_fail_open() {
     let token = "test_token_redis_error_ai";
-    let liveness = HealthRegistry::new("ai_limit_tests");
+    let (readiness, liveness, _monitor) = test_lifecycle_handlers();
+
     let sink = MemorySink::default();
     let timesource = FixedTimeSource {
         time: DateTime::parse_from_rfc3339("2025-07-31T12:00:00Z")
@@ -1760,16 +1799,16 @@ async fn test_ai_quota_cross_batch_redis_error_fail_open() {
 
     let app = router(
         timesource,
+        readiness,
         liveness,
-        sink.clone(),
+        Arc::new(OutputRegistry::single(sink.clone())),
         redis,
         None,
         quota_limiter,
         TokenDropper::default(),
         None, // event_restriction_service
-        false,
+        None, // recorder_handle
         CaptureMode::Events,
-        String::from("capture"),
         None,
         1024 * 1024,
         false,
@@ -1777,10 +1816,20 @@ async fn test_ai_quota_cross_batch_redis_error_fail_open() {
         false,
         0.0,
         26_214_400,
-        None,     // ai_blob_storage
-        Some(10), // request_timeout_seconds
-        None,     // body_chunk_read_timeout_ms
-        256,      // body_read_chunk_size_kb
+        983_040,          // ai_max_event_bytes (960KB, the previous hardcoded limit)
+        None,             // body_chunk_read_timeout_ms
+        256,              // body_read_chunk_size_kb
+        10 * 1024 * 1024, // capture_v1_max_compressed_body_bytes
+        50 * 1024 * 1024, // capture_v1_max_decompressed_body_bytes
+        None,             // overflow_limiter
+        None,             // ai_events_overflow_limiter
+        None,             // ai_byte_rate_limiter
+        None,             // replay_overflow_limiter
+        None,             // v1_sink_router
+        8,                // capture_v1_scatter_gather_min_batch
+        None,             // ai_gateway_signing_secret
+        false,            // ai_events_overflow_enabled
+        None,             // ingestion_warning_emitter
     );
 
     let client = TestClient::new(app);

@@ -1,8 +1,10 @@
 import pytest
 from posthog.test.base import BaseTest
 
+from parameterized import parameterized
+
 from posthog.hogql.compiler.bytecode import create_bytecode, execute_hog, to_bytecode
-from posthog.hogql.errors import QueryError
+from posthog.hogql.errors import QueryError, SyntaxError
 from posthog.hogql.parser import parse_program
 
 from common.hogvm.python.operation import (
@@ -561,6 +563,31 @@ class TestBytecode(BaseTest):
         self.assertEqual(
             str(e.exception), 'Variable "globalVar" not declared in this scope. Can not assign to globals.'
         )
+
+    @parameterized.expand(
+        [
+            ("past the top of the stack", "let output := lower(output)\nreturn output"),
+            ("within the stack", "let output := concat('PREFIX:', output)\nreturn output"),
+        ]
+    )
+    def test_bytecode_variable_cannot_reference_itself(self, _name: str, source: str):
+        with self.assertRaises(QueryError) as e:
+            create_bytecode(parse_program(source))
+        self.assertEqual(
+            str(e.exception), "Variable `output` cannot be used inside its own declaration. Rename the new variable."
+        )
+
+    def test_bytecode_lambda_can_reference_itself(self):
+        # The guard above must not reach a lambda, whose body runs after the assignment completes.
+        self.assertEqual(
+            execute_hog("let f := (n) -> n <= 1 ? 1 : n * f(n - 1)\nreturn f(5)", team=self.team).result, 120
+        )
+
+    def test_bytecode_bare_throw(self):
+        # A bare `throw` is rejected at parse time; `throw <expr>` still compiles.
+        with self.assertRaises(SyntaxError):
+            execute_hog("throw", team=self.team)
+        create_bytecode(parse_program("throw Error('boom')"))
 
     def test_bytecode_execute(self):
         # Test a simple operations. The Hog execution itself is tested under common/hogvm/python/

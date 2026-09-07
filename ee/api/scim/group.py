@@ -1,16 +1,17 @@
 import logging
-from typing import Union
+from typing import Union, cast
 
 from django.db import transaction
+from django.db.models import QuerySet
 
 from django_scim import constants
 from django_scim.adapters import SCIMGroup
 from scim2_filter_parser.attr_paths import AttrPath
 
 from posthog.models import OrganizationMembership, User
-from posthog.models.organization_domain import OrganizationDomain
+from posthog.models.identity_provider_config import IdentityProviderConfig
 
-from ee.models.rbac.role import Role, RoleMembership
+from products.access_control.backend.models.role import Role, RoleMembership
 
 logger = logging.getLogger(__name__)
 
@@ -47,26 +48,26 @@ class PostHogSCIMGroup(SCIMGroup):
         """
         Return list of group members in SCIM format.
         """
-        role_memberships = RoleMembership.objects.filter(role=self.obj).select_related("user")
+        role_memberships = RoleMembership.objects.filter(role=self.obj).valid_for_authorization().select_related("user")
         return [
             {
                 "value": str(rm.user.id),
-                "$ref": f"/scim/v2/{self._organization_domain.id}/Users/{rm.user.id}",
+                "$ref": f"/scim/v2/{self._config.scim_slug}/Users/{rm.user.id}",
                 "display": rm.user.email,
             }
             for rm in role_memberships
         ]
 
-    def __init__(self, obj: Role, organization_domain: OrganizationDomain):
+    def __init__(self, obj: Role, config: IdentityProviderConfig):
         super().__init__(obj)
-        self._organization_domain = organization_domain
+        self._config = config
 
     @classmethod
     def resource_type_dict(cls, request=None) -> dict:
         return {
             "id": cls.resource_type,
             "name": cls.resource_type,
-            "endpoint": f"/scim/v2/{request.auth.id if request and request.auth else '{domain_id}'}/Groups",
+            "endpoint": f"/scim/v2/{request.auth.scim_slug if request and request.auth else '{scim_slug}'}/Groups",
             "schema": constants.SchemaURI.GROUP,
         }
 
@@ -81,12 +82,12 @@ class PostHogSCIMGroup(SCIMGroup):
             "members": self.members,
             "meta": {
                 "resourceType": self.resource_type,
-                "location": f"/scim/v2/{self._organization_domain.id}/Groups/{self.id}",
+                "location": f"/scim/v2/{self._config.scim_slug}/Groups/{self.id}",
             },
         }
 
     @classmethod
-    def from_dict(cls, data: dict, organization_domain: OrganizationDomain) -> "PostHogSCIMGroup":
+    def from_dict(cls, data: dict, config: IdentityProviderConfig) -> "PostHogSCIMGroup":
         """
         Create or update a Role from SCIM Group data.
         Upserts role by name matching.
@@ -99,47 +100,72 @@ class PostHogSCIMGroup(SCIMGroup):
             # Upsert role by name
             role, created = Role.objects.get_or_create(
                 name=display_name,
-                organization=organization_domain.organization,
+                organization=config.organization,
                 defaults={"created_by": None},
             )
 
             # Handle member updates if provided
             if "members" in data:
-                cls._update_members(role, data["members"], organization_domain)
+                cls._update_members(role, data["members"], config)
 
-        return cls(role, organization_domain)
+        return cls(role, config)
+
+    @staticmethod
+    def _parse_member_id(raw_member_id) -> str | None:
+        """
+        Normalize a SCIM `members[].value` to the string form of an integer ID,
+        matching the always-string `current_user_ids` set in `_update_members`.
+
+        Some IdPs send `value` as a JSON number; without this, the set diff
+        would be type-asymmetric and silently delete the membership the IdP
+        asked to keep. Non-coercible values (e.g. nested-group UUIDs from
+        Entra ID) return None and are logged once.
+        """
+        if raw_member_id is None:
+            return None
+        try:
+            return str(int(raw_member_id))
+        except (TypeError, ValueError):
+            logger.warning("scim_group_skip_invalid_member_id", extra={"member_value": raw_member_id})
+            return None
+
+    @staticmethod
+    def _assign_role_member(role: Role, user_pk: int, config: IdentityProviderConfig) -> None:
+        try:
+            user = User.objects.get(id=user_pk)
+        except User.DoesNotExist:
+            return
+
+        org_membership = OrganizationMembership.objects.filter(user=user, organization=config.organization).first()
+        if not org_membership:
+            return
+
+        # nosemgrep: idor-lookup-without-org (SCIM bearer token auth, org gated by middleware)
+        RoleMembership.objects.update_or_create(
+            role=role,
+            user=user,
+            defaults={"organization_member": org_membership},
+        )
 
     @classmethod
-    def _update_members(cls, role: Role, members_data: list[dict], organization_domain: OrganizationDomain) -> None:
+    def _update_members(cls, role: Role, members_data: list[dict], config: IdentityProviderConfig) -> None:
         """
         Update role membership based on SCIM members list.
         """
-        # Get list of user IDs from SCIM data
-        member_user_ids = {member.get("value") for member in members_data}
+        member_user_ids: set[str] = set()
+        for member in members_data:
+            parsed = cls._parse_member_id(member.get("value"))
+            if parsed is not None:
+                member_user_ids.add(parsed)
 
-        # Get current role members
         current_memberships = RoleMembership.objects.filter(role=role).select_related("user", "organization_member")
-
         current_user_ids = {str(rm.user.id) for rm in current_memberships}
         to_add = member_user_ids - current_user_ids
         to_remove = current_user_ids - member_user_ids
 
-        for user_id in to_add:
-            try:
-                user = User.objects.get(id=user_id)
-                org_membership = OrganizationMembership.objects.filter(
-                    user=user, organization=organization_domain.organization
-                ).first()
+        for raw_member_id in to_add:
+            cls._assign_role_member(role, int(raw_member_id), config)
 
-                if org_membership:
-                    # nosemgrep: idor-lookup-without-org (SCIM bearer token auth, org gated by middleware)
-                    RoleMembership.objects.get_or_create(
-                        role=role, user=user, defaults={"organization_member": org_membership}
-                    )
-            except User.DoesNotExist:
-                continue
-
-        # Remove members no longer in the group
         RoleMembership.objects.filter(role=role, user__id__in=to_remove).delete()
 
     def put(self, data: dict) -> None:
@@ -157,7 +183,7 @@ class PostHogSCIMGroup(SCIMGroup):
             self.obj.save()
 
             members_data = data.get("members", [])
-            self._update_members(self.obj, members_data, self._organization_domain)
+            self._update_members(self.obj, members_data, self._config)
 
     def delete(self) -> None:
         """
@@ -183,8 +209,8 @@ class PostHogSCIMGroup(SCIMGroup):
                 if path.is_complex:
                     raise ValueError("Complex filtered paths for members are not supported")
                 else:
-                    members_data = value if isinstance(value, list) else [value]
-                    self._update_members(self.obj, members_data, self._organization_domain)
+                    members_data: list[dict] = cast(list[dict], value if isinstance(value, list) else [value])
+                    self._update_members(self.obj, members_data, self._config)
 
     def handle_add(self, path: AttrPath, value: Union[str, list, dict], operation: dict) -> None:
         """
@@ -215,23 +241,10 @@ class PostHogSCIMGroup(SCIMGroup):
                     members_to_add = [{"value": value}]
 
                 for member_data in members_to_add:
-                    user_id = member_data.get("value")
-
-                    try:
-                        user = User.objects.get(id=user_id)
-                        # Upsert organization membership
-                        org_membership, _ = OrganizationMembership.objects.get_or_create(
-                            user=user,
-                            organization=self._organization_domain.organization,
-                            defaults={"level": OrganizationMembership.Level.MEMBER},
-                        )
-
-                        # nosemgrep: idor-lookup-without-org (SCIM bearer token auth, org gated by middleware)
-                        RoleMembership.objects.get_or_create(
-                            role=self.obj, user=user, defaults={"organization_member": org_membership}
-                        )
-                    except User.DoesNotExist:
+                    parsed = self._parse_member_id(member_data.get("value"))
+                    if parsed is None:
                         continue
+                    self._assign_role_member(self.obj, int(parsed), self._config)
 
     def handle_remove(self, path: AttrPath, value: Union[str, list, dict], operation: dict) -> None:
         """
@@ -272,9 +285,5 @@ class PostHogSCIMGroup(SCIMGroup):
                     RoleMembership.objects.filter(role=self.obj).delete()
 
     @classmethod
-    def get_for_organization(cls, organization_domain: OrganizationDomain) -> list["PostHogSCIMGroup"]:
-        """
-        Get all roles (groups) for a specific organization.
-        """
-        roles = Role.objects.filter(organization=organization_domain.organization)
-        return [cls(role, organization_domain) for role in roles]
+    def get_queryset_for_organization(cls, config: IdentityProviderConfig) -> QuerySet[Role]:
+        return Role.objects.filter(organization=config.organization).order_by("id")

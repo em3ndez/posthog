@@ -4,13 +4,13 @@ import { LemonButton } from '@posthog/lemon-ui'
 import { IconLink } from 'lib/lemon-ui/icons'
 import { copyToClipboard } from 'lib/utils/copyToClipboard'
 
-function getSurveyUrl(surveyId: string): string {
+export function getSurveyUrl(surveyId: string): string {
     const url = new URL(window.location.origin)
     url.pathname = `/external_surveys/${surveyId}`
     return url.toString()
 }
 
-function getEmbedSnippet(surveyId: string): string {
+export function getEmbedSnippet(surveyId: string): string {
     const surveyUrl = getSurveyUrl(surveyId)
     return `<div id="posthog-survey-container-${surveyId}"></div>
 <script>
@@ -41,7 +41,9 @@ function getEmbedSnippet(surveyId: string): string {
     }
 
     window.addEventListener('message', function(e) {
-      if (e.origin !== '${new URL(surveyUrl).origin}') return;
+      // Sandboxed surveys have an opaque origin, so bind messages to this iframe's window.
+      if (e.source !== iframe.contentWindow) return;
+      if (e.origin !== 'null' && e.origin !== '${new URL(surveyUrl).origin}') return;
       if (e.data.type === 'posthog:survey:height' && e.data.surveyId === '${surveyId}') {
         var height = parseInt(e.data.height, 10);
         if (height > 0 && height < 10000) {

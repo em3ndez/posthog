@@ -1,25 +1,34 @@
 import { useActions, useValues } from 'kea'
-import { Suspense, lazy } from 'react'
+import { Suspense } from 'react'
 
 import { LemonButton } from '@posthog/lemon-ui'
 
+import { PIE_DISPLAY_TYPES } from 'lib/constants'
+import { WrappingLoadingSkeleton } from 'lib/ui/WrappingLoadingSkeleton/WrappingLoadingSkeleton'
+import { lazyWithRetry } from 'lib/utils/retryImport'
 import { insightLogic } from 'scenes/insights/insightLogic'
 import { BoldNumber } from 'scenes/insights/views/BoldNumber'
+import { BoxPlotChart } from 'scenes/insights/views/BoxPlot'
+import { TrendsCalendarHeatMap } from 'scenes/insights/views/CalendarHeatMap'
 import { InsightsTable } from 'scenes/insights/views/InsightsTable/InsightsTable'
+import { MetricCard } from 'scenes/insights/views/Metric/Metric'
 
 import { InsightVizNode } from '~/queries/schema/schema-general'
 import { QueryContext } from '~/queries/types'
 import { ChartDisplayType, InsightType } from '~/types'
 
-import { trendsDataLogic } from './trendsDataLogic'
-import { ActionsHorizontalBar, ActionsLineGraph, ActionsPie } from './viz'
+import { StickinessBarChart } from 'products/product_analytics/frontend/insights/stickiness/StickinessBarChart/StickinessBarChart'
+import { StickinessLineChart } from 'products/product_analytics/frontend/insights/stickiness/StickinessLineChart/StickinessLineChart'
+import { TrendsBarChart } from 'products/product_analytics/frontend/insights/trends/TrendsBarChart/TrendsBarChart'
+import { TrendsLifecycleChart } from 'products/product_analytics/frontend/insights/trends/TrendsLifecycleChart/TrendsLifecycleChart'
+import { TrendsLineChart } from 'products/product_analytics/frontend/insights/trends/TrendsLineChart/TrendsLineChart'
+import { TrendsPieChart } from 'products/product_analytics/frontend/insights/trends/TrendsPieChart/TrendsPieChart'
+import { TrendsSlopeChart } from 'products/product_analytics/frontend/insights/trends/TrendsSlopeChart/TrendsSlopeChart'
 
-// Lazy-loaded viz types that are rarely used on dashboards
-const WorldMap = lazy(() => import('scenes/insights/views/WorldMap').then((m) => ({ default: m.WorldMap })))
-const RegionMap = lazy(() => import('scenes/insights/views/RegionMap').then((m) => ({ default: m.RegionMap })))
-const TrendsCalendarHeatMap = lazy(() =>
-    import('scenes/insights/views/CalendarHeatMap').then((m) => ({ default: m.TrendsCalendarHeatMap }))
-)
+import { trendsDataLogic } from './trendsDataLogic'
+// Maps carry ~1 MB of d3-geo + topojson data only the map display needs; kept lazy.
+const WorldMap = lazyWithRetry(() => import('scenes/insights/views/WorldMap').then((m) => ({ default: m.WorldMap })))
+const RegionMap = lazyWithRetry(() => import('scenes/insights/views/RegionMap').then((m) => ({ default: m.RegionMap })))
 
 interface Props {
     view: InsightType
@@ -33,43 +42,38 @@ export function TrendInsight({ view, context, embedded, inSharedMode, editMode }
     const { insightProps, showPersonsModal: insightLogicShowPersonsModal } = useValues(insightLogic)
     const showPersonsModal = insightLogicShowPersonsModal && !inSharedMode
 
-    const { display, series, breakdownFilter, hasBreakdownMore, breakdownValuesLoading } = useValues(
-        trendsDataLogic(insightProps)
-    )
+    const { display, series, breakdownFilter, hasBreakdownMore, breakdownValuesLoading, isLifecycle, isStickiness } =
+        useValues(trendsDataLogic(insightProps))
     const { updateBreakdownFilter } = useActions(trendsDataLogic(insightProps))
 
-    const renderViz = (): JSX.Element | undefined => {
-        if (
-            !display ||
-            display === ChartDisplayType.ActionsLineGraph ||
-            display === ChartDisplayType.ActionsLineGraphCumulative ||
-            display === ChartDisplayType.ActionsAreaGraph ||
-            display === ChartDisplayType.ActionsBar ||
-            display === ChartDisplayType.ActionsUnstackedBar
-        ) {
-            return (
-                <ActionsLineGraph
-                    showPersonsModal={showPersonsModal}
-                    context={context}
-                    inCardView={embedded}
-                    inSharedMode={inSharedMode}
-                />
-            )
+    const commonProps = {
+        showPersonsModal,
+        context,
+        // Fill the card in every embedded surface (dashboard tiles and shared/exported insights alike) so the
+        // Metric sparkline stretches and hugs the bottom instead of collapsing to a fixed height mid-card.
+        inCardView: embedded,
+        inSharedMode,
+    }
+
+    const renderViz = (): JSX.Element => {
+        if (isLifecycle) {
+            return <TrendsLifecycleChart context={context} inSharedMode={inSharedMode} />
+        }
+        if (display === ChartDisplayType.ActionsBar || display === ChartDisplayType.ActionsUnstackedBar) {
+            if (isStickiness) {
+                return <StickinessBarChart context={context} />
+            }
+            return <TrendsBarChart context={context} inSharedMode={inSharedMode} embedded={embedded} />
         }
         if (display === ChartDisplayType.BoldNumber) {
-            return (
-                <BoldNumber
-                    showPersonsModal={showPersonsModal}
-                    context={context}
-                    inCardView={embedded}
-                    inSharedMode={inSharedMode}
-                />
-            )
+            return <BoldNumber {...commonProps} />
+        }
+        if (display === ChartDisplayType.Metric) {
+            return <MetricCard {...commonProps} />
         }
         if (display === ChartDisplayType.ActionsTable) {
-            const ActionsTable = InsightsTable
             return (
-                <ActionsTable
+                <InsightsTable
                     embedded
                     filterKey={`trends_${view}`}
                     canEditSeriesNameInline={editMode}
@@ -78,25 +82,11 @@ export function TrendInsight({ view, context, embedded, inSharedMode, editMode }
                 />
             )
         }
-        if (display === ChartDisplayType.ActionsPie) {
-            return (
-                <ActionsPie
-                    showPersonsModal={showPersonsModal}
-                    context={context}
-                    inCardView={embedded}
-                    inSharedMode={inSharedMode}
-                />
-            )
+        if (display && PIE_DISPLAY_TYPES.includes(display)) {
+            return <TrendsPieChart context={context} inSharedMode={inSharedMode} showPersonsModal={showPersonsModal} />
         }
         if (display === ChartDisplayType.ActionsBarValue) {
-            return (
-                <ActionsHorizontalBar
-                    showPersonsModal={showPersonsModal}
-                    context={context}
-                    inCardView={embedded}
-                    inSharedMode={inSharedMode}
-                />
-            )
+            return <TrendsBarChart context={context} inSharedMode={inSharedMode} embedded={embedded} />
         }
         if (display === ChartDisplayType.WorldMap) {
             const hasSubdivisionBreakdown =
@@ -107,47 +97,53 @@ export function TrendInsight({ view, context, embedded, inSharedMode, editMode }
                 )
 
             if (hasSubdivisionBreakdown) {
-                return (
-                    <RegionMap
-                        showPersonsModal={showPersonsModal}
-                        context={context}
-                        inCardView={embedded}
-                        inSharedMode={inSharedMode}
-                    />
-                )
+                return <RegionMap {...commonProps} />
             }
 
-            return (
-                <WorldMap
-                    showPersonsModal={showPersonsModal}
-                    context={context}
-                    inCardView={embedded}
-                    inSharedMode={inSharedMode}
-                />
-            )
+            return <WorldMap {...commonProps} />
         }
         if (display === ChartDisplayType.CalendarHeatmap) {
-            return (
-                <TrendsCalendarHeatMap
-                    showPersonsModal={showPersonsModal}
-                    context={context}
-                    inCardView={embedded}
-                    inSharedMode={inSharedMode}
-                />
-            )
+            return <TrendsCalendarHeatMap {...commonProps} />
         }
+        if (display === ChartDisplayType.BoxPlot) {
+            return <BoxPlotChart {...commonProps} inCardView={embedded} />
+        }
+        if (display === ChartDisplayType.SlopeGraph) {
+            return <TrendsSlopeChart context={context} />
+        }
+        // Line/area/cumulative displays land here, and so does any display value without a trends
+        // renderer (e.g. Auto, reachable via the API) — the default chart beats a blank tile.
+        if (isStickiness) {
+            return <StickinessLineChart context={context} />
+        }
+        return <TrendsLineChart context={context} inSharedMode={inSharedMode} embedded={embedded} />
     }
 
     return (
         <>
             {series && (
-                <div className={embedded ? 'InsightCard__viz' : `TrendsInsight TrendsInsight--${display}`}>
-                    <Suspense fallback={null}>{renderViz()}</Suspense>
+                <div
+                    className={
+                        embedded
+                            ? `InsightCard__viz InsightCard__viz--${display}`
+                            : `TrendsInsight TrendsInsight--${display}`
+                    }
+                >
+                    <Suspense
+                        fallback={
+                            <WrappingLoadingSkeleton fullWidth>
+                                <span className="block w-full h-72" />
+                            </WrappingLoadingSkeleton>
+                        }
+                    >
+                        {renderViz()}
+                    </Suspense>
                 </div>
             )}
             {!embedded &&
                 display !== ChartDisplayType.WorldMap && // the world map doesn't need this cta
                 display !== ChartDisplayType.CalendarHeatmap && // the heatmap doesn't need this cta
+                display !== ChartDisplayType.BoxPlot && // box plot doesn't support breakdowns
                 breakdownFilter &&
                 hasBreakdownMore && (
                     <div className="p-4">

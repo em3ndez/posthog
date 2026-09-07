@@ -5,8 +5,8 @@ import { LemonButton } from '@posthog/lemon-ui'
 import { CyclotronJobFiltersType, HogFunctionSubTemplateIdType, HogFunctionTypeType } from '~/types'
 
 import { HOG_FUNCTION_SUB_TEMPLATE_COMMON_PROPERTIES } from '../sub-templates/sub-templates'
-import { HogFunctionTemplateList } from './HogFunctionTemplateList'
 import { HogFunctionList } from './HogFunctionsList'
+import { HogFunctionTemplateList } from './HogFunctionTemplateList'
 
 export type LinkedHogFunctionsProps = {
     type: HogFunctionTypeType
@@ -18,7 +18,7 @@ export type LinkedHogFunctionsProps = {
     queryParams?: Record<string, string>
 }
 
-const getFiltersFromSubTemplateId = (
+export const getFiltersFromSubTemplateId = (
     subTemplateId: HogFunctionSubTemplateIdType
 ): CyclotronJobFiltersType | undefined => {
     const commonProperties = HOG_FUNCTION_SUB_TEMPLATE_COMMON_PROPERTIES[subTemplateId]
@@ -44,13 +44,14 @@ export function LinkedHogFunctions({
     const templateType = type === 'internal_destination' ? 'destination' : type
 
     const getConfigurationOverrides = (
-        subTemplateId?: HogFunctionSubTemplateIdType
-    ): CyclotronJobFiltersType | undefined => {
+        subTemplateId: HogFunctionSubTemplateIdType | undefined
+    ): { filters: CyclotronJobFiltersType } | undefined => {
         if (forceFilterGroups && forceFilterGroups.length > 0) {
-            return forceFilterGroups[0]
+            return { filters: forceFilterGroups[0] }
         }
         if (subTemplateId) {
-            return getFiltersFromSubTemplateId(subTemplateId)
+            const filters = getFiltersFromSubTemplateId(subTemplateId)
+            return filters ? { filters } : undefined
         }
         return undefined
     }
@@ -80,6 +81,7 @@ export function LinkedHogFunctions({
             key={logicKey}
             forceFilterGroups={hogFunctionFilterList}
             type={type}
+            returnTo={queryParams?.returnTo}
             hideFeedback={hideFeedback}
             emptyText={emptyText}
             extraControls={

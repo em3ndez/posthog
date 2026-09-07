@@ -7,14 +7,15 @@ import { LemonButton, LemonDialog, LemonInput, LemonLabel, LemonSkeleton } from 
 import { AuthorizedUrlList } from 'lib/components/AuthorizedUrlList/AuthorizedUrlList'
 import { AuthorizedUrlListType } from 'lib/components/AuthorizedUrlList/authorizedUrlListLogic'
 import { CodeSnippet } from 'lib/components/CodeSnippet'
-import { JSSnippet, JSSnippetV2 as JSSnippetV2Component } from 'lib/components/JSSnippet'
-import { getPublicSupportSnippet } from 'lib/components/Support/supportLogic'
+import { JSSnippet } from 'lib/components/JSSnippet'
+import { RestrictionScope, useRestrictedArea } from 'lib/components/RestrictedArea'
+import { TeamMembershipLevel } from 'lib/constants'
 import { LemonField } from 'lib/lemon-ui/LemonField'
 import { Link } from 'lib/lemon-ui/Link'
-import { debounce, inStorybook, inStorybookTestRunner } from 'lib/utils'
 import { userHasAccess } from 'lib/utils/accessControlUtils'
+import { debounce } from 'lib/utils/async'
+import { inStorybook, inStorybookTestRunner } from 'lib/utils/dom'
 import { preflightLogic } from 'scenes/PreflightCheck/preflightLogic'
-import { organizationLogic } from 'scenes/organizationLogic'
 import { teamLogic } from 'scenes/teamLogic'
 
 import { AccessControlLevel, AccessControlResourceType } from '~/types'
@@ -27,23 +28,27 @@ export function TeamDisplayName({ updateInline = false }: { updateInline?: boole
     const { currentTeam, currentTeamLoading } = useValues(teamLogic)
     const { updateCurrentTeam } = useActions(teamLogic)
     const [name, setName] = useState(currentTeam?.name || '')
+    const restrictedReason = useRestrictedArea({
+        scope: RestrictionScope.Project,
+        minimumAccessLevel: TeamMembershipLevel.Admin,
+    })
 
     const debouncedUpdateCurrentTeam = useMemo(() => debounce(updateCurrentTeam, 500), [updateCurrentTeam])
     const handleChange = (value: string): void => {
         setName(value)
-        if (updateInline) {
+        if (updateInline && !restrictedReason) {
             debouncedUpdateCurrentTeam({ name: value })
         }
     }
 
     return (
         <div className="deprecated-space-y-4 max-w-160">
-            <LemonInput value={name} onChange={handleChange} />
+            <LemonInput value={name} onChange={handleChange} disabledReason={restrictedReason} />
             {!updateInline && (
                 <LemonButton
                     type="primary"
                     onClick={() => updateCurrentTeam({ name })}
-                    disabled={!name || !currentTeam || name === currentTeam.name}
+                    disabled={!name || !currentTeam || name === currentTeam.name || !!restrictedReason}
                     loading={currentTeamLoading}
                 >
                     Rename project
@@ -66,59 +71,13 @@ export function WebSnippet(): JSX.Element {
     )
 }
 
-export function WebSnippetV2(): JSX.Element {
-    const { currentTeam, currentTeamLoading } = useValues(teamLogic)
-
-    return currentTeamLoading && !currentTeam ? (
-        <div className="deprecated-space-y-4">
-            <LemonSkeleton className="w-1/2 h-4" />
-            <LemonSkeleton repeat={3} />
-        </div>
-    ) : (
-        <JSSnippetV2Component />
-    )
-}
-
-function DebugInfoPanel(): JSX.Element | null {
-    const { currentTeam, currentTeamLoading } = useValues(teamLogic)
-    const { currentOrganization, currentOrganizationLoading } = useValues(organizationLogic)
-    const { preflight, preflightLoading } = useValues(preflightLogic)
-
-    const region = preflight?.region
-    const anyLoading = preflightLoading || currentOrganizationLoading || currentTeamLoading
-    const hasRequiredInfo = region && currentOrganization && currentTeam
-
-    if (!hasRequiredInfo && !anyLoading) {
-        return null
-    }
-
-    if (inStorybookTestRunner() || inStorybook()) {
-        // this data changes e.g. when session id changes, so it flaps in visual regression tests
-        // so...
-        return null
-    }
-
-    return (
-        <div className="flex-1 max-w-full">
-            <h3 id="debug-info" className="min-w-[25rem]">
-                Debug information
-            </h3>
-            <p>Include this snippet when creating an issue (feature request or bug report) on GitHub.</p>
-            {anyLoading ? (
-                <LemonSkeleton repeat={2} active={true} />
-            ) : (
-                <CodeSnippet compact thing="debug info">
-                    {getPublicSupportSnippet(region, currentOrganization, currentTeam, false)}
-                </CodeSnippet>
-            )}
-        </div>
-    )
-}
-
 export function TeamVariables(): JSX.Element {
     const { currentTeam, isTeamTokenResetAvailable } = useValues(teamLogic)
     const { resetToken } = useActions(teamLogic)
-
+    const restrictedReason = useRestrictedArea({
+        scope: RestrictionScope.Project,
+        minimumAccessLevel: TeamMembershipLevel.Admin,
+    })
     const { preflight } = useValues(preflightLogic)
 
     const region = preflight?.region
@@ -166,7 +125,13 @@ export function TeamVariables(): JSX.Element {
                     thing="project token"
                     actions={
                         isTeamTokenResetAvailable ? (
-                            <LemonButton icon={<IconRefresh />} noPadding onClick={openDialog} tooltip="Reset token" />
+                            <LemonButton
+                                icon={<IconRefresh />}
+                                disabledReason={restrictedReason}
+                                noPadding
+                                onClick={openDialog}
+                                tooltip="Reset token"
+                            />
                         ) : undefined
                     }
                 >
@@ -198,8 +163,6 @@ export function TeamVariables(): JSX.Element {
                     </div>
                 ) : null}
             </div>
-
-            <DebugInfoPanel />
         </div>
     )
 }
@@ -241,6 +204,7 @@ export function TeamAuthorizedURLs(): JSX.Element {
             allowWildCards={false}
             allowAdd={canEdit}
             allowDelete={canEdit}
+            displaySuggestions={canEdit}
         />
     )
 }

@@ -1,5 +1,6 @@
 import { BuiltLogic, LogicWrapper, useValues } from 'kea'
 
+import { NotFound } from 'lib/components/NotFound'
 import { LoadingBar } from 'lib/lemon-ui/LoadingBar'
 import { useAttachedLogic } from 'lib/logic/scenes/useAttachedLogic'
 import { insightDataLogic } from 'scenes/insights/insightDataLogic'
@@ -29,7 +30,7 @@ export function SavedInsight({
     editMode,
 }: InsightProps): JSX.Element {
     const insightProps: InsightLogicProps = { dashboardItemId: propsQuery.shortId }
-    const { insight, insightLoading } = useValues(insightLogic(insightProps))
+    const { insight, insightLoading, insightMissing } = useValues(insightLogic(insightProps))
     const { query: dataQuery } = useValues(insightDataLogic(insightProps))
 
     useAttachedLogic(insightLogic(insightProps), attachTo)
@@ -37,13 +38,25 @@ export function SavedInsight({
 
     if (insightLoading) {
         return (
-            <div className="text-center">
+            <div className="flex flex-col flex-1 justify-center items-center w-full h-full">
                 <LoadingBar />
             </div>
         )
     }
 
-    const query = { ...propsQuery, ...dataQuery, full: propsQuery.full }
+    if (insightMissing) {
+        return <NotFound object="insight" />
+    }
+
+    // `showResults` is reapplied only when the caller set it: a stored query carrying an explicit
+    // `false` would otherwise override an embed that asked for the result body and draw a card with
+    // nothing in it, while callers that say nothing keep deferring to what the insight stored.
+    const query = {
+        ...propsQuery,
+        ...dataQuery,
+        full: propsQuery.full,
+        ...(propsQuery.showResults === undefined ? {} : { showResults: propsQuery.showResults }),
+    }
 
     return (
         <Query

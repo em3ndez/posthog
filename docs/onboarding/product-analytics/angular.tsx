@@ -1,11 +1,10 @@
-import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/OnboardingDocsContentWrapper'
+import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/shared/OnboardingDocsContentWrapper'
 
 import { StepDefinition } from '../steps'
+import { SDK_DEFAULTS_DATE } from './_snippets/sdkDefaults'
 
-export const getAngularSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
-    const { CodeBlock, Markdown, dedent, snippets, Tab } = ctx
-
-    const JSEventCapture = snippets?.JSEventCapture
+export const getAngularInstallSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
+    const { CodeBlock, Markdown, dedent, Tab } = ctx
 
     return [
         {
@@ -37,6 +36,13 @@ export const getAngularSteps = (ctx: OnboardingComponentsContext): StepDefinitio
                                     pnpm add posthog-js
                                 `,
                             },
+                            {
+                                language: 'bash',
+                                file: 'bun',
+                                code: dedent`
+                                    bun add posthog-js
+                                `,
+                            },
                         ]}
                     />
                 </>
@@ -48,7 +54,7 @@ export const getAngularSteps = (ctx: OnboardingComponentsContext): StepDefinitio
             content: (
                 <>
                     <Markdown>
-                        In your `src/main.ts`, initialize PostHog using your project API key and instance address:
+                        In your `src/main.ts`, initialize PostHog using your project token and instance address:
                     </Markdown>
                     <Tab.Group tabs={['Angular 17+', 'Angular 16 and below']}>
                         <Tab.List>
@@ -90,7 +96,7 @@ export const getAngularSteps = (ctx: OnboardingComponentsContext): StepDefinitio
                                                   this.ngZone.runOutsideAngular(() => {
                                                     posthog.init(environment.posthogKey, {
                                                       api_host: environment.posthogHost,
-                                                      defaults: '2026-01-30',
+                                                      defaults: '${SDK_DEFAULTS_DATE}',
                                                     });
                                                   });
                                                 }
@@ -156,25 +162,37 @@ export const getAngularSteps = (ctx: OnboardingComponentsContext): StepDefinitio
                                               import posthog from 'posthog-js'
                                               posthog.init(environment.posthogKey, {
                                                 api_host: environment.posthogHost,
-                                                defaults: '2025-11-30'
+                                                defaults: '${SDK_DEFAULTS_DATE}'
                                               })
                                               bootstrapApplication(AppComponent, appConfig)
                                                 .catch((err) => console.error(err));
                                             `,
-                                            },
-                                        ]}
-                                    />
+                                        },
+                                    ]}
+                                />
                             </Tab.Panel>
                         </Tab.Panels>
                     </Tab.Group>
                 </>
             ),
         },
-        {
-            title: 'Send events',
-            content: <>{JSEventCapture && <JSEventCapture />}</>,
-        },
     ]
 }
+
+export const getAngularEventStep = (ctx: OnboardingComponentsContext): StepDefinition => {
+    const { snippets } = ctx
+
+    const JSEventCapture = snippets?.JSEventCapture
+
+    return {
+        title: 'Send events',
+        content: <>{JSEventCapture && <JSEventCapture />}</>,
+    }
+}
+
+export const getAngularSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => [
+    ...getAngularInstallSteps(ctx),
+    getAngularEventStep(ctx),
+]
 
 export const AngularInstallation = createInstallation(getAngularSteps)

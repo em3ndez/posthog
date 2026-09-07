@@ -1,21 +1,30 @@
-import { Meta, StoryFn, StoryObj } from '@storybook/react'
+import type { Meta, StoryObj } from '@storybook/react'
 
 import { ObjectTags, ObjectTagsProps } from './ObjectTags'
 
-type Story = StoryObj<typeof ObjectTags>
-const meta: Meta<typeof ObjectTags> = {
+type Story = StoryObj<ObjectTagsProps>
+const meta: Meta<ObjectTagsProps> = {
     title: 'Lemon UI/Object Tags',
     component: ObjectTags,
     tags: ['autodocs'],
+    render: (props: Partial<ObjectTagsProps>) => {
+        return <ObjectTags tags={['one', 'two', 'three']} {...props} />
+    },
 }
 export default meta
 
-const BasicTemplate: StoryFn<typeof ObjectTags> = (props: Partial<ObjectTagsProps>) => {
-    return <ObjectTags tags={['one', 'two', 'three']} {...props} />
+export const Default: Story = {
+    args: {},
 }
 
-export const Default: Story = BasicTemplate.bind({})
-Default.args = {}
+export const StaticOnly: Story = {
+    args: { staticOnly: true },
+}
 
-export const StaticOnly: Story = BasicTemplate.bind({})
-StaticOnly.args = { staticOnly: true }
+export const WrapLongTagsInNarrowContainer: Story = {
+    render: () => (
+        <div className="w-40 rounded border p-2">
+            <ObjectTags tags={['support-ticket-tag-with-a-very-long-unbroken-name', 'billing']} staticOnly wrap />
+        </div>
+    ),
+}

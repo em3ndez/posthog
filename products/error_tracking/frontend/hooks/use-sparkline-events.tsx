@@ -4,20 +4,20 @@ import { useMemo } from 'react'
 import { ErrorEventType } from 'lib/components/Errors/types'
 import { Dayjs } from 'lib/dayjs'
 
-import { SparklineEvent } from '../components/SparklineChart/SparklineChart'
+import type { SparklineEvent } from '../components/VolumeSparkline/types'
 import { errorTrackingIssueSceneLogic } from '../scenes/ErrorTrackingIssueScene/errorTrackingIssueSceneLogic'
 
 export function useSparklineEvents(): SparklineEvent<string>[] {
     const { firstSeen, lastSeen, selectedEvent } = useValues(errorTrackingIssueSceneLogic)
+
     return useMemo(() => {
-        const events = []
+        const events: SparklineEvent<string>[] = []
         if (firstSeen) {
             events.push({
                 id: 'first_seen',
                 date: firstSeen.toDate(),
                 color: 'var(--brand-blue)',
-                payload: 'First Seen',
-                radius: 6,
+                payload: 'First seen',
             })
         }
         if (selectedEvent && !isFirstOrLastEvent(firstSeen, lastSeen, selectedEvent)) {
@@ -26,7 +26,6 @@ export function useSparklineEvents(): SparklineEvent<string>[] {
                 date: new Date(selectedEvent.timestamp),
                 color: 'var(--brand-yellow)',
                 payload: 'Current',
-                radius: 6,
             })
         }
         if (lastSeen) {
@@ -34,8 +33,7 @@ export function useSparklineEvents(): SparklineEvent<string>[] {
                 id: 'last_seen',
                 date: lastSeen.toDate(),
                 color: 'var(--brand-red)',
-                payload: 'Last Seen',
-                radius: 6,
+                payload: 'Last seen',
             })
         }
         return events
@@ -47,11 +45,7 @@ function isFirstOrLastEvent(
     lastSeen: Dayjs | null,
     selectedEvent: ErrorEventType | null
 ): boolean {
-    if (selectedEvent && firstSeen?.isSame(selectedEvent.timestamp)) {
-        return true
-    }
-    if (selectedEvent && lastSeen?.isSame(selectedEvent.timestamp)) {
-        return true
-    }
-    return false
+    return Boolean(
+        selectedEvent && (firstSeen?.isSame(selectedEvent.timestamp) || lastSeen?.isSame(selectedEvent.timestamp))
+    )
 }

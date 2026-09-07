@@ -1,4 +1,4 @@
-import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/OnboardingDocsContentWrapper'
+import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/shared/OnboardingDocsContentWrapper'
 
 import { getNuxtSteps as getNuxtStepsPA } from '../product-analytics/nuxt'
 import { StepDefinition } from '../steps'
@@ -113,12 +113,7 @@ export const getNuxt36Steps = (ctx: OnboardingComponentsContext): StepDefinition
         ),
     }
 
-    return [
-        ...installSteps,
-        manualCaptureStep,
-        exceptionAutocaptureStep,
-        verifyStep,
-    ]
+    return [...installSteps, manualCaptureStep, exceptionAutocaptureStep, verifyStep]
 }
 
 export const Nuxt36Installation = createInstallation(getNuxt36Steps)

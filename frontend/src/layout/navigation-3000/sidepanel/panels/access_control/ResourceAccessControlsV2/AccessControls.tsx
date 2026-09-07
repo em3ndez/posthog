@@ -4,14 +4,16 @@ import { LemonTabs } from '@posthog/lemon-ui'
 
 import { PayGateMini } from 'lib/components/PayGateMini/PayGateMini'
 
-import { AvailableFeature } from '~/types'
+import { sidePanelStateLogic } from '~/layout/navigation-3000/sidepanel/sidePanelStateLogic'
+import { AvailableFeature, SidePanelTab } from '~/types'
 
 import { AccessControlDefaultSettings } from './AccessControlDefaultSettings'
 import { AccessControlFilters } from './AccessControlFilters'
+import { accessControlsLogic } from './accessControlsLogic'
 import { AccessControlTable } from './AccessControlTable'
 import { GroupedAccessControlRuleModal } from './GroupedAccessControlRuleModal'
-import { accessControlsLogic } from './accessControlsLogic'
-import type { AccessControlsTab } from './types'
+import { getEntryId } from './helpers'
+import type { AccessControlsTab, ScopeType } from './types'
 
 export function AccessControls({ projectId }: { projectId: string }): JSX.Element {
     const logic = accessControlsLogic({ projectId })
@@ -20,25 +22,33 @@ export function AccessControls({ projectId }: { projectId: string }): JSX.Elemen
         activeTab,
         searchText,
         filters,
-        ruleModalState,
         canUseRoles,
         allMembers,
+        roles,
         resourcesWithProject,
         ruleOptions,
-        filteredSortedRows,
-        getLevelOptionsForResource,
-        canEditAny,
+        filteredRoles,
+        filteredMembers,
+        canEdit,
         loading,
-        roles,
-        canEditAccessControls,
-        canEditRoleBasedAccessControls,
-        ruleModalMemberIsOrgAdmin,
-        ruleModalMemberHasAdminAccess,
-        ruleModalRoleHasAdminAccess,
+        activePanelSubject,
+        visibleResourceKeySet,
+        filteredResourceKeySet,
+        accessDetailPanelEnabled,
+        ruleModalState,
     } = useValues(logic)
 
-    const { setActiveTab, setSearchText, setFilters, openRuleModal, closeRuleModal, saveGroupedRules } =
-        useActions(logic)
+    const { setActiveTab, setSearchText, setFilters, openAccessDetailPanel, openRuleModal } = useActions(logic)
+    const { openSidePanel } = useActions(sidePanelStateLogic)
+    const { selectedTab, sidePanelOpen } = useValues(sidePanelStateLogic)
+
+    const scopeType: ScopeType = activeTab === 'roles' ? 'role' : 'member'
+
+    // Highlight the row whose detail is open in the side panel
+    const openInPanelId =
+        sidePanelOpen && selectedTab === SidePanelTab.AccessDetail && activePanelSubject?.scopeType === scopeType
+            ? activePanelSubject.subjectId
+            : null
 
     return (
         <>
@@ -76,33 +86,27 @@ export function AccessControls({ projectId }: { projectId: string }): JSX.Elemen
                             />
                             <AccessControlTable
                                 activeTab={activeTab}
-                                rows={filteredSortedRows}
+                                entries={activeTab === 'roles' ? filteredRoles : filteredMembers}
                                 loading={loading}
-                                canEditAny={canEditAny}
-                                onEdit={(row) => openRuleModal({ row })}
+                                canEditAny={canEdit}
+                                visibleResources={visibleResourceKeySet}
+                                filteredResources={filteredResourceKeySet}
+                                selectedEntryId={openInPanelId}
+                                onEdit={(entry) => {
+                                    if (!accessDetailPanelEnabled) {
+                                        openRuleModal({ scopeType, entry, projectId })
+                                        return
+                                    }
+                                    openAccessDetailPanel(scopeType, getEntryId(entry))
+                                    openSidePanel(SidePanelTab.AccessDetail, `${scopeType}:${getEntryId(entry)}`)
+                                }}
                             />
                         </div>
                     )}
                 </AccessControlTabContainer>
             </div>
 
-            {ruleModalState && (
-                <GroupedAccessControlRuleModal
-                    state={ruleModalState}
-                    close={closeRuleModal}
-                    resources={resourcesWithProject}
-                    loading={loading}
-                    projectId={projectId}
-                    getLevelOptionsForResource={getLevelOptionsForResource}
-                    canEdit={
-                        ruleModalState.row.id === 'default' ? !!canEditAccessControls : !!canEditRoleBasedAccessControls
-                    }
-                    onSave={saveGroupedRules}
-                    memberIsOrgAdmin={ruleModalMemberIsOrgAdmin}
-                    memberHasAdminAccess={ruleModalMemberHasAdminAccess}
-                    roleHasAdminAccess={ruleModalRoleHasAdminAccess}
-                />
-            )}
+            {ruleModalState && <GroupedAccessControlRuleModal state={ruleModalState} />}
         </>
     )
 }
@@ -110,13 +114,19 @@ export function AccessControls({ projectId }: { projectId: string }): JSX.Elemen
 function AccessControlTabContainer(props: { activeTab: AccessControlsTab; children?: React.ReactNode }): JSX.Element {
     if (props.activeTab === 'roles') {
         return (
-            <PayGateMini feature={AvailableFeature.ROLE_BASED_ACCESS}>
-                <PayGateMini feature={AvailableFeature.ADVANCED_PERMISSIONS}>{props.children}</PayGateMini>
+            <PayGateMini feature={AvailableFeature.ROLE_BASED_ACCESS} featureDetail="resource-access-controls-roles">
+                <PayGateMini feature={AvailableFeature.ACCESS_CONTROL} featureDetail="access-control-roles">
+                    {props.children}
+                </PayGateMini>
             </PayGateMini>
         )
     }
     if (props.activeTab === 'members') {
-        return <PayGateMini feature={AvailableFeature.ADVANCED_PERMISSIONS}>{props.children}</PayGateMini>
+        return (
+            <PayGateMini feature={AvailableFeature.ACCESS_CONTROL} featureDetail="access-control-members">
+                {props.children}
+            </PayGateMini>
+        )
     }
 
     return <>{props.children}</>

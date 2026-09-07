@@ -1,11 +1,15 @@
 // eslint-disable-next-line no-restricted-imports
 import fetch from 'node-fetch'
 
-import { logger, shutdownLogger } from './src/utils/logger'
+import { installPostgresTypeParsers } from './src/common/utils/db/postgres'
+import { logger, shutdownLogger } from './src/common/utils/logger'
 
 const { readFileSync } = require('fs')
 const { DateTime } = require('luxon')
 const { join } = require('path')
+
+// Sets up the same type parsers as used everywhere else in the codebase
+installPostgresTypeParsers()
 
 // Mock @pyroscope/nodejs to avoid ESM compatibility issues with p-limit
 jest.mock('@pyroscope/nodejs', () => ({

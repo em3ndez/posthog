@@ -1,8 +1,16 @@
 from typing import cast
 
+from django.contrib.postgres.indexes import GinIndex, OpClass
 from django.db import models
+from django.db.models.functions import Upper
 
-from posthog.models.activity_logging.activity_log import Change, Detail, log_activity
+from posthog.models.activity_logging.activity_log import (
+    AuditableScope,
+    Change,
+    Detail,
+    field_with_masked_contents,
+    log_activity,
+)
 from posthog.models.activity_logging.model_activity import get_was_impersonated
 from posthog.models.signals import mutable_receiver
 from posthog.models.utils import RootTeamMixin, UUIDTModel
@@ -27,6 +35,18 @@ class Comment(UUIDTModel, RootTeamMixin):
     # Threads/replies are simply comments with a source_comment_id
     source_comment = models.ForeignKey("Comment", on_delete=models.CASCADE, null=True, blank=True)
 
+    # Nullable so old code can INSERT without naming the column during rolling deploys.
+    is_task = models.BooleanField(null=True, blank=True, default=False)
+    completed_at = models.DateTimeField(blank=True, null=True)
+    completed_by = models.ForeignKey(
+        "User",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="+",
+        db_index=False,
+    )
+
     class Meta:
         indexes = [
             models.Index(fields=["team_id", "scope", "item_id"]),
@@ -35,12 +55,37 @@ class Comment(UUIDTModel, RootTeamMixin):
                 fields=["team_id", "scope", "item_id", "deleted", "-created_at"],
                 name="posthog_comment_convo_idx",
             ),
+            # Trigram index for conversations ticket search on message content. On UPPER(...)
+            # because icontains compiles to UPPER(col) LIKE UPPER(pattern) on Postgres.
+            # Partial: the table is shared across products, and the search always filters
+            # on this scope.
+            GinIndex(
+                OpClass(Upper("content"), name="gin_trgm_ops"),
+                name="comment_convo_content_trgm",
+                condition=models.Q(scope="conversations_ticket"),
+            ),
         ]
+
+
+# Comment scopes that carry support-ticket data: customer-facing ticket messages
+# (conversations_ticket) and internal ticket discussions (Ticket). Reading or writing these
+# requires ticket access, not just comment access — and their content must not leak through
+# surfaces gated on weaker scopes (e.g. activity logs).
+TICKET_COMMENT_SCOPES = frozenset({"Ticket", "conversations_ticket"})
+
+# Product-owned content in these scopes is available only through the owning product's API.
+COMMENT_SCOPES_BLOCKED_FROM_GENERIC_API = frozenset({"EmailThread"})
+
+
+def activity_log_scope_for(comment: Comment) -> str:
+    # Map legacy "recording" → "Replay"; replies are logged under the parent thread.
+    corrected = "Replay" if comment.scope == "recording" else comment.scope
+    return "Comment" if comment.source_comment_id else corrected
 
 
 @mutable_receiver(models.signals.post_save, sender=Comment)
 def log_comment_activity(sender, instance: Comment, created: bool, **kwargs):
-    if created:
+    if created and instance.scope not in COMMENT_SCOPES_BLOCKED_FROM_GENERIC_API:
         # TRICKY: - Comments relate to a "thing" like a flag or insight. When we log the activity we need to know what the "thing" is
 
         # Rendering in the frontend we need
@@ -57,13 +102,17 @@ def log_comment_activity(sender, instance: Comment, created: bool, **kwargs):
         # 2. Lookup the information when loading the activity (could be pretty slow as well as needing custom logic for each type of thing)
         # 3. Pass only the URL which allows us to say "X commented on insight/1234"
 
-        # If it is a reply, the scope is the original comment
         item_id = cast(str, instance.source_comment_id) or instance.item_id
-        # Map 'recording' to 'Replay' for activity log
-        # this is only necessary while we still have comments with scope 'recording'
-        # after we stop allowing 'recording' as a scope this can be removed
-        corrected_scope = "Replay" if instance.scope == "recording" else instance.scope
-        scope = "Comment" if instance.source_comment_id else corrected_scope
+        scope = activity_log_scope_for(instance)
+        activity = "created task" if instance.is_task else "commented"
+
+        # Ticket comment bodies are gated on ticket access; the activity log is readable with
+        # only activity_log:read, so the content must not ride along in the change record.
+        # Masking is driven by field_with_masked_contents, keyed by the comment's own scope
+        # (not the activity scope) so ticket replies — logged under the parent thread's
+        # "Comment" scope — are masked too.
+        masked_fields = field_with_masked_contents.get(cast(AuditableScope, instance.scope), [])
+        logged_content = "masked" if "content" in masked_fields else instance.content
 
         log_activity(
             organization_id=None,
@@ -72,10 +121,10 @@ def log_comment_activity(sender, instance: Comment, created: bool, **kwargs):
             was_impersonated=get_was_impersonated(),
             item_id=item_id,
             scope=scope,
-            activity="commented",
+            activity=activity,
             detail=Detail(
                 # name=TODO,
                 # short_id=TODO,
-                changes=[Change(type="Comment", field="content", action="created", after=instance.content)],
+                changes=[Change(type="Comment", field="content", action="created", after=logged_content)],
             ),
         )

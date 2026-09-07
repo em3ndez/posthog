@@ -4,6 +4,7 @@ from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel
 
+from posthog.event_usage import EventSource
 from posthog.models import Team, User
 
 ArgsT = TypeVar("ArgsT", bound=BaseModel)
@@ -23,9 +24,10 @@ class MCPTool(ABC, Generic[ArgsT]):
     name: str
     args_schema: type[ArgsT]
 
-    def __init__(self, team: Team, user: User):
+    def __init__(self, team: Team, user: User, event_source: EventSource = EventSource.MCP):
         self._team = team
         self._user = user
+        self._event_source = event_source
 
     @abstractmethod
     async def execute(self, args: ArgsT) -> str:
@@ -72,27 +74,33 @@ class MCPToolRegistry:
 
         return decorator
 
-    def get(self, name: str, team: Team, user: User) -> MCPTool[Any] | None:
-        """Get an MCP tool instance by name, constructed with team/user."""
-        import ee.hogai.tools  # noqa: F401 - ensure tools are registered
+    def _ensure_loaded(self) -> dict[str, MCPToolRegistration]:
+        # Tools self-register on import, so every read must trigger the import first. Keep the
+        # load-then-read invariant in one place — function-local import to avoid the tools <-> mcp_tool cycle.
+        from ee.hogai.tools import load_all_tools  # noqa: PLC0415 - ensure tools are registered
 
-        registration = self._tools.get(name)
+        load_all_tools()
+        return self._tools
+
+    def get(
+        self, name: str, team: Team, user: User, event_source: EventSource = EventSource.MCP
+    ) -> MCPTool[Any] | None:
+        """Get an MCP tool instance by name, constructed with team/user."""
+        registration = self._ensure_loaded().get(name)
         if registration:
-            return registration.tool_cls(team=team, user=user)
+            return registration.tool_cls(team=team, user=user, event_source=event_source)
         return None
 
     def get_scopes(self, name: str) -> list[str]:
         """Get the required scopes for a registered MCP tool."""
-        import ee.hogai.tools  # noqa: F401 - ensure tools are registered
-
-        registration = self._tools.get(name)
+        registration = self._ensure_loaded().get(name)
         if registration:
             return registration.scopes
         return []
 
     def get_names(self) -> list[str]:
         """Get list of registered MCP tool names."""
-        return list(self._tools.keys())
+        return list(self._ensure_loaded().keys())
 
 
 mcp_tool_registry = MCPToolRegistry()

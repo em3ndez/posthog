@@ -1,12 +1,15 @@
+import { createMockJobQueue } from '~/tests/helpers/mocks/job-queue.mock'
 import { mockFetch } from '~/tests/helpers/mocks/request.mock'
 
 import { DateTime } from 'luxon'
 
-import { getFirstTeam, resetTestDatabase } from '~/tests/helpers/sql'
-import { UUIDT } from '~/utils/utils'
+import { closeHub, createHub } from '~/common/utils/db/hub'
+import { configureEventLoopYield, getEventLoopYieldThresholdMs } from '~/common/utils/event-loop-yield'
+import { UUIDT } from '~/common/utils/utils'
+import { createCdpConsumerDeps } from '~/tests/helpers/cdp'
+import { createTestTeamFixture } from '~/tests/helpers/sql'
 
 import { Hub, Team } from '../../types'
-import { closeHub, createHub } from '../../utils/db/hub'
 import { HOG_EXAMPLES, HOG_FILTERS_EXAMPLES, HOG_INPUTS_EXAMPLES } from '../_tests/examples'
 import {
     createExampleInvocation,
@@ -33,10 +36,9 @@ describe('CdpCyclotronWorker', () => {
     let invocation: CyclotronJobInvocationHogFunction
 
     beforeEach(async () => {
-        await resetTestDatabase()
         hub = await createHub()
-        team = await getFirstTeam(hub)
-        processor = new CdpCyclotronWorker(hub)
+        team = (await createTestTeamFixture(hub.postgres)).team
+        processor = new CdpCyclotronWorker(hub, createCdpConsumerDeps(hub), createMockJobQueue())
 
         fn = await insertHogFunction(
             hub.postgres,
@@ -136,7 +138,7 @@ describe('CdpCyclotronWorker', () => {
             const nativeExecutorSpy = jest.spyOn(processor['nativeDestinationExecutorService'], 'execute')
             const pluginExecutorSpy = jest.spyOn(processor['pluginDestinationExecutorService'], 'execute')
             const segmentExecutorSpy = jest.spyOn(processor['segmentDestinationExecutorService'], 'execute')
-            const hogExecutorSpy = jest.spyOn(processor['hogExecutor'], 'executeWithAsyncFunctions')
+            const hogExecutorSpy = jest.spyOn(processor['hogExecutorAsync'], 'executeWithAsyncFunctions')
 
             const invocations = [
                 createExampleInvocation(nativeFn, globals),
@@ -186,6 +188,8 @@ describe('CdpCyclotronWorker', () => {
             } as any)
 
             const invocationId = invocation.id
+            // Capture reference time BEFORE execution to avoid timing race in lower-bound assertion
+            const beforeExecution = DateTime.now()
             const results = await processor.processInvocations([invocation])
             const result = results[0]
 
@@ -195,8 +199,8 @@ describe('CdpCyclotronWorker', () => {
             expect(result.invocation.id).toEqual(invocationId)
             expect(result.invocation.queue).toEqual('hog')
             // NOTE: Check the queue scheduled at is within the bounds of the backoff
-            expect(result.invocation.queueScheduledAt?.toMillis()).toBeGreaterThan(
-                DateTime.now().plus({ milliseconds: hub.CDP_FETCH_BACKOFF_BASE_MS }).toMillis()
+            expect(result.invocation.queueScheduledAt?.toMillis()).toBeGreaterThanOrEqual(
+                beforeExecution.plus({ milliseconds: hub.CDP_FETCH_BACKOFF_BASE_MS }).toMillis()
             )
             expect(result.invocation.queueScheduledAt?.toMillis()).toBeLessThan(
                 DateTime.now().plus({ milliseconds: hub.CDP_FETCH_BACKOFF_MAX_MS }).toMillis()
@@ -216,7 +220,7 @@ describe('CdpCyclotronWorker', () => {
             expect(result.invocation.queueMetadata).toBeUndefined()
             // No logs from initial invoke
             expect(result.logs.map((x) => x.message)).toEqual([
-                expect.stringContaining('HTTP fetch failed on attempt 1 with status code 500. Retrying in'),
+                expect.stringContaining('HTTP fetch failed on attempt 1 with status code 500. Retrying.'),
             ])
 
             // Now invoke the result again
@@ -246,14 +250,61 @@ describe('CdpCyclotronWorker', () => {
             const dequeueInvocationsSpy = jest
                 .spyOn(processor['cyclotronJobQueue'], 'dequeueInvocations')
                 .mockResolvedValue(undefined)
+            const recordTerminalFailureSpy = jest
+                .spyOn(
+                    processor['invocationResultsService'].invocationResultsRowsService,
+                    'recordTerminalFailureDurably'
+                )
+                .mockResolvedValue(true)
             const invocation = createExampleInvocation(fn, globals)
             invocation.functionId = new UUIDT().toString()
             const results = await processor.processInvocations([invocation])
             expect(results).toEqual([])
             expect(dequeueInvocationsSpy).toHaveBeenCalledWith([invocation])
+            // Without a terminal lifecycle row the runs UI shows the invocation as running forever
+            expect(recordTerminalFailureSpy).toHaveBeenCalledWith(
+                invocation,
+                expect.objectContaining({ errorKind: 'function_not_found' })
+            )
         })
 
-        it('should skip a loaded function if it is disabled', async () => {
+        it.each([['project'], ['event']] as const)(
+            'should DLQ a malformed invocation whose globals is missing %s instead of crashing',
+            async (field) => {
+                const dequeueInvocationsSpy = jest
+                    .spyOn(processor['cyclotronJobQueue'], 'dequeueInvocations')
+                    .mockResolvedValue(undefined)
+                const recordTerminalFailureSpy = jest
+                    .spyOn(
+                        processor['invocationResultsService'].invocationResultsRowsService,
+                        'recordTerminalFailureDurably'
+                    )
+                    .mockResolvedValue(true)
+
+                const malformed = createExampleInvocation(fn, globals)
+                delete (malformed.state.globals as any)[field]
+
+                const results = await processor['loadHogFunctions']([malformed])
+
+                expect(results).toEqual([])
+                expect(dequeueInvocationsSpy).toHaveBeenCalledWith([malformed])
+                expect(recordTerminalFailureSpy).toHaveBeenCalledWith(
+                    malformed,
+                    expect.objectContaining({ errorKind: 'malformed_invocation' })
+                )
+            }
+        )
+
+        it('should skip a loaded function if it is disabled and record the terminal row with real globals', async () => {
+            const dequeueInvocationsSpy = jest
+                .spyOn(processor['cyclotronJobQueue'], 'dequeueInvocations')
+                .mockResolvedValue(undefined)
+            const recordTerminalFailureSpy = jest
+                .spyOn(
+                    processor['invocationResultsService'].invocationResultsRowsService,
+                    'recordTerminalFailureDurably'
+                )
+                .mockResolvedValue(true)
             const fn2 = await insertHogFunction(
                 hub.postgres,
                 team.id,
@@ -264,9 +315,45 @@ describe('CdpCyclotronWorker', () => {
                     enabled: false,
                 })
             )
+            // Simulate a job as it arrives off the queue: state + globals present, but the
+            // hogFunction not yet loaded — loadHogFunctions is what attaches it. The fixture
+            // pre-attaches it, which would otherwise mask the lost-globals regression.
+            const { hogFunction: _unloaded, ...queued } = createExampleInvocation(fn2, globals)
 
-            const results = await processor['loadHogFunctions']([createExampleInvocation(fn2, globals)])
+            const results = await processor['loadHogFunctions']([queued as CyclotronJobInvocationHogFunction])
             expect(results).toEqual([])
+            expect(dequeueInvocationsSpy).toHaveBeenCalledWith([expect.objectContaining({ id: queued.id })])
+            // The terminal row must be built from a fully-shaped hog function invocation so its
+            // globals serialize to the real payload, not '{}'. Otherwise the row wins the
+            // ReplacingMergeTree argMax and the rerun paginator can't rehydrate it — the re-run
+            // after re-enabling the function would silently skip.
+            expect(recordTerminalFailureSpy).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    id: queued.id,
+                    hogFunction: expect.objectContaining({ id: fn2.id }),
+                    state: expect.objectContaining({ globals: queued.state.globals }),
+                }),
+                expect.objectContaining({ errorKind: 'function_disabled' })
+            )
+        })
+
+        it('should keep the job for a later retry if the terminal row cannot be recorded', async () => {
+            hub.HOG_INVOCATION_RESULTS_ENABLED = true
+            const dequeueInvocationsSpy = jest
+                .spyOn(processor['cyclotronJobQueue'], 'dequeueInvocations')
+                .mockResolvedValue(undefined)
+            jest.spyOn(
+                processor['invocationResultsService'].invocationResultsRowsService,
+                'recordTerminalFailureDurably'
+            ).mockResolvedValue(false)
+            const invocation2 = createExampleInvocation(fn, globals)
+            invocation2.functionId = new UUIDT().toString()
+
+            const results = await processor['loadHogFunctions']([invocation2])
+
+            expect(results).toEqual([])
+            // Dequeuing without the terminal row would recreate the stuck-'running' state
+            expect(dequeueInvocationsSpy).toHaveBeenCalledWith([])
         })
 
         describe('e2e lag metrics tracking', () => {
@@ -406,17 +493,22 @@ describe('CdpCyclotronWorker', () => {
         describe('thread relief', () => {
             jest.setTimeout(10000)
             let interval: NodeJS.Timeout
+            const blockTime = 200
+            let originalThresholdMs: number
+
             beforeEach(() => {
                 jest.spyOn(Date, 'now').mockRestore()
                 jest.useRealTimers()
+                originalThresholdMs = getEventLoopYieldThresholdMs()
+                configureEventLoopYield(blockTime)
             })
 
             afterEach(() => {
                 clearInterval(interval)
+                configureEventLoopYield(originalThresholdMs)
             })
 
             it('should process batches in a way that does not block the main thread', async () => {
-                const blockTime = 200
                 let lastCheck = Date.now()
                 let longestDelay = 0
 
@@ -447,8 +539,7 @@ describe('CdpCyclotronWorker', () => {
                     })
                 )
 
-                hub.CDP_WATCHER_HOG_COST_TIMING_UPPER_MS = blockTime
-                hub.CDP_WATCHER_HOG_COST_TIMING_LOWER_MS = 0
+                processor.hogExecutorAsync.hogExecutor['config'].executionTimeoutMs = blockTime
 
                 const numberToTest = 5
                 const invocations = Array.from({ length: numberToTest }, () =>

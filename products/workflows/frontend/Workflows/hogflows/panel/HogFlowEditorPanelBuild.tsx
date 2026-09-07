@@ -2,20 +2,25 @@ import { useActions, useValues } from 'kea'
 import { Fragment, useEffect, useState } from 'react'
 
 import { IconDrag } from '@posthog/icons'
-import { LemonButton, LemonDivider, LemonDropdown, LemonInput, SpinnerOverlay } from '@posthog/lemon-ui'
+import { LemonButton, LemonDivider, LemonDropdown, LemonInput, LemonTag, SpinnerOverlay } from '@posthog/lemon-ui'
 
 import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
 import { hogFunctionTemplateListLogic } from 'scenes/hog-functions/list/hogFunctionTemplateListLogic'
 import { HogFunctionStatusTag } from 'scenes/hog-functions/misc/HogFunctionStatusTag'
+import { teamLogic } from 'scenes/teamLogic'
 
 import { HogFunctionTemplateType } from '~/types'
 
 import { CreateActionType, hogFlowEditorLogic } from '../hogFlowEditorLogic'
 // Side-effect imports: register product-specific trigger and action nodes
 import '../registry'
+
+import { FEATURE_FLAGS } from 'lib/constants'
+
+import { PERSON_DEPENDENT_ACTION_TYPES, workflowLogic } from '../../workflowLogic'
 import { getRegisteredActionNodeCategories } from '../registry/actions/actionNodeRegistry'
 import { useHogFlowStep } from '../steps/HogFlowSteps'
-import { getDelayDescription } from '../steps/stepDelayLogic'
+import { DEFAULT_DELAY_DURATION, getDelayDescription } from '../steps/stepDelayLogic'
 import { HogFlowAction } from '../types'
 
 export const ACTION_NODES_TO_SHOW: CreateActionType[] = [
@@ -51,18 +56,51 @@ export const ACTION_NODES_TO_SHOW: CreateActionType[] = [
     },
 ]
 
-const DEFAULT_DELAY = '10m'
+const PUSH_NOTIFICATION_ACTION_NODE: CreateActionType = {
+    type: 'function_push',
+    name: 'Push',
+    description: 'Send a push notification to the user.',
+    config: { template_id: 'template-native-push', inputs: {} },
+}
+
+const AI_TASK_ACTION_NODE: CreateActionType = {
+    type: 'function',
+    name: 'Create AI task',
+    description: 'Start an AI agent task with instructions from this workflow.',
+    config: {
+        template_id: 'template-posthog-create-task',
+        // Pinned rather than relying on the template default: the engine only reads
+        // action.config.inputs at execution time, and this value is what turns a 409
+        // "task limit reached" reply into a graceful skip instead of a failed step.
+        inputs: { non_failure_status_codes: { value: [409] } },
+    },
+    output_variable: { key: 'task', result_path: null, label: 'Task' },
+}
+
+const RUN_SCOUT_ACTION_NODE: CreateActionType = {
+    type: 'function',
+    name: 'Run scout',
+    description: 'Start a Signals scout run. The scout explores as it does on its schedule.',
+    config: {
+        template_id: 'template-posthog-run-scout',
+        // Same reason as the AI-task node above: 409 (run in flight, scout paused, cooldown,
+        // budget, or quota) is backpressure the step should skip on, not fail.
+        inputs: { non_failure_status_codes: { value: [409] } },
+    },
+    output_variable: { key: 'scout_run', result_path: null, label: 'Scout run' },
+}
+
 export const DELAY_NODES_TO_SHOW: CreateActionType[] = [
     {
         type: 'delay',
         name: 'Delay',
-        description: getDelayDescription(DEFAULT_DELAY),
-        config: { delay_duration: DEFAULT_DELAY },
+        description: getDelayDescription({ delay_duration: DEFAULT_DELAY_DURATION }),
+        config: { delay_duration: DEFAULT_DELAY_DURATION },
     },
     {
         type: 'wait_until_time_window',
-        name: 'Wait until window',
-        description: 'Wait until a specified time window.',
+        name: 'Time window',
+        description: 'Wait for the next allowed time window before continuing.',
         config: {
             timezone: null,
             day: 'any',
@@ -71,8 +109,8 @@ export const DELAY_NODES_TO_SHOW: CreateActionType[] = [
     },
     {
         type: 'wait_until_condition',
-        name: 'Wait until condition',
-        description: 'Wait until a condition is met or a duration has passed.',
+        name: 'Wait until',
+        description: 'Wait until a matching event fires or a condition is met, up to a maximum duration.',
         branchEdges: 1,
         config: {
             condition: { filters: null },
@@ -194,7 +232,7 @@ const customFilterFunction = (template: HogFunctionTemplateType): boolean => {
         return false
     }
 
-    if (template.status === 'coming_soon') {
+    if (['hidden', 'coming_soon'].includes(template.status)) {
         return false
     }
 
@@ -274,10 +312,19 @@ function HogFunctionTemplatesChooser(): JSX.Element {
 
 export function HogFlowEditorPanelBuild(): JSX.Element {
     const { featureFlags } = useValues(featureFlagLogic)
+    const { currentTeam } = useValues(teamLogic)
+    const { isRowScopedTrigger } = useValues(workflowLogic)
 
     const registeredCategories = getRegisteredActionNodeCategories().filter(
         (cat) => !cat.featureFlag || featureFlags[cat.featureFlag]
     )
+
+    // Warehouse-triggered workflows have no person, so don't offer person-dependent steps at all.
+    const hideIfRowScoped = (nodes: CreateActionType[]): CreateActionType[] =>
+        isRowScopedTrigger ? nodes.filter((node) => !PERSON_DEPENDENT_ACTION_TYPES.has(node.type)) : nodes
+
+    const delayNodes = hideIfRowScoped(DELAY_NODES_TO_SHOW)
+    const logicNodes = hideIfRowScoped(LOGIC_NODES_TO_SHOW)
 
     return (
         <div className="flex overflow-y-auto flex-col gap-px p-2" data-attr="workflow-add-action">
@@ -287,21 +334,54 @@ export function HogFlowEditorPanelBuild(): JSX.Element {
             {ACTION_NODES_TO_SHOW.map((node, index) => (
                 <HogFlowEditorToolbarNode key={`${node.type}-${index}`} action={node} />
             ))}
+            {featureFlags[FEATURE_FLAGS.WORKFLOWS_PUSH_NOTIFICATIONS] && (
+                <HogFlowEditorToolbarNode key="push-notifications" action={PUSH_NOTIFICATION_ACTION_NODE}>
+                    <span className="inline-flex items-center gap-1.5">
+                        {PUSH_NOTIFICATION_ACTION_NODE.name}
+                        <LemonTag type="completion">Beta</LemonTag>
+                    </span>
+                </HogFlowEditorToolbarNode>
+            )}
+            {featureFlags[FEATURE_FLAGS.WORKFLOW_AI_TASK_ACTION] && (
+                <HogFlowEditorToolbarNode key="ai-task" action={AI_TASK_ACTION_NODE}>
+                    <span className="inline-flex items-center gap-1.5">
+                        {AI_TASK_ACTION_NODE.name}
+                        <LemonTag type="completion">Beta</LemonTag>
+                    </span>
+                </HogFlowEditorToolbarNode>
+            )}
+            {/* Scouts belong to the project's main environment, and the server refuses the step elsewhere.
+            Require currentTeam explicitly: while it's still loading, both sides of the id comparison are
+            undefined, which would otherwise pass. */}
+            {featureFlags[FEATURE_FLAGS.WORKFLOW_RUN_SCOUT_ACTION] &&
+                !!currentTeam &&
+                currentTeam.id === currentTeam.project_id && (
+                    <HogFlowEditorToolbarNode key="run-scout" action={RUN_SCOUT_ACTION_NODE}>
+                        <span className="inline-flex items-center gap-1.5">
+                            {RUN_SCOUT_ACTION_NODE.name}
+                            <LemonTag type="completion">Beta</LemonTag>
+                        </span>
+                    </HogFlowEditorToolbarNode>
+                )}
             <HogFunctionTemplatesChooser />
 
             <span className="flex gap-2 text-sm font-semibold mt-2 items-center">
                 Delays <LemonDivider className="flex-1" />
             </span>
-            {DELAY_NODES_TO_SHOW.map((action, index) => (
+            {delayNodes.map((action, index) => (
                 <HogFlowEditorToolbarNode key={`${action.type}-${index}`} action={action} />
             ))}
 
-            <span className="flex gap-2 text-sm font-semibold mt-2 items-center">
-                Audience split <LemonDivider className="flex-1" />
-            </span>
-            {LOGIC_NODES_TO_SHOW.map((action, index) => (
-                <HogFlowEditorToolbarNode key={`${action.type}-${index}`} action={action} />
-            ))}
+            {logicNodes.length > 0 && (
+                <>
+                    <span className="flex gap-2 text-sm font-semibold mt-2 items-center">
+                        Audience split <LemonDivider className="flex-1" />
+                    </span>
+                    {logicNodes.map((action, index) => (
+                        <HogFlowEditorToolbarNode key={`${action.type}-${index}`} action={action} />
+                    ))}
+                </>
+            )}
 
             <span className="flex gap-2 text-sm font-semibold mt-2 items-center">
                 PostHog actions <LemonDivider className="flex-1" />

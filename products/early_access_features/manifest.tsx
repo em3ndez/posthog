@@ -1,6 +1,6 @@
 import { urls } from 'scenes/urls'
 
-import { FileSystemIconType, ProductKey } from '~/queries/schema/schema-general'
+import { FileSystemIconType, ProductItemCategory, ProductKey } from '~/queries/schema/schema-general'
 
 import { FileSystemIconColor, ProductManifest } from '../../frontend/src/types'
 
@@ -11,15 +11,14 @@ export const manifest: ProductManifest = {
             name: 'Early access features',
             import: () => import('./frontend/EarlyAccessFeatures'),
             projectBased: true,
-            defaultDocsPath: '/docs/feature-flags/early-access-feature-management',
             description: 'Allow your users to individually enable or disable features that are in public beta.',
             iconType: 'early_access_feature',
+            docsHref: 'https://posthog.com/docs/feature-flags/early-access-feature-management',
         },
         EarlyAccessFeature: {
             name: 'Early access feature',
             import: () => import('./frontend/EarlyAccessFeature'),
             projectBased: true,
-            defaultDocsPath: '/docs/feature-flags/early-access-feature-management',
         },
     },
     routes: {
@@ -61,7 +60,7 @@ export const manifest: ProductManifest = {
         {
             path: 'Early access features',
             intents: [ProductKey.EARLY_ACCESS_FEATURES],
-            category: 'Features',
+            category: ProductItemCategory.FEATURES,
             type: 'early_access_feature',
             href: urls.earlyAccessFeatures(),
             iconType: 'early_access_feature' as FileSystemIconType,

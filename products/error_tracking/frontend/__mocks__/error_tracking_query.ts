@@ -1,4 +1,5 @@
-import { range, uuid } from 'lib/utils'
+import { range } from 'lib/utils/arrays'
+import { uuid } from 'lib/utils/dom'
 
 import { ErrorTrackingQueryResponse, ErrorTrackingRelationalIssue } from '~/queries/schema/schema-general'
 
@@ -93,6 +94,7 @@ const errorTrackingTypeIssue: ErrorTrackingRelationalIssue = {
     description: 'This is a TypeError',
     assignee: null,
     status: 'active',
+    severity: 'high',
     first_seen: '2023-07-07T00:00:00.000000-00:00',
     external_issues: [],
 }

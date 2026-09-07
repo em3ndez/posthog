@@ -10,7 +10,7 @@ from posthog.schema import (
 
 from posthog.clickhouse.query_tagging import Product, tags_context
 from posthog.hogql_queries.events_query_runner import EventsQueryRunner
-from posthog.hogql_queries.insights.paginators import HogQLHasMorePaginator
+from posthog.hogql_queries.paginators import HogQLHasMorePaginator
 from posthog.hogql_queries.query_runner import QueryRunner
 from posthog.session_recordings.constants import (
     DEFAULT_TOTAL_EVENTS_PER_QUERY,
@@ -90,6 +90,7 @@ class SessionBatchEventsQueryRunner(QueryRunner):
             query_result = self.paginator.execute_hogql_query(
                 query=self.to_query(),
                 team=self.team,
+                user=self.user,
                 query_type="SessionBatchEventsQuery",
                 timings=self.timings,
                 modifiers=self.modifiers,

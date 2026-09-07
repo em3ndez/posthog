@@ -1,7 +1,7 @@
 import { FEATURE_FLAGS } from 'lib/constants'
 import { urls } from 'scenes/urls'
 
-import { ProductKey } from '~/queries/schema/schema-general'
+import { ProductItemCategory, ProductKey } from '~/queries/schema/schema-general'
 
 import { FileSystemIconColor, ProductManifest } from '../../frontend/src/types'
 
@@ -9,9 +9,10 @@ export const manifest: ProductManifest = {
     name: 'Live Debugger',
     scenes: {
         LiveDebugger: {
-            name: 'Live Debugger',
+            name: 'Live debugger',
             import: () => import('./frontend/LiveDebugger'),
             projectBased: true,
+            description: 'Set breakpoints in your running code and inspect the state captured when they hit.',
         },
     },
     routes: {
@@ -35,8 +36,10 @@ export const manifest: ProductManifest = {
     treeItemsProducts: [
         {
             path: 'Live Debugger',
+            displayLabel: 'Live debugger',
             intents: [ProductKey.LIVE_DEBUGGER],
-            category: 'Unreleased',
+            sceneKey: 'LiveDebugger',
+            category: ProductItemCategory.UNRELEASED,
             type: 'live_debugger',
             href: urls.liveDebugger(),
             flag: FEATURE_FLAGS.LIVE_DEBUGGER,

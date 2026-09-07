@@ -1,7 +1,6 @@
 from collections import defaultdict
-from typing import Any, cast
 
-from posthog.schema import DatabaseSchemaManagedViewTableKind
+import structlog
 
 from posthog.hogql import ast
 from posthog.hogql.context import HogQLContext
@@ -12,14 +11,15 @@ from posthog.hogql.database.models import (
     LazyJoinToAdd,
     LazyTable,
     LazyTableToAdd,
-    SavedQuery,
-    StringDatabaseField,
+    UUIDDatabaseField,
 )
+from posthog.hogql.database.schema.util.revenue_analytics import get_table_kind, is_event_view
 from posthog.hogql.errors import ResolutionError
 
-from posthog.models.exchange_rate.sql import EXCHANGE_RATE_DECIMAL_PRECISION
+from posthog.exchange_rate_constants import EXCHANGE_RATE_DECIMAL_PRECISION
+from posthog.schema_enums import DatabaseSchemaManagedViewTableKind
 
-from products.revenue_analytics.backend.views.schemas import SCHEMAS as VIEW_SCHEMAS
+logger = structlog.get_logger(__name__)
 
 ZERO_DECIMAL = ast.Call(
     name="toDecimal", args=[ast.Constant(value=0), ast.Constant(value=EXCHANGE_RATE_DECIMAL_PRECISION)]
@@ -27,50 +27,41 @@ ZERO_DECIMAL = ast.Call(
 
 FIELDS: dict[str, FieldOrTable] = {
     "team_id": IntegerDatabaseField(name="team_id"),
-    "person_id": StringDatabaseField(name="person_id"),
-    "revenue": DecimalDatabaseField(name="revenue", nullable=False),
-    "mrr": DecimalDatabaseField(name="mrr", nullable=False),
+    "person_id": UUIDDatabaseField(
+        name="person_id",
+        nullable=True,
+        description="Person these revenue figures are aggregated for; join target for `persons.id`.",
+    ),
+    "revenue": DecimalDatabaseField(
+        name="revenue",
+        nullable=False,
+        description="Total revenue attributed to the person, summed across all their customers, in the project's base currency.",
+    ),
+    "mrr": DecimalDatabaseField(
+        name="mrr",
+        nullable=False,
+        description="Monthly recurring revenue attributed to the person, summed across all their customers, in the project's base currency.",
+    ),
 }
 
 
 def _select_from_persons_revenue_analytics_table(context: HogQLContext) -> ast.SelectQuery | ast.SelectSetQuery:
-    from products.revenue_analytics.backend.views import (
-        RevenueAnalyticsBaseView,
-        RevenueAnalyticsCustomerView,
-        RevenueAnalyticsMRRView,
-        RevenueAnalyticsRevenueItemView,
-    )
+    from posthog.hogql.database.schema.persons import PersonsTable  # noqa: PLC0415 — circular import
+
+    from products.revenue_analytics.backend.views import RevenueAnalyticsCustomerView, RevenueAnalyticsRevenueItemView
 
     if not context.database:
         return ast.SelectQuery.empty(columns=FIELDS)
 
-    customer_schema = VIEW_SCHEMAS[DatabaseSchemaManagedViewTableKind.REVENUE_ANALYTICS_CUSTOMER]
-    mrr_schema = VIEW_SCHEMAS[DatabaseSchemaManagedViewTableKind.REVENUE_ANALYTICS_MRR]
-    revenue_item_schema = VIEW_SCHEMAS[DatabaseSchemaManagedViewTableKind.REVENUE_ANALYTICS_REVENUE_ITEM]
-
     # Get all customer/mrr/revenue item tuples from the existing views making sure we ignore `all`
     # since the `persons` join is in the child view
-    all_views = defaultdict[str, dict[DatabaseSchemaManagedViewTableKind, RevenueAnalyticsBaseView]](defaultdict)
+    all_views = defaultdict[str, dict](defaultdict)
     for view_name in context.database.get_view_names():
-        view = cast(SavedQuery | RevenueAnalyticsBaseView, context.database.get_table(view_name))
-        prefix = ".".join(view_name.split(".")[:-1])
-
-        # Might need to convert to RevenueAnalyticsBaseView from a SavedQuery if the FF is enabled
-        # Soon we'll be able to remove all of this and handle them all using the `SavedQuery` logic directly
-        if view_name.endswith(customer_schema.source_suffix) or view_name.endswith(customer_schema.events_suffix):
-            if not isinstance(view, RevenueAnalyticsBaseView):
-                view = RevenueAnalyticsCustomerView(**_base_view_args_from_saved_query(view))
-            all_views[prefix][DatabaseSchemaManagedViewTableKind.REVENUE_ANALYTICS_CUSTOMER] = view
-        elif view_name.endswith(revenue_item_schema.source_suffix) or view_name.endswith(
-            revenue_item_schema.events_suffix
-        ):
-            if not isinstance(view, RevenueAnalyticsBaseView):
-                view = RevenueAnalyticsRevenueItemView(**_base_view_args_from_saved_query(view))
-            all_views[prefix][DatabaseSchemaManagedViewTableKind.REVENUE_ANALYTICS_REVENUE_ITEM] = view
-        elif view_name.endswith(mrr_schema.source_suffix) or view_name.endswith(mrr_schema.events_suffix):
-            if not isinstance(view, RevenueAnalyticsBaseView):
-                view = RevenueAnalyticsMRRView(**_base_view_args_from_saved_query(view))
-            all_views[prefix][DatabaseSchemaManagedViewTableKind.REVENUE_ANALYTICS_MRR] = view
+        table_kind = get_table_kind(view_name)
+        if table_kind is not None:
+            view = context.database.get_table(view_name)
+            prefix = ".".join(view_name.split(".")[:-1])
+            all_views[prefix][table_kind] = view
 
     # Iterate over all possible view tuples and figure out which queries we can add to the set
     queries = []
@@ -86,12 +77,27 @@ def _select_from_persons_revenue_analytics_table(context: HogQLContext) -> ast.S
         # If we're working with event views, we can use the customer's id field directly
         # Otherwise, we need to join with the persons table by checking whether it exists
         person_id_chain: list[str | int] | None = None
-        if customer_view.is_event_view():
+        if is_event_view(customer_view.name):
             person_id_chain = [RevenueAnalyticsCustomerView.get_generic_view_alias(), "id"]
         else:
+            # The `persons` field comes from a user-defined warehouse join, so its name does not
+            # guarantee its target. Reading `id` off some other table casts to NULL below, which would
+            # hide that source's revenue in one unlabeled row, so require the real persons table.
             persons_lazy_join = customer_view.fields.get("persons")
-            if persons_lazy_join is not None and isinstance(persons_lazy_join, ast.LazyJoin):
+            persons_join_target = (
+                persons_lazy_join.resolve_table(context) if isinstance(persons_lazy_join, ast.LazyJoin) else None
+            )
+            if isinstance(persons_join_target, PersonsTable):
                 person_id_chain = [RevenueAnalyticsCustomerView.get_generic_view_alias(), "persons", "id"]
+            else:
+                # Skipping the source drops its revenue from this table with no other signal, so say
+                # so here. Otherwise a mistyped join name reads as "this source earned nothing".
+                logger.warning(
+                    "persons_revenue_analytics_skipped_source",
+                    team_id=context.team_id,
+                    customer_view=customer_view.name,
+                    persons_join_target=type(persons_join_target).__name__ if persons_join_target else None,
+                )
 
         if person_id_chain is not None:
             # Get the aggregated revenue by customer_id
@@ -129,7 +135,12 @@ def _select_from_persons_revenue_analytics_table(context: HogQLContext) -> ast.S
                     # and those views are, on their own, safe to query "without a `team_id` filter"
                     # since they're getting data from either the data warehouse (safe) or the events table (safe)
                     ast.Alias(alias="team_id", expr=ast.Constant(value=context.team_id)),
-                    ast.Alias(alias="person_id", expr=ast.Field(chain=person_id_chain)),
+                    # Event views give a String id, warehouse views a UUID. A Variant cannot be a GROUP BY
+                    # key, so both legs cast to the UUID that each of them ultimately holds.
+                    ast.Alias(
+                        alias="person_id",
+                        expr=ast.Call(name="toUUID", args=[ast.Field(chain=person_id_chain)]),
+                    ),
                     ast.Alias(
                         alias="revenue",
                         expr=ast.Call(
@@ -177,28 +188,41 @@ def _select_from_persons_revenue_analytics_table(context: HogQLContext) -> ast.S
 
     if not queries:
         return ast.SelectQuery.empty(columns=FIELDS)
-    elif len(queries) == 1:
-        return queries[0]
-    else:
-        return ast.SelectSetQuery.create_from_queries(queries, set_operator="UNION ALL")
 
+    inner_query: ast.SelectQuery | ast.SelectSetQuery = (
+        queries[0] if len(queries) == 1 else ast.SelectSetQuery.create_from_queries(queries, set_operator="UNION ALL")
+    )
 
-def _base_view_args_from_saved_query(saved_query: SavedQuery) -> dict[str, Any]:
-    return {
-        "id": saved_query.id,
-        "query": saved_query.query,
-        "name": saved_query.name,
-        "fields": saved_query.fields,
-        "metadata": saved_query.metadata,
-        # :KLUDGE: None of these properties below are great but it's all we can do to figure this one out for now
-        # We'll be able to come up with a better solution we don't need to support the old managed views anymore
-        "prefix": ".".join(saved_query.name.split(".")[:-1]),
-        "source_id": None,  # Not used so just ignore it
-        "event_name": saved_query.name.split(".")[2] if "revenue_analytics.events" in saved_query.name else None,
-    }
+    # A person can map to more than one customer -- duplicate customer records sharing an email, or
+    # customers spread across multiple revenue sources -- and each mapping is its own row above.
+    # Aggregating by `person_id` keeps this table at one row per person so the `persons` join can't
+    # fan out the persons table. Mirrors what `groups_revenue_analytics` already does per group.
+    return ast.SelectQuery(
+        select=[
+            ast.Alias(alias="team_id", expr=ast.Constant(value=context.team_id)),
+            ast.Alias(alias="person_id", expr=ast.Field(chain=["person_id"])),
+            ast.Alias(alias="revenue", expr=ast.Call(name="sum", args=[ast.Field(chain=["revenue"])])),
+            ast.Alias(alias="mrr", expr=ast.Call(name="sum", args=[ast.Field(chain=["mrr"])])),
+        ],
+        select_from=ast.JoinExpr(table=inner_query),
+        # A warehouse customer with no matching person gets the all-zeros UUID, because the LEFT JOIN
+        # fills the non-nullable `persons.id` with its type default rather than NULL. Dropping that
+        # key keeps unattributable revenue from reporting as one synthetic person that outranks every
+        # real one. A NULL from the cast compares to NULL here, so it is dropped too.
+        where=ast.CompareOperation(
+            op=ast.CompareOperationOp.NotEq,
+            left=ast.Field(chain=["person_id"]),
+            right=ast.Call(name="toUUID", args=[ast.Constant(value="00000000-0000-0000-0000-000000000000")]),
+        ),
+        group_by=[ast.Field(chain=["person_id"])],
+    )
 
 
 class PersonsRevenueAnalyticsTable(LazyTable):
+    description: str = (
+        "Revenue and MRR aggregated per person from the revenue analytics views. "
+        "One row per person; reachable from persons via the `revenue_analytics` join."
+    )
     fields: dict[str, FieldOrTable] = FIELDS
 
     def lazy_select(
@@ -231,11 +255,8 @@ def join_with_persons_revenue_analytics_table(
         constraint=ast.JoinConstraint(
             expr=ast.CompareOperation(
                 op=ast.CompareOperationOp.Eq,
-                left=ast.Call(
-                    name="toString",
-                    args=[ast.Field(chain=[join_to_add.from_table, *join_to_add.lazy_join.from_field])],
-                ),
-                right=ast.Call(name="toString", args=[ast.Field(chain=[join_to_add.to_table, "person_id"])]),
+                left=ast.Field(chain=[join_to_add.from_table, *join_to_add.lazy_join.from_field]),
+                right=ast.Field(chain=[join_to_add.to_table, "person_id"]),
             ),
             constraint_type="ON",
         ),

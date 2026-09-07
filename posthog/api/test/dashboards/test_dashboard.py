@@ -6,6 +6,7 @@ from posthog.test.base import APIBaseTest, FuzzyInt, QueryMatchingTest, snapshot
 from unittest import mock
 from unittest.mock import ANY, MagicMock, patch
 
+from django.core.cache import cache
 from django.test import override_settings
 from django.utils.timezone import now
 
@@ -13,23 +14,47 @@ from dateutil.parser import isoparse
 from parameterized import parameterized
 from rest_framework import status
 
-from posthog.api.dashboards.dashboard import DashboardSerializer
+from posthog.schema import DateRange, EventPropertyFilter, EventsNode, InsightVizNode, PropertyOperator, TrendsQuery
+
+from posthog.hogql.errors import ExposedHogQLError
+
 from posthog.api.test.dashboards import DashboardAPI
+from posthog.caching.insight_result import InsightResult
 from posthog.constants import AvailableFeature
 from posthog.helpers.dashboard_templates import create_group_type_mapping_detail_dashboard
-from posthog.hogql_queries.legacy_compatibility.filter_to_query import filter_to_query
-from posthog.models import Dashboard, DashboardTile, Filter, Insight, Team, User
+from posthog.models import Filter, Team, User
 from posthog.models.activity_logging.activity_log import ActivityLog
-from posthog.models.dashboard_tile import Text
+from posthog.models.file_system.file_system import FileSystem
 from posthog.models.file_system.file_system_view_log import FileSystemViewLog
-from posthog.models.insight_variable import InsightVariable
-from posthog.models.organization import Organization
+from posthog.models.group_type_mapping import (
+    GROUP_TYPES_CACHE_KEY_PREFIX,
+    GROUP_TYPES_STALE_CACHE_KEY_PREFIX,
+    get_group_type_mapping_instance,
+    update_group_type_mapping_fields,
+)
+from posthog.models.organization import Organization, OrganizationMembership
 from posthog.models.project import Project
+from posthog.models.quick_filter import QuickFilter
 from posthog.models.sharing_configuration import SharingConfiguration
 from posthog.models.signals import mute_selected_signals
+from posthog.test.db_context_capturing import capture_db_queries
 from posthog.test.test_utils import create_group_type_mapping_without_created_at
+from posthog.user_permissions import UserPermissions
 
-from ee.models.rbac.access_control import AccessControl
+from products.access_control.backend.facade.user_access_control import UserAccessControl
+from products.access_control.backend.models.access_control import AccessControl
+from products.alerts.backend.models.alert import AlertConfiguration, AlertSubscription, Threshold
+from products.dashboards.backend.access import DashboardAccessMethod
+from products.dashboards.backend.api.dashboard import (
+    DashboardSerializer,
+    DashboardTileErrorSerializer,
+    serialize_tile_with_context,
+)
+from products.dashboards.backend.models.dashboard import Dashboard
+from products.dashboards.backend.models.dashboard_templates import DashboardTemplate
+from products.dashboards.backend.models.dashboard_tile import ButtonTile, DashboardTile, Text
+from products.product_analytics.backend.facade.models import Insight, InsightVariable
+from products.product_analytics.backend.presentation.insight import InsightSerializer
 
 valid_template: dict = {
     "template_name": "Sign up conversion template with variables",
@@ -66,8 +91,8 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         super().setUp()
         self.organization.available_product_features = [
             {
-                "key": AvailableFeature.ADVANCED_PERMISSIONS,
-                "name": AvailableFeature.ADVANCED_PERMISSIONS,
+                "key": AvailableFeature.ACCESS_CONTROL,
+                "name": AvailableFeature.ACCESS_CONTROL,
             },
         ]
 
@@ -80,12 +105,37 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         for dashboard_name in dashboard_names:
             self.dashboard_api.create_dashboard({"name": dashboard_name})
 
-        with self.assertNumQueries(15):
+        with self.assertNumQueries(13):
             response_data = self.dashboard_api.list_dashboards()
         self.assertEqual(
             [dashboard["name"] for dashboard in response_data["results"]],
             dashboard_names,
         )
+
+    @patch("products.dashboards.backend.api.dashboard.report_user_action")
+    def test_non_web_retrieve_fires_dashboard_read_event(self, mock_report_user_action: mock.Mock) -> None:
+        dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "test"})
+        mock_report_user_action.reset_mock()
+
+        self.client.get(f"/api/projects/{self.team.id}/dashboards/{dashboard_id}/", HTTP_X_POSTHOG_CLIENT="mcp")
+
+        mock_report_user_action.assert_any_call(
+            self.user,
+            "dashboard read",
+            {"dashboard_id": dashboard_id, "creation_mode": "default"},
+            team=ANY,
+            request=ANY,
+        )
+
+    @patch("products.dashboards.backend.api.dashboard.report_user_action")
+    def test_web_retrieve_does_not_fire_dashboard_read_event(self, mock_report_user_action: mock.Mock) -> None:
+        dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "test"})
+        mock_report_user_action.reset_mock()
+
+        self.client.get(f"/api/projects/{self.team.id}/dashboards/{dashboard_id}/")
+
+        read_calls = [c for c in mock_report_user_action.call_args_list if c.args[1:2] == ("dashboard read",)]
+        self.assertEqual(read_calls, [])
 
     def test_retrieve_dashboard_list_includes_other_environments(self):
         other_team_in_project = Team.objects.create(organization=self.organization, project=self.project)
@@ -119,7 +169,7 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         self.dashboard_api.create_dashboard({"name": "also tagged", "tags": ["tag2"]})
         self.dashboard_api.create_dashboard({"name": "not tagged"})
 
-        with self.assertNumQueries(15):
+        with self.assertNumQueries(13):
             response = self.dashboard_api.list_dashboards(
                 expected_status=status.HTTP_200_OK, query_params={"tags": ["tag"]}
             )
@@ -133,7 +183,7 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         self.dashboard_api.create_dashboard({"name": "not tagged"})
         self.dashboard_api.create_dashboard({"name": "not with the right tag", "tags": ["wrong-tag"]})
 
-        with self.assertNumQueries(15):
+        with self.assertNumQueries(13):
             response = self.dashboard_api.list_dashboards(
                 expected_status=status.HTTP_200_OK, query_params={"tags": ["tag", "tag2"]}
             )
@@ -141,6 +191,242 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         assert response["count"] == 2
         dashboard_names = {dashboard["name"] for dashboard in response["results"]}
         assert dashboard_names == {"tagged", "also tagged"}
+
+    @parameterized.expand(
+        [
+            (
+                "exact match wins over partial matches",
+                ["Ad Sales", "Email Sales", "Sales", "Sales Funnel", "Salesforce sync", "Weekly Sales", "Unrelated"],
+                "Sales",
+                "Sales",
+                ["Unrelated"],
+            ),
+            (
+                "typo / transposition still matches via trigram",
+                ["Dashboard overview", "Unrelated"],
+                "dahsboard",
+                "Dashboard overview",
+                ["Unrelated"],
+            ),
+            (
+                "prefix-as-you-type",
+                ["Marketing funnel", "Engineering metrics"],
+                "Marke",
+                "Marketing funnel",
+                ["Engineering metrics"],
+            ),
+            (
+                "case-insensitive: lower",
+                ["VMS Feature - History Browser - Nova", "Engineering metrics"],
+                "nova",
+                "VMS Feature - History Browser - Nova",
+                ["Engineering metrics"],
+            ),
+            (
+                "case-insensitive: upper",
+                ["VMS Feature - History Browser - Nova", "Engineering metrics"],
+                "NOVA",
+                "VMS Feature - History Browser - Nova",
+                ["Engineering metrics"],
+            ),
+        ]
+    )
+    def test_list_filter_by_search_relevance(self, _name, dashboard_names, search, expected_first, excluded):
+        for name in dashboard_names:
+            self.dashboard_api.create_dashboard({"name": name})
+
+        response = self.dashboard_api.list_dashboards(query_params={"search": search})
+        result_names = [d["name"] for d in response["results"]]
+
+        assert result_names, f"expected at least one match for {search!r}, got nothing"
+        assert result_names[0] == expected_first, f"expected {expected_first!r} first, got {result_names}"
+        for name in excluded:
+            assert name not in result_names, f"expected {name!r} excluded, got {result_names}"
+
+    def test_list_filter_by_search_matches_description_with_lower_rank_than_name(self):
+        # Description matches are kept but rank below name matches.
+        name_match_id, _ = self.dashboard_api.create_dashboard({"name": "revenue"})
+        description_match_id, _ = self.dashboard_api.create_dashboard(
+            {"name": "Q4 review", "description": "Quarterly revenue dashboard"}
+        )
+        self.dashboard_api.create_dashboard({"name": "Unrelated", "description": "nothing here"})
+
+        response = self.dashboard_api.list_dashboards(query_params={"search": "revenue"})
+        result_ids = [d["id"] for d in response["results"]]
+
+        assert result_ids[:2] == [name_match_id, description_match_id]
+        assert all(d["name"] != "Unrelated" for d in response["results"])
+
+    def test_list_filter_by_search_handles_null_name_with_description_match(self):
+        # Dashboard.name is nullable. Without coalescing the trigram annotations to 0.0
+        # the unnamed row's `_search_score` would be NULL, and Postgres orders NULLS FIRST
+        # in DESC — so an unnamed row matched on description alone would wrongly outrank
+        # a row matched on name.
+        named_match_id, _ = self.dashboard_api.create_dashboard({"name": "Marketing funnel"})
+        unnamed_match = Dashboard.objects.create(team=self.team, name=None, description="A marketing-focused overview")
+
+        response = self.dashboard_api.list_dashboards(query_params={"search": "marketing"})
+        result_ids = [d["id"] for d in response["results"]]
+
+        assert named_match_id in result_ids
+        assert unnamed_match.id in result_ids
+        assert result_ids.index(named_match_id) < result_ids.index(unnamed_match.id), (
+            f"named match should rank above unnamed description match, got {result_ids}"
+        )
+
+    def test_list_filter_by_search_is_team_scoped(self):
+        other_team = Team.objects.create(organization=self.organization)
+        Dashboard.objects.create(team=other_team, name="Sales Funnel")
+        own_id, _ = self.dashboard_api.create_dashboard({"name": "Sales Funnel"})
+
+        response = self.dashboard_api.list_dashboards(query_params={"search": "Sales"})
+        result_ids = [d["id"] for d in response["results"]]
+
+        assert result_ids == [own_id]
+
+    def test_list_filter_by_search_combines_with_tag_filter(self):
+        target_id, _ = self.dashboard_api.create_dashboard({"name": "Sales", "tags": ["finance"]})
+        self.dashboard_api.create_dashboard({"name": "Sales Funnel", "tags": ["marketing"]})
+        self.dashboard_api.create_dashboard({"name": "Other", "tags": ["finance"]})
+
+        response = self.dashboard_api.list_dashboards(query_params={"search": "Sales", "tags": ["finance"]})
+        result_ids = [d["id"] for d in response["results"]]
+
+        assert result_ids == [target_id]
+
+    def test_list_filter_by_search_decides_match_tier_after_tag_filter(self):
+        self.dashboard_api.create_dashboard({"name": "sales dashboard", "tags": ["marketing"]})
+        similar_id, _ = self.dashboard_api.create_dashboard({"name": "dahsboard metrics", "tags": ["finance"]})
+
+        response = self.dashboard_api.list_dashboards(query_params={"search": "dashboard", "tags": ["finance"]})
+        results = response["results"]
+
+        assert [(d["id"], d["search_match_type"]) for d in results] == [(similar_id, "similar")], (
+            "an exact match removed by the tag filter must not suppress the similar matches that survive it"
+        )
+
+    @parameterized.expand(
+        [
+            ("whitespace-only", "   "),
+            ("empty", ""),
+        ]
+    )
+    def test_list_filter_by_search_blank_returns_all(self, _name, search):
+        a_id, _ = self.dashboard_api.create_dashboard({"name": "Alpha"})
+        b_id, _ = self.dashboard_api.create_dashboard({"name": "Beta"})
+
+        response = self.dashboard_api.list_dashboards(query_params={"search": search})
+        result_ids = {d["id"] for d in response["results"]}
+
+        assert {a_id, b_id}.issubset(result_ids)
+
+    @parameterized.expand(
+        [
+            ("plain symbols", "&|!"),
+            ("sql-injection-shaped", "'; DROP TABLE--"),
+        ]
+    )
+    def test_list_filter_by_search_pathological_input_does_not_500(self, _name, search):
+        # No `to_tsquery` to trip on unsafe characters; trigram tolerates anything
+        # the URL layer admits. We pin the contract that pathological inputs return
+        # an empty result set rather than raising.
+        self.dashboard_api.create_dashboard({"name": "Dashboard overview"})
+
+        response = self.dashboard_api.list_dashboards(
+            query_params={"search": search},
+            expected_status=status.HTTP_200_OK,
+        )
+
+        assert response["results"] == []
+
+    @parameterized.expand(
+        [
+            ("at cap (200)", 200, status.HTTP_200_OK),
+            ("just over cap (201)", 201, status.HTTP_400_BAD_REQUEST),
+            ("very long (10k)", 10_000, status.HTTP_400_BAD_REQUEST),
+        ]
+    )
+    def test_list_filter_by_search_enforces_length_cap(self, _name, length, expected_status):
+        self.dashboard_api.create_dashboard({"name": "Dashboard overview"})
+
+        response = self.dashboard_api.list_dashboards(
+            query_params={"search": "a" * length},
+            expected_status=expected_status,
+        )
+
+        if expected_status == status.HTTP_400_BAD_REQUEST:
+            assert response["attr"] == "search", f"expected error scoped to 'search', got {response}"
+            assert "200 characters" in response["detail"], (
+                f"expected error detail to mention the cap, got {response['detail']}"
+            )
+
+    @parameterized.expand(
+        [
+            ("email in name", "alerts+ops@example.com", "alerts+ops@example.com"),
+            ("uuid in name", "run 1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed", "1b9d6bcd-bbfd-4b2d-9b5d-ab8dfbbd4bed"),
+            ("dotted identifier", "com.acme.billing dashboard", "com.acme.billing"),
+        ]
+    )
+    def test_list_filter_by_search_matches_literal_substring_below_trigram_threshold(
+        self, _name, dashboard_name, search
+    ):
+        matching_id, _ = self.dashboard_api.create_dashboard({"name": dashboard_name})
+        self.dashboard_api.create_dashboard({"name": "Totally unrelated"})
+
+        response = self.dashboard_api.list_dashboards(query_params={"search": search})
+        results = response["results"]
+
+        match_type_by_id = {d["id"]: d["search_match_type"] for d in results}
+        assert match_type_by_id.get(matching_id) == "exact", (
+            "a literal substring must match and be labelled exact even when it scores below the trigram thresholds"
+        )
+        assert all(d["name"] != "Totally unrelated" for d in results)
+
+    def test_list_filter_by_search_hides_similar_matches_when_exact_matches_exist(self):
+        for name in ("dashboard overview", "sales dashboard", "dahsboard metrics", "Engineering metrics"):
+            self.dashboard_api.create_dashboard({"name": name})
+
+        response = self.dashboard_api.list_dashboards(query_params={"search": "dashboard"})
+        results = response["results"]
+
+        match_type_by_name = {d["name"]: d["search_match_type"] for d in results}
+        assert match_type_by_name == {
+            "dashboard overview": "exact",
+            "sales dashboard": "exact",
+        }, "similar matches must be hidden when exact matches exist"
+
+    def test_list_filter_by_search_match_type_absent_without_search(self):
+        self.dashboard_api.create_dashboard({"name": "Alpha"})
+
+        response = self.dashboard_api.list_dashboards()
+        results = response["results"]
+
+        assert results
+        assert all("search_match_type" not in d for d in results)
+
+    def test_list_filter_by_search_matches_tag_content(self):
+        tagged_id, _ = self.dashboard_api.create_dashboard({"name": "Q4 review", "tags": ["revenue-forecast"]})
+        self.dashboard_api.create_dashboard({"name": "Unrelated", "tags": ["marketing"]})
+
+        response = self.dashboard_api.list_dashboards(query_params={"search": "revenue-forecast"})
+        results = response["results"]
+
+        match_type_by_id = {d["id"]: d["search_match_type"] for d in results}
+        assert match_type_by_id.get(tagged_id) == "exact", "a dashboard whose tag name contains the term must match"
+        assert all(d["name"] != "Unrelated" for d in results)
+
+    def test_list_filter_by_search_does_not_duplicate_dashboard_with_multiple_matching_tags(self):
+        target_id, _ = self.dashboard_api.create_dashboard(
+            {"name": "needle", "tags": ["needle-tag-a", "needle-tag-b", "needle-tag-c"]}
+        )
+
+        response = self.dashboard_api.list_dashboards(query_params={"search": "needle"})
+        matching = [d["id"] for d in response["results"] if d["id"] == target_id]
+
+        assert len(matching) == 1, (
+            f"search=needle must return the dashboard once even though three tags + the name match it; "
+            f"got {len(matching)} copies."
+        )
 
     def test_list_includes_last_viewed_at_from_filesystem_logs(self):
         dashboard_recent_id, _ = self.dashboard_api.create_dashboard({"name": "Recently viewed"})
@@ -171,11 +457,144 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         assert isoparse(results_by_id[dashboard_recent_id]["last_viewed_at"]) == isoparse("2024-01-01T12:00:00+00:00")
         assert results_by_id[dashboard_unseen_id]["last_viewed_at"] is None
 
+    def test_list_includes_folder_from_filesystem(self):
+        filed_id, _ = self.dashboard_api.create_dashboard(
+            {"name": "Filed dashboard", "_create_in_folder": "Marketing/Website"}
+        )
+        unfiled_id, _ = self.dashboard_api.create_dashboard({"name": "Unfiled dashboard"})
+
+        response = self.dashboard_api.list_dashboards(parent="environment")
+        results_by_id = {dashboard["id"]: dashboard for dashboard in response["results"]}
+
+        # The folder is the file system path without the dashboard's own name
+        assert results_by_id[filed_id]["folder"] == "Marketing/Website"
+        # Dashboards created without an explicit folder land in the default unfiled folder
+        assert results_by_id[unfiled_id]["folder"] == "Unfiled/Dashboards"
+
+    def test_list_includes_the_file_system_entry_needed_to_move_a_dashboard(self):
+        filed_id, _ = self.dashboard_api.create_dashboard(
+            {"name": "Filed dashboard", "_create_in_folder": "Marketing/Website"}
+        )
+
+        response = self.dashboard_api.list_dashboards(parent="environment")
+        result = {dashboard["id"]: dashboard for dashboard in response["results"]}[filed_id]
+
+        entry = FileSystem.objects.get(team=self.team, type="dashboard", ref=str(filed_id), shortcut=False)
+        # Together these are everything a move needs, so the list page never looks the entry up again.
+        assert result["file_system_id"] == str(entry.id)
+        assert result["file_system_path"] == entry.path
+        # Unlike `folder`, the path keeps the dashboard's own name as its last segment
+        assert result["file_system_path"] == "Marketing/Website/Filed dashboard"
+
+    def test_list_picks_the_same_entry_every_time_when_a_dashboard_has_several(self):
+        dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "Twice filed", "_create_in_folder": "First"})
+        second = FileSystem.objects.create(
+            team=self.team, path="Second/Twice filed", type="dashboard", ref=str(dashboard_id), created_by=self.user
+        )
+        first = FileSystem.objects.get(team=self.team, type="dashboard", ref=str(dashboard_id), shortcut=False)
+        first = min([first, second], key=lambda entry: entry.id)
+
+        response = self.dashboard_api.list_dashboards(parent="environment")
+        result = {dashboard["id"]: dashboard for dashboard in response["results"]}[dashboard_id]
+
+        # Both annotations must resolve the same row, or a move would target one and report the other
+        assert result["file_system_id"] == str(first.id)
+        assert result["file_system_path"] == first.path
+
+    def test_updating_a_dashboard_keeps_its_file_system_entry_in_the_response(self):
+        dashboard_id, _ = self.dashboard_api.create_dashboard(
+            {"name": "Filed dashboard", "_create_in_folder": "Marketing/Website"}
+        )
+        entry = FileSystem.objects.get(team=self.team, type="dashboard", ref=str(dashboard_id), shortcut=False)
+
+        _, updated = self.dashboard_api.update_dashboard(dashboard_id, {"pinned": True})
+
+        # The list gates "Move to another folder" on these, so an update that drops them un-files the row
+        assert updated["file_system_id"] == str(entry.id)
+        assert updated["file_system_path"] == entry.path
+
+    def test_creating_a_dashboard_from_a_template_returns_its_file_system_entry(self):
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/dashboards/create_from_template_json",
+            {"template": valid_template, "_create_in_folder": "Unfiled/Dashboards"},
+        )
+        assert response.status_code == 200, response.content
+
+        created = response.json()
+        entry = FileSystem.objects.get(team=self.team, type="dashboard", ref=str(created["id"]), shortcut=False)
+        # This endpoint serializes a dashboard the list annotation never touched, and the list stores the
+        # response as-is, so without the entry the new row offers no way to file it until a reload.
+        assert created["file_system_id"] == str(entry.id)
+        assert created["file_system_path"] == entry.path
+        assert created["folder"] == "Unfiled/Dashboards"
+
+    def test_creating_a_dashboard_returns_its_file_system_entry(self):
+        dashboard_id, created = self.dashboard_api.create_dashboard(
+            {"name": "Fresh dashboard", "_create_in_folder": "Marketing/Website"}
+        )
+        entry = FileSystem.objects.get(team=self.team, type="dashboard", ref=str(dashboard_id), shortcut=False)
+
+        # The save signal files the dashboard, so a response saying otherwise disables its move action
+        # until the list is reloaded.
+        assert created["file_system_id"] == str(entry.id)
+        assert created["file_system_path"] == entry.path
+
+    def test_renaming_a_dashboard_returns_the_new_file_system_path(self):
+        dashboard_id, _ = self.dashboard_api.create_dashboard(
+            {"name": "Old name", "_create_in_folder": "Marketing/Website"}
+        )
+
+        _, updated = self.dashboard_api.update_dashboard(dashboard_id, {"name": "New name"})
+
+        # The path's last segment is the dashboard's own name, and a move re-files the row under whatever
+        # that segment says, so a stale path would rename the entry back.
+        assert updated["file_system_path"] == "Marketing/Website/New name"
+
+    def test_list_reports_no_file_system_entry_when_the_dashboard_has_none(self):
+        dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "Entryless dashboard"})
+        FileSystem.objects.filter(team=self.team, type="dashboard", ref=str(dashboard_id)).delete()
+
+        response = self.dashboard_api.list_dashboards(parent="environment")
+        result = {dashboard["id"]: dashboard for dashboard in response["results"]}[dashboard_id]
+
+        assert result["file_system_id"] is None
+        assert result["file_system_path"] is None
+        assert result["folder"] is None
+
+    @parameterized.expand(
+        [
+            # The named folder matches only the dashboard filed directly in it — nested sub-folders excluded
+            ("named_folder", "Marketing/Website", "in_folder"),
+            # The empty string is the project root (the `depth=1`, no-prefix branch of _apply_folder_filter)
+            ("project_root", "", "root"),
+        ]
+    )
+    def test_list_filters_by_folder(self, _name: str, folder: str, expected_key: str):
+        ids = {
+            "in_folder": self.dashboard_api.create_dashboard(
+                {"name": "In folder", "_create_in_folder": "Marketing/Website"}
+            )[0],
+            "nested": self.dashboard_api.create_dashboard(
+                {"name": "Nested deeper", "_create_in_folder": "Marketing/Website/Landing"}
+            )[0],
+            "other": self.dashboard_api.create_dashboard({"name": "Other folder", "_create_in_folder": "Product"})[0],
+            "root": self.dashboard_api.create_dashboard({"name": "Root dashboard", "_create_in_folder": ""})[0],
+        }
+
+        response = self.dashboard_api.list_dashboards(parent="environment", query_params={"folder": folder})
+        result_ids = {dashboard["id"] for dashboard in response["results"]}
+
+        # Set equality asserts the match is exact — every other dashboard (nested, other folder, root/named) is excluded
+        assert result_ids == {ids[expected_key]}
+
     @snapshot_postgres_queries
     def test_retrieve_dashboard(self):
         dashboard = Dashboard.objects.create(team=self.team, name="private dashboard", created_by=self.user)
 
-        response_data = self.dashboard_api.get_dashboard(dashboard.pk)
+        with patch("products.dashboards.backend.access.record_dashboard_access") as mock_record_access:
+            response_data = self.dashboard_api.get_dashboard(dashboard.pk)
+
+        mock_record_access.assert_called_once_with(DashboardAccessMethod.HUMAN)
 
         self.assertEqual(response_data["name"], "private dashboard")
         self.assertEqual(response_data["description"], "")
@@ -237,7 +656,179 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         dashboard.refresh_from_db()
         self.assertEqual(dashboard.name, "dashboard new name")
 
-    def test_cannot_update_dashboard_with_invalid_filters(self):
+    @patch("products.dashboards.backend.api.dashboard.dashboard_customization_enabled", return_value=True)
+    def test_dashboard_tile_spacing_is_saved_and_duplicated(self, _mock_enabled: MagicMock):
+        dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard"})
+
+        _, updated = self.dashboard_api.update_dashboard(dashboard_id, {"grid_spacing": "relaxed"})
+        self.assertEqual(updated["customization"], {"tile_spacing": "relaxed"})
+
+        Dashboard.objects.filter(id=dashboard_id).update(customization={"show_legend": False})
+        _, updated = self.dashboard_api.update_dashboard(dashboard_id, {"grid_spacing": "wide"})
+        self.assertEqual(updated["customization"], {"tile_spacing": "wide"})
+
+        copied_id, copied = self.dashboard_api.create_dashboard({"name": "copy", "use_dashboard": dashboard_id})
+        self.assertEqual(copied["customization"], {"tile_spacing": "wide"})
+        self.assertEqual(
+            Dashboard.objects.get(id=copied_id).customization, {"show_legend": False, "tile_spacing": "wide"}
+        )
+
+    @patch("products.dashboards.backend.feature_flags.posthoganalytics.feature_enabled", return_value=True)
+    def test_dashboard_customization_evaluates_flag_against_posthog_project(
+        self, mock_feature_enabled: MagicMock
+    ) -> None:
+        dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard"})
+
+        _, updated = self.dashboard_api.update_dashboard(
+            dashboard_id,
+            {"grid_spacing": "condensed", "layout_compaction": "horizontal"},
+        )
+
+        self.assertEqual(
+            updated["customization"],
+            {"tile_spacing": "condensed", "layout_compaction": "horizontal"},
+        )
+        # The flag must resolve through posthoganalytics (our project), not the customer team token.
+        self.assertIn(
+            "dashboard-customization",
+            [flag_call.args[0] for flag_call in mock_feature_enabled.call_args_list],
+        )
+
+    @parameterized.expand([("horizontal",), ("stable",)])
+    @patch("products.dashboards.backend.api.dashboard.dashboard_customization_enabled", return_value=True)
+    def test_dashboard_layout_compaction_is_saved_and_duplicated(
+        self, layout_compaction: str, _mock_enabled: MagicMock
+    ) -> None:
+        dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard"})
+
+        _, updated = self.dashboard_api.update_dashboard(dashboard_id, {"layout_compaction": layout_compaction})
+        self.assertEqual(updated["customization"], {"layout_compaction": layout_compaction})
+
+        copied_id, copied = self.dashboard_api.create_dashboard({"name": "copy", "use_dashboard": dashboard_id})
+        self.assertEqual(copied["customization"], {"layout_compaction": layout_compaction})
+        self.assertEqual(Dashboard.objects.get(id=copied_id).customization, {"layout_compaction": layout_compaction})
+
+    @patch("products.dashboards.backend.api.dashboard.report_user_action")
+    @patch("products.dashboards.backend.api.dashboard.dashboard_customization_enabled", return_value=True)
+    def test_dashboard_layout_compaction_reports_every_mode_change(
+        self, _mock_enabled: MagicMock, mock_report_user_action: MagicMock
+    ) -> None:
+        dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard"})
+        mock_report_user_action.reset_mock()
+
+        self.dashboard_api.update_dashboard(dashboard_id, {"layout_compaction": "horizontal"})
+        self.dashboard_api.update_dashboard(dashboard_id, {"layout_compaction": "vertical"})
+
+        compaction_calls = [
+            call
+            for call in mock_report_user_action.call_args_list
+            if call.args[1] == "dashboard grid compaction configured"
+        ]
+        self.assertEqual(len(compaction_calls), 2)
+        self.assertEqual(
+            compaction_calls[0].args[2],
+            {
+                "dashboard_id": dashboard_id,
+                "previous_layout_compaction": "vertical",
+                "layout_compaction": "horizontal",
+            },
+        )
+        self.assertEqual(
+            compaction_calls[1].args[2],
+            {
+                "dashboard_id": dashboard_id,
+                "previous_layout_compaction": "horizontal",
+                "layout_compaction": "vertical",
+            },
+        )
+
+    @patch("products.dashboards.backend.api.dashboard.dashboard_customization_enabled", return_value=True)
+    def test_dashboard_tile_spacing_recovers_from_malformed_customization(self, _mock_enabled: MagicMock):
+        dashboard = Dashboard.objects.create(team=self.team, name="dashboard", customization=[])
+
+        retrieved = self.dashboard_api.get_dashboard(dashboard.id)
+        self.assertEqual(retrieved["customization"], {})
+
+        _, updated = self.dashboard_api.update_dashboard(dashboard.id, {"grid_spacing": "condensed"})
+        self.assertEqual(updated["customization"], {"tile_spacing": "condensed"})
+
+    @patch("products.dashboards.backend.api.dashboard.dashboard_customization_enabled", return_value=False)
+    def test_dashboard_tile_spacing_requires_feature_flag(self, _mock_enabled: MagicMock):
+        dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard"})
+
+        _, response = self.dashboard_api.update_dashboard(
+            dashboard_id,
+            {"grid_spacing": "relaxed"},
+            expected_status=status.HTTP_400_BAD_REQUEST,
+        )
+        self.assertEqual(response["attr"], "grid_spacing")
+        self.assertEqual(response["detail"], "Tile density isn't available.")
+
+    @patch("products.dashboards.backend.api.dashboard.dashboard_customization_enabled", return_value=False)
+    def test_dashboard_layout_compaction_requires_feature_flag(self, _mock_enabled: MagicMock) -> None:
+        dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard"})
+
+        _, response = self.dashboard_api.update_dashboard(
+            dashboard_id,
+            {"layout_compaction": "horizontal"},
+            expected_status=status.HTTP_400_BAD_REQUEST,
+        )
+        self.assertEqual(response["attr"], "layout_compaction")
+        self.assertEqual(response["detail"], "Tile movement settings aren't available.")
+
+    @patch("products.dashboards.backend.api.dashboard.dashboard_customization_enabled", return_value=True)
+    def test_dashboard_tile_spacing_requires_a_known_preset(self, _mock_enabled: MagicMock):
+        dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard"})
+
+        _, response = self.dashboard_api.update_dashboard(
+            dashboard_id,
+            {"grid_spacing": "extra-wide"},
+            expected_status=status.HTTP_400_BAD_REQUEST,
+        )
+        self.assertEqual(response["attr"], "grid_spacing")
+
+    @patch("products.dashboards.backend.api.dashboard.dashboard_customization_enabled", return_value=True)
+    def test_dashboard_layout_compaction_requires_a_known_mode(self, _mock_enabled: MagicMock) -> None:
+        dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard"})
+
+        _, response = self.dashboard_api.update_dashboard(
+            dashboard_id,
+            {"layout_compaction": "none"},
+            expected_status=status.HTTP_400_BAD_REQUEST,
+        )
+        self.assertEqual(response["attr"], "layout_compaction")
+
+    @patch("products.product_analytics.backend.presentation.insight.record_dashboard_cache_outcome")
+    @patch("posthog.caching.calculate_results.calculate_for_query_based_insight")
+    def test_update_dashboard_does_not_record_cache_outcomes(
+        self,
+        mock_calculate: mock.MagicMock,
+        mock_record_outcome: mock.MagicMock,
+    ) -> None:
+        dashboard = Dashboard.objects.create(team=self.team, name="Dashboard", created_by=self.user)
+        insight = Insight.objects.create(
+            team=self.team,
+            created_by=self.user,
+            query={"kind": "DataTableNode", "source": {"kind": "EventsQuery", "select": ["*"]}},
+        )
+        DashboardTile.objects.create(dashboard=dashboard, insight=insight)
+        mock_calculate.return_value = InsightResult(
+            result=[],
+            last_refresh=now(),
+            cache_key="cache-key",
+            is_cached=False,
+            timezone=self.team.timezone,
+        )
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/dashboards/{dashboard.id}",
+            {"name": "Updated dashboard"},
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        mock_record_outcome.assert_not_called()
+
+    def test_cannot_update_dashboard_with_invalid_filters(self) -> None:
         dashboard = Dashboard.objects.create(
             team=self.team,
             name="private dashboard",
@@ -258,9 +849,24 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
             },
             expected_status=status.HTTP_400_BAD_REQUEST,
         )
-
         dashboard.refresh_from_db()
         self.assertEqual(dashboard.filters, {})
+
+    def test_cannot_update_dashboard_with_invalid_variables(self):
+        dashboard = Dashboard.objects.create(
+            team=self.team,
+            name="dashboard",
+            created_by=self.user,
+            variables={"existing": "value"},
+        )
+        self.dashboard_api.update_dashboard(
+            dashboard.pk,
+            {"variables": ["not", "a", "dict"]},
+            expected_status=status.HTTP_400_BAD_REQUEST,
+        )
+
+        dashboard.refresh_from_db()
+        self.assertEqual(dashboard.variables, {"existing": "value"})
 
     def test_create_dashboard_item(self):
         dashboard = Dashboard.objects.create(team=self.team, name="public dashboard")
@@ -286,6 +892,23 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         response = self.client.get("/shared_dashboard/testtoken")
         self.assertEqual(response.status_code, status.HTTP_200_OK)
 
+    def test_shared_dashboard_does_not_expose_where_it_is_filed(self):
+        dashboard_id, _ = self.dashboard_api.create_dashboard(
+            {"name": "public dashboard", "_create_in_folder": "Acquisitions/Project Falcon"}
+        )
+        dashboard = Dashboard.objects.get(id=dashboard_id)
+        SharingConfiguration.objects.create(team=self.team, dashboard=dashboard, access_token="testtoken", enabled=True)
+        self.client.logout()
+
+        response = self.client.get("/shared_dashboard/testtoken")
+        assert response.status_code == status.HTTP_200_OK
+
+        # The share page serializes the dashboard straight off the sharing configuration, so the fields fall
+        # back to reading the entry. Every one of them names a folder an anonymous viewer must not see.
+        payload = response.content.decode()
+        assert "Project Falcon" not in payload
+        assert "Acquisitions" not in payload
+
     def test_return_cached_results_bleh(self):
         dashboard = Dashboard.objects.create(team=self.team, name="dashboard")
 
@@ -308,12 +931,24 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
 
         # Now the dashboard has data without having to refresh
         response = self.dashboard_api.get_dashboard(dashboard.pk, query_params={"refresh": False, "use_cache": True})
+        last_accessed_at = Dashboard.objects.get().last_accessed_at
+        assert last_accessed_at is not None
         self.assertAlmostEqual(
-            Dashboard.objects.get().last_accessed_at,
+            last_accessed_at,
             now(),
             delta=datetime.timedelta(seconds=5),
         )
         self.assertEqual(response["tiles"][0]["insight"]["result"][0]["count"], 0)
+
+    def test_impersonated_view_does_not_bump_last_accessed_at(self) -> None:
+        dashboard = Dashboard.objects.create(team=self.team, name="dashboard", created_by=self.user)
+
+        with patch("products.dashboards.backend.api.dashboard.is_impersonated", return_value=True):
+            response = self.client.get(f"/api/projects/{self.team.id}/dashboards/{dashboard.pk}")
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        dashboard.refresh_from_db()
+        self.assertIsNone(dashboard.last_accessed_at)
 
     # :KLUDGE: avoid making extra queries that are explicitly not cached in tests. Avoids false N+1-s.
     @override_settings(PERSON_ON_EVENTS_OVERRIDE=False, PERSON_ON_EVENTS_V2_OVERRIDE=False)
@@ -321,28 +956,68 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
     def test_adding_insights_is_not_nplus1_for_gets(self):
         with mute_selected_signals():
             dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard"})
-            filter_dict = {
-                "events": [{"id": "$pageview"}],
-                "properties": [{"key": "$browser", "value": "Mac OS X"}],
-                "insight": "TRENDS",
-            }
 
-            baseline = 10
+            baseline = 9
+            # Each dashboard GET that materializes at least one insight runner performs one
+            # property-access-control feature check, memoized across all runners on the dashboard
+            # by `get_restricted_properties_for_team`'s per-scope cache. It costs no Postgres
+            # queries: the runner passes its already-loaded team, so the check skips the Team
+            # lookup, and with the feature unavailable no PropertyAccessControl rows are read.
 
             with self.assertNumQueries(baseline + 11):
                 self.dashboard_api.get_dashboard(dashboard_id, query_params={"no_items_field": "true"})
 
-            self.dashboard_api.create_insight({"filters": filter_dict, "dashboards": [dashboard_id]})
-            with self.assertNumQueries(baseline + 11 + 12):
+            # baseline + 11 + 9 once at least one insight materializes
+            self.dashboard_api.create_insight({"dashboards": [dashboard_id]})
+            with self.assertNumQueries(baseline + 11 + 9):
                 self.dashboard_api.get_dashboard(dashboard_id, query_params={"no_items_field": "true"})
 
-            self.dashboard_api.create_insight({"filters": filter_dict, "dashboards": [dashboard_id]})
-            with self.assertNumQueries(baseline + 11 + 12):
+            self.dashboard_api.create_insight({"dashboards": [dashboard_id]})
+            with self.assertNumQueries(baseline + 11 + 9):
                 self.dashboard_api.get_dashboard(dashboard_id, query_params={"no_items_field": "true"})
 
-        self.dashboard_api.create_insight({"filters": filter_dict, "dashboards": [dashboard_id]})
-        with self.assertNumQueries(baseline + 11 + 12):
+        self.dashboard_api.create_insight({"dashboards": [dashboard_id]})
+        with self.assertNumQueries(baseline + 11 + 9):
             self.dashboard_api.get_dashboard(dashboard_id, query_params={"no_items_field": "true"})
+
+    def test_insight_alerts_do_not_nplus1_dashboard_gets(self) -> None:
+        dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard"})
+
+        def _add_insight_with_alerts() -> None:
+            insight_id, _ = self.dashboard_api.create_insight({"dashboards": [dashboard_id]})
+            threshold = Threshold.objects.create(
+                team=self.team,
+                insight_id=insight_id,
+                created_by=self.user,
+                configuration={"type": "absolute", "bounds": {"upper": 1}},
+            )
+            # one threshold alert and one detector alert — AlertSerializer emits threshold and
+            # subscribed_users per alert, the two relations that regress to per-alert queries
+            for alert_threshold in (threshold, None):
+                alert = AlertConfiguration.objects.create(
+                    team=self.team,
+                    insight_id=insight_id,
+                    created_by=self.user,
+                    name="alert",
+                    threshold=alert_threshold,
+                    condition={"type": "absolute_value"},
+                    config={"type": "TrendsAlertConfig", "series_index": 0},
+                    detector_config=None if alert_threshold else {"type": "zscore", "threshold": 3},
+                )
+                AlertSubscription.objects.create(user=self.user, alert_configuration=alert, created_by=self.user)
+
+        def _dashboard_query_count() -> int:
+            with capture_db_queries() as ctx:
+                self.dashboard_api.get_dashboard(dashboard_id, query_params={"no_items_field": "true"})
+            return len(ctx.captured_queries)
+
+        _add_insight_with_alerts()
+        _dashboard_query_count()  # warmup: absorbs one-off writes like last_accessed_at
+        baseline = _dashboard_query_count()
+
+        _add_insight_with_alerts()
+        _add_insight_with_alerts()
+        self.assertEqual(_dashboard_query_count(), baseline)
 
     @snapshot_postgres_queries
     def test_listing_dashboards_is_not_nplus1(self) -> None:
@@ -374,7 +1049,7 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
 
         self.client.force_login(user_with_collaboration)
 
-        with self.assertNumQueries(10):
+        with self.assertNumQueries(9):
             self.dashboard_api.list_dashboards()
 
         for i in range(5):
@@ -382,7 +1057,7 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
             for j in range(3):
                 self.dashboard_api.create_insight({"dashboards": [dashboard_id], "name": f"insight-{j}"})
 
-            with self.assertNumQueries(FuzzyInt(12, 13)):
+            with self.assertNumQueries(FuzzyInt(11, 13)):
                 self.dashboard_api.list_dashboards(query_params={"limit": 300})
 
     def test_listing_dashboards_does_not_include_tiles(self) -> None:
@@ -489,25 +1164,13 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
             self.assertIsNotNone(response_data["tiles"][0]["last_refresh"])
             self.assertEqual(response_data["tiles"][0]["insight"]["result"][0]["count"], 0)
 
-            item_default.refresh_from_db()
-            item_trends.refresh_from_db()
-
-            self.assertEqual(
-                isoparse(response_data["tiles"][0]["last_refresh"]),
-                item_default.caching_state.last_refresh,
-            )
-            self.assertEqual(
-                isoparse(response_data["tiles"][1]["last_refresh"]),
-                item_default.caching_state.last_refresh,
-            )
-
             self.assertAlmostEqual(
-                item_default.caching_state.last_refresh,
+                isoparse(response_data["tiles"][0]["last_refresh"]),
                 now(),
                 delta=datetime.timedelta(seconds=5),
             )
             self.assertAlmostEqual(
-                item_trends.caching_state.last_refresh,
+                isoparse(response_data["tiles"][1]["last_refresh"]),
                 now(),
                 delta=datetime.timedelta(seconds=5),
             )
@@ -553,7 +1216,6 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         dashboard_id, _ = self.dashboard_api.create_dashboard({"filters": {"date_from": "-14d"}})
         insight_id, _ = self.dashboard_api.create_insight(
             {
-                "filters": {"hello": "test", "date_from": "-7d"},
                 "dashboards": [dashboard_id],
                 "name": "some_item",
             }
@@ -609,6 +1271,52 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         dashboard_two_after_delete = self.dashboard_api.get_dashboard(dashboard_two_id)
         assert len(dashboard_two_after_delete["tiles"]) == 1
 
+    def test_delete_dashboard_with_insights_removes_filesystem_entries(self):
+        """
+        Cascading insight deletion via the dashboard endpoint uses bulk update under the hood,
+        which bypasses signals. The serializer must explicitly resync FileSystem entries so the
+        Recents sidebar stops surfacing dead references.
+        """
+        from posthog.models.file_system.file_system import FileSystem
+
+        dashboard_id, _ = self.dashboard_api.create_dashboard({})
+        insight_id, _ = self.dashboard_api.create_insight(
+            {"name": "to be cascade-deleted", "dashboards": [dashboard_id]}
+        )
+
+        insight = Insight.objects.get(id=insight_id)
+        assert FileSystem.objects.filter(team=self.team, type="insight", ref=insight.short_id).exists()
+        FileSystemViewLog.objects.create(team=self.team, user=self.user, type="insight", ref=insight.short_id)
+
+        self.dashboard_api.soft_delete(dashboard_id, "dashboards", {"delete_insights": True})
+
+        insight.refresh_from_db()
+        assert insight.deleted is True
+        assert not FileSystem.objects.filter(team=self.team, type="insight", ref=insight.short_id).exists()
+        assert not FileSystemViewLog.objects.filter(team=self.team, type="insight", ref=insight.short_id).exists()
+
+    def test_undelete_dashboard_restores_insight_filesystem_entries(self):
+        """Undoing a cascade delete must re-create FileSystem entries via the resync helper."""
+        from posthog.models.file_system.file_system import FileSystem
+
+        dashboard_id, _ = self.dashboard_api.create_dashboard({})
+        insight_id, _ = self.dashboard_api.create_insight({"name": "round-tripped", "dashboards": [dashboard_id]})
+        insight = Insight.objects.get(id=insight_id)
+
+        self.dashboard_api.soft_delete(dashboard_id, "dashboards", {"delete_insights": True})
+        assert not FileSystem.objects.filter(team=self.team, type="insight", ref=insight.short_id).exists()
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/dashboards/{dashboard_id}/",
+            {"deleted": False},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_200_OK
+
+        insight.refresh_from_db()
+        assert insight.deleted is False
+        assert FileSystem.objects.filter(team=self.team, type="insight", ref=insight.short_id).exists()
+
     def test_delete_dashboard_clears_primary_dashboard(self):
         dashboard_id, _ = self.dashboard_api.create_dashboard({})
         self.team.primary_dashboard_id = dashboard_id
@@ -625,18 +1333,29 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         )
 
         dashboard = create_group_type_mapping_detail_dashboard(group_type, self.user)
-        group_type.detail_dashboard_id = dashboard.id
-        group_type.save()
+        update_group_type_mapping_fields(group_type, fields={"detail_dashboard_id": dashboard.id}, caller_tag="test")
+
+        cache_key = f"{GROUP_TYPES_CACHE_KEY_PREFIX}{self.team.project_id}"
+        stale_cache_key = f"{GROUP_TYPES_STALE_CACHE_KEY_PREFIX}{self.team.project_id}"
+        cache.set(cache_key, [{"stale": True}], 300)
+        cache.set(stale_cache_key, [{"stale": True}], 300)
 
         self.dashboard_api.soft_delete(dashboard.id, "dashboards", {"delete_insights": True})
-        group_type.refresh_from_db()
+        self.assertIsNone(cache.get(cache_key))
+        self.assertIsNone(cache.get(stale_cache_key))
+        # Strong consistency bypasses the cache so this read doesn't re-populate the keys asserted above.
+        group_type = get_group_type_mapping_instance(
+            project_id=self.team.project_id, group_type_index=group_type.group_type_index, consistency="strong"
+        )
         self.assertIsNone(group_type.detail_dashboard_id)
 
     def test_dashboard_items(self):
         dashboard_id, _ = self.dashboard_api.create_dashboard({"filters": {"date_from": "-14d"}})
         insight_id, _ = self.dashboard_api.create_insight(
             {
-                "filters": {"hello": "test", "date_from": "-7d"},
+                "query": InsightVizNode(
+                    source=TrendsQuery(series=[EventsNode(event="$pageview")], dateRange=DateRange(date_from="-7d"))
+                ).model_dump(),
                 "dashboards": [dashboard_id],
                 "name": "some_item",
             }
@@ -645,7 +1364,7 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         response = self.dashboard_api.get_dashboard(dashboard_id)
         self.assertEqual(len(response["tiles"]), 1)
         self.assertEqual(response["tiles"][0]["insight"]["name"], "some_item")
-        self.assertEqual(response["tiles"][0]["insight"]["filters"]["date_from"], "-14d")
+        self.assertEqual(response["tiles"][0]["insight"]["query"]["source"]["dateRange"]["date_from"], "-14d")
 
         item_response = self.client.get(f"/api/projects/{self.team.id}/insights/").json()
         self.assertEqual(item_response["results"][0]["name"], "some_item")
@@ -666,14 +1385,12 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         dashboard_id, _ = self.dashboard_api.create_dashboard({"filters": {"date_from": "-14d"}})
         insight_id, _ = self.dashboard_api.create_insight(
             {
-                "filters": {"hello": "test", "date_from": "-7d"},
                 "dashboards": [dashboard_id],
                 "name": "some_item",
             }
         )
         out_of_synch_insight_id, _ = self.dashboard_api.create_insight(
             {
-                "filters": {"hello": "test", "date_from": "-7d"},
                 "dashboards": [dashboard_id],
                 "name": "out of synch",
             }
@@ -698,8 +1415,6 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         mock_request.user = self.user
 
         # Create a proper user access control for the serializer
-        from posthog.rbac.user_access_control import UserAccessControl
-
         user_access_control = UserAccessControl(self.user, organization_id=str(self.user.current_organization_id))
 
         dashboard_data = DashboardSerializer(
@@ -714,11 +1429,213 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         ).data
         assert len(dashboard_data["tiles"]) == 1
 
+    def test_removing_already_soft_deleted_tile_is_idempotent(self):
+        """
+        Regression test: removing a tile whose underlying insight was already soft-deleted
+        (so the tile row itself has deleted=True via cascade) used to 500 with
+        IntegrityError on dash_tile_exactly_one_related_object, because update_or_create
+        looked up through the default manager that hides soft-deleted rows and then fell
+        through to CREATE with only {id, dashboard, deleted} fields set.
+        """
+        dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "d"})
+        insight_id, _ = self.dashboard_api.create_insight({"dashboards": [dashboard_id], "name": "i"})
+        tile = DashboardTile.objects.get(insight_id=insight_id, dashboard_id=dashboard_id)
+
+        self.dashboard_api.soft_delete(insight_id, "insights")
+        tile.refresh_from_db()
+        assert tile.deleted is True, "cascade should mark the tile as soft-deleted when its insight is deleted"
+
+        _, body = self.dashboard_api.update_dashboard(
+            dashboard_id,
+            {"tiles": [{"id": tile.id, "deleted": True}]},
+        )
+        assert body["id"] == dashboard_id
+        assert DashboardTile.objects_including_soft_deleted.get(id=tile.id).deleted is True
+
+    def test_layout_patch_succeeds_on_dashboard_with_mixed_tile_state(self):
+        """
+        Coverage for layout edits on a dashboard with a realistic mix of tile states:
+        alive insight tiles with proper sm layouts, alive insight tiles whose layouts
+        are still ``{}``, tiles whose underlying insight has been soft-deleted (cascade
+        soft-deletes the tile row), tiles soft-deleted directly, plus a text and button
+        tile with empty layouts.
+
+        The frontend's saveEditModeChanges sends ``{id, layouts: {sm: ...}}`` for every
+        VISIBLE tile (i.e. tiles returned by GET, which excludes soft-deleted rows and
+        rows pointing at soft-deleted insights). The PATCH must succeed AND the new
+        layouts must actually be persisted.
+        """
+        dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "mixed-tile-state"})
+
+        # 5 alive insight tiles that we will give proper sm layouts.
+        with_layout_insight_ids: list[int] = []
+        for i in range(5):
+            insight_id, _ = self.dashboard_api.create_insight(
+                {"dashboards": [dashboard_id], "name": f"with-layout-{i}"}
+            )
+            with_layout_insight_ids.append(insight_id)
+
+        # 3 alive insight tiles whose layouts stay {} (creation default).
+        for i in range(3):
+            self.dashboard_api.create_insight({"dashboards": [dashboard_id], "name": f"empty-layout-{i}"})
+
+        # 2 tiles whose insight gets soft-deleted -> tile cascades to deleted=True
+        for i in range(2):
+            insight_id, _ = self.dashboard_api.create_insight({"dashboards": [dashboard_id], "name": f"cascade-{i}"})
+            self.dashboard_api.soft_delete(insight_id, "insights")
+
+        # 2 tiles soft-deleted directly via PATCH (insight stays alive)
+        for i in range(2):
+            insight_id, _ = self.dashboard_api.create_insight({"dashboards": [dashboard_id], "name": f"direct-{i}"})
+            tile_to_remove = DashboardTile.objects.get(insight_id=insight_id, dashboard_id=dashboard_id)
+            self.dashboard_api.update_dashboard(dashboard_id, {"tiles": [{"id": tile_to_remove.id, "deleted": True}]})
+
+        # 1 text tile and 1 button tile, both with empty layouts
+        self.dashboard_api.create_text_tile(dashboard_id, text="hello")
+        self.dashboard_api.create_button_tile(dashboard_id, url="https://example.com", text="click")
+
+        # Sanity: persist {} layouts on the empty-layout insight tiles (creation default is {})
+        for tile in DashboardTile.objects.filter(dashboard_id=dashboard_id):
+            assert isinstance(tile.layouts, dict)
+
+        # Set realistic sm layouts on the first 5 insight tiles
+        for y, insight_id in enumerate(with_layout_insight_ids):
+            tile = DashboardTile.objects.get(insight_id=insight_id, dashboard_id=dashboard_id)
+            tile.layouts = {
+                "sm": {
+                    "h": 5,
+                    "i": str(tile.id),
+                    "w": 6,
+                    "x": 0,
+                    "y": y * 5,
+                    "minH": 2,
+                    "minW": 2,
+                    "moved": False,
+                    "static": False,
+                }
+            }
+            tile.save()
+
+        # Fetch the dashboard like the frontend does, then send the same shape PATCH
+        dashboard_response = self.dashboard_api.get_dashboard(dashboard_id)
+        visible_tiles = dashboard_response["tiles"]
+        assert len(visible_tiles) == 5 + 3 + 1 + 1, "GET should hide soft-deleted and cascade-deleted tiles"
+
+        # Mirror frontend saveEditModeChanges: layouts: tile.layouts?.sm ? {sm: tile.layouts.sm} : {}
+        layouts_payload = []
+        expected_layouts_by_tile_id: dict[int, dict] = {}
+        for idx, tile in enumerate(visible_tiles):
+            sm = (tile.get("layouts") or {}).get("sm")
+            if sm:
+                # Move it slightly to simulate a real edit
+                new_sm = {**sm, "y": sm["y"] + 1}
+            else:
+                # Frontend just resized this previously-empty tile
+                new_sm = {
+                    "h": 5,
+                    "i": str(tile["id"]),
+                    "w": 6,
+                    "x": 0,
+                    "y": 100 + idx,
+                    "minH": 2,
+                    "minW": 2,
+                    "moved": False,
+                    "static": False,
+                }
+            new_layouts = {"sm": new_sm}
+            layouts_payload.append({"id": tile["id"], "layouts": new_layouts})
+            expected_layouts_by_tile_id[tile["id"]] = new_layouts
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/dashboards/{dashboard_id}",
+            {"tiles": layouts_payload},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_200_OK, (
+            f"expected 200, got {response.status_code} body={response.content[:500]}"
+        )
+
+        # Crucial: assert the helper actually wrote the new layouts. Without this, the test
+        # would still pass if `_update_existing_tile_display_fields` silently no-op'd everything.
+        for tile_id, expected_layouts in expected_layouts_by_tile_id.items():
+            persisted = DashboardTile.objects.get(id=tile_id)
+            assert persisted.layouts == expected_layouts, (
+                f"tile {tile_id} layouts not persisted — expected {expected_layouts}, got {persisted.layouts}"
+            )
+
+    @parameterized.expand(
+        [
+            ("tile_belongs_to_another_dashboard",),
+            ("tile_id_does_not_exist_anywhere",),
+        ]
+    )
+    def test_layout_patch_silently_skips_unknown_tile_id(self, scenario: str) -> None:
+        """
+        Regression: the layout-only branch of ``_update_tiles`` was using ``update_or_create``,
+        which silently fell through to INSERT when the (id, dashboard) pair didn't match an
+        existing row. The INSERT carried no insight/text/button_tile FK and tripped the partial
+        CHECK constraint ``dash_tile_exactly_one_related_object``, returning a generic 500.
+
+        Two real-world ways this triggers in production:
+          - ``tile_belongs_to_another_dashboard``: cross-dashboard kea state contamination —
+            the frontend posts a tile id that exists, but on a different dashboard.
+          - ``tile_id_does_not_exist_anywhere``: the tile was hard-deleted or never existed.
+
+        In both cases the bad id must be silently skipped while the rest of the payload saves.
+        """
+        dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "target"})
+        valid_insight, _ = self.dashboard_api.create_insight({"dashboards": [dashboard_id], "name": "valid"})
+        valid_tile = DashboardTile.objects.get(insight_id=valid_insight, dashboard_id=dashboard_id)
+
+        stranger_tile: DashboardTile | None = None
+        stranger_layouts_before: dict | None = None
+        stranger_dashboard_before: int | None = None
+        if scenario == "tile_belongs_to_another_dashboard":
+            other_dashboard, _ = self.dashboard_api.create_dashboard({"name": "other"})
+            stranger_insight, _ = self.dashboard_api.create_insight(
+                {"dashboards": [other_dashboard], "name": "stranger"}
+            )
+            stranger_tile = DashboardTile.objects.get(insight_id=stranger_insight, dashboard_id=other_dashboard)
+            unknown_tile_id = stranger_tile.id
+            stranger_layouts_before = dict(stranger_tile.layouts)
+            stranger_dashboard_before = stranger_tile.dashboard_id
+        else:
+            unknown_tile_id = 99_999_999
+
+        new_layouts = {"sm": {"h": 7, "i": str(valid_tile.id), "w": 8, "x": 1, "y": 2, "minH": 2, "minW": 2}}
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/dashboards/{dashboard_id}",
+            {
+                "tiles": [
+                    {"id": valid_tile.id, "layouts": new_layouts},
+                    {"id": unknown_tile_id, "layouts": {"sm": {"x": 99, "y": 99, "w": 1, "h": 1}}},
+                ]
+            },
+            format="json",
+        )
+        assert response.status_code == status.HTTP_200_OK, response.content[:500]
+
+        valid_tile.refresh_from_db()
+        assert valid_tile.layouts == new_layouts, "valid tile layouts should have been saved"
+
+        if stranger_tile is not None:
+            stranger_tile.refresh_from_db()
+            assert stranger_tile.layouts == stranger_layouts_before, "stranger tile must NOT be touched"
+            assert stranger_tile.dashboard_id == stranger_dashboard_before, (
+                "stranger tile must NOT be moved to the target dashboard"
+            )
+        else:
+            assert not DashboardTile.objects_including_soft_deleted.filter(id=unknown_tile_id).exists(), (
+                "unknown id must not have created a new row"
+            )
+
     def test_dashboard_insight_tiles_can_be_loaded_correct_context(self):
         dashboard_id, _ = self.dashboard_api.create_dashboard({"filters": {"date_from": "-14d"}})
         insight_id, _ = self.dashboard_api.create_insight(
             {
-                "filters": {"hello": "test", "date_from": "-7d"},
+                "query": InsightVizNode(
+                    source=TrendsQuery(series=[EventsNode(event="$pageview")], dateRange=DateRange(date_from="-7d"))
+                ).model_dump(),
                 "dashboards": [dashboard_id],
                 "name": "some_item",
             }
@@ -729,7 +1646,7 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         tile = response["tiles"][0]
 
         assert tile["insight"]["id"] == insight_id
-        assert tile["insight"]["filters"]["date_from"] == "-14d"
+        assert tile["insight"]["query"]["source"]["dateRange"]["date_from"] == "-14d"
 
     def test_dashboard_filtering_on_properties(self):
         dashboard_id, _ = self.dashboard_api.create_dashboard({"filters": {"date_from": "-24h"}})
@@ -747,7 +1664,9 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
 
         insight_id, _ = self.dashboard_api.create_insight(
             {
-                "filters": {"hello": "test", "date_from": "-7d"},
+                "query": InsightVizNode(
+                    source=TrendsQuery(series=[EventsNode(event="$pageview")], dateRange=DateRange(date_from="-7d"))
+                ).model_dump(),
                 "dashboards": [dashboard_id],
                 "name": "some_item",
             }
@@ -757,13 +1676,41 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         self.assertEqual(len(response["tiles"]), 1)
         self.assertEqual(response["tiles"][0]["insight"]["name"], "some_item")
         self.assertEqual(
-            response["tiles"][0]["insight"]["filters"]["properties"],
-            [{"key": "prop", "value": "val"}],
+            response["tiles"][0]["insight"]["query"]["source"]["properties"],
+            [
+                {
+                    "key": "prop",
+                    "label": None,
+                    "operator": "exact",
+                    "type": "event",
+                    "value": "val",
+                }
+            ],
         )
+
+    def test_dashboard_interval_and_test_account_overrides_round_trip(self):
+        dashboard_id, _ = self.dashboard_api.create_dashboard({"filters": {"date_from": "-24h"}})
+
+        _, response = self.dashboard_api.update_dashboard(
+            dashboard_id,
+            {"filters": {"date_from": "-24h", "interval": "week", "filterTestAccounts": True}},
+        )
+
+        self.assertEqual(response["filters"]["interval"], "week")
+        self.assertEqual(response["filters"]["filterTestAccounts"], True)
+
+        read_back = self.dashboard_api.get_dashboard(dashboard_id)
+        self.assertEqual(read_back["filters"]["interval"], "week")
+        self.assertEqual(read_back["filters"]["filterTestAccounts"], True)
 
     def test_dashboard_filter_is_applied_even_if_insight_is_created_before_dashboard(self):
         insight_id, _ = self.dashboard_api.create_insight(
-            {"filters": {"hello": "test", "date_from": "-7d"}, "name": "some_item"}
+            {
+                "name": "some_item",
+                "query": InsightVizNode(
+                    source=TrendsQuery(series=[EventsNode(event="$pageview")], dateRange=DateRange(date_from="-7d"))
+                ).model_dump(),
+            }
         )
 
         dashboard_id, _ = self.dashboard_api.create_dashboard({"filters": {"date_from": "-14d"}})
@@ -772,27 +1719,20 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         self.dashboard_api.add_insight_to_dashboard([dashboard_id], insight_id)
 
         response = self.dashboard_api.get_dashboard(dashboard_id)
-        self.assertEqual(response["tiles"][0]["insight"]["filters"]["date_from"], "-14d")
+        self.assertEqual(response["tiles"][0]["insight"]["query"]["source"]["dateRange"]["date_from"], "-14d")
 
         # which doesn't change the insight's filter
         response = self.dashboard_api.get_insight(insight_id)
-        self.assertEqual(response["filters"]["date_from"], "-7d")
+        self.assertEqual(response["query"]["source"]["dateRange"]["date_from"], "-7d")
 
     def test_dashboard_items_history_per_user(self):
         test_user = User.objects.create_and_join(self.organization, "test@test.com", None)
 
         Insight.objects.create(filters={"hello": "test"}, team=self.team, created_by=test_user)
 
-        self.dashboard_api.create_insight({"filters": {"hello": "test"}})
+        self.dashboard_api.create_insight({})
 
         response = self.client.get(f"/api/projects/{self.team.id}/insights/?user=true").json()
-        self.assertEqual(response["count"], 1)
-
-    def test_dashboard_items_history_saved(self):
-        self.dashboard_api.create_insight({"filters": {"hello": "test"}, "saved": True})
-        self.dashboard_api.create_insight({"filters": {"hello": "test"}})
-
-        response = self.client.get(f"/api/projects/{self.team.id}/insights/?user=true&saved=true").json()
         self.assertEqual(response["count"], 1)
 
     def test_dashboard_item_layout(self):
@@ -800,7 +1740,6 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
 
         insight_id, _ = self.dashboard_api.create_insight(
             {
-                "filters": {"hello": "test"},
                 "dashboards": [dashboard_id],
                 "name": "another",
             }
@@ -823,7 +1762,6 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
 
         insight_id, _ = self.dashboard_api.create_insight(
             {
-                "filters": {"hello": "test"},
                 "dashboards": [dashboard_id],
                 "name": "another",
             }
@@ -857,31 +1795,158 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         dashboard_json = self.dashboard_api.get_dashboard(dashboard_id, query_params={"refresh": False})
         assert dashboard_json["tiles"][0]["color"] == "red"
 
-    @patch("posthog.api.dashboards.dashboard.report_user_action")
-    def test_dashboard_from_template(self, mock_capture):
+    def test_dashboard_tile_show_description_can_be_toggled(self):
+        dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "test", "pinned": True})
+        self.dashboard_api.create_insight({"dashboards": [dashboard_id], "name": "insight"})
+
+        dashboard_json = self.dashboard_api.get_dashboard(dashboard_id)
+        tile_id = dashboard_json["tiles"][0]["id"]
+        assert dashboard_json["tiles"][0]["show_description"] is None
+
+        self.dashboard_api.update_dashboard(dashboard_id, {"tiles": [{"id": tile_id, "show_description": True}]})
+        dashboard_json = self.dashboard_api.get_dashboard(dashboard_id, query_params={"refresh": False})
+        assert dashboard_json["tiles"][0]["show_description"] is True
+
+        self.dashboard_api.update_dashboard(dashboard_id, {"tiles": [{"id": tile_id, "show_description": False}]})
+        dashboard_json = self.dashboard_api.get_dashboard(dashboard_id, query_params={"refresh": False})
+        assert dashboard_json["tiles"][0]["show_description"] is False
+
+    @patch("products.dashboards.backend.api.dashboard.report_user_action")
+    def test_dashboard_from_template(self, mock_report_user_action):
         _, response = self.dashboard_api.create_dashboard({"name": "another", "use_template": "DEFAULT_APP"})
         self.assertGreater(Insight.objects.count(), 1)
         self.assertEqual(response["creation_mode"], "template")
 
         # Assert analytics are sent
-        mock_capture.assert_called_once_with(
+        mock_report_user_action.assert_called_once_with(
             self.user,
             "dashboard created",
             {
-                "$current_url": None,
-                "$session_id": mock.ANY,
                 "created_at": mock.ANY,
-                "dashboard_id": None,
+                "creation_mode": "template",
+                "dashboard_id": response["id"],
                 "duplicated": False,
+                "duplicated_from_dashboard_id": None,
                 "from_template": True,
-                "has_description": False,
+                "has_description": True,
                 "is_shared": False,
                 "item_count": 6,
                 "pinned": False,
                 "tags_count": 0,
                 "template_key": "DEFAULT_APP",
             },
+            team=ANY,
+            request=ANY,
         )
+
+    @patch("products.dashboards.backend.api.dashboard.report_user_action")
+    def test_soft_delete_reports_dashboard_deleted(self, mock_report_user_action):
+        dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "to delete"})
+        self.dashboard_api.create_insight({"dashboards": [dashboard_id]})
+        self.dashboard_api.create_text_tile(dashboard_id)
+        mock_report_user_action.reset_mock()
+
+        self.dashboard_api.soft_delete(dashboard_id, "dashboards")
+
+        # item_count (insight tiles) and tile_count (all tiles) are snapshotted pre-delete, so they survive
+        # _delete_related_tiles: 1 insight tile, 2 tiles total (insight + text).
+        mock_report_user_action.assert_called_once_with(
+            self.user,
+            "dashboard deleted",
+            {
+                "created_at": mock.ANY,
+                "creation_mode": "default",
+                "dashboard_id": dashboard_id,
+                "has_description": False,
+                "is_shared": False,
+                "item_count": 1,
+                "pinned": False,
+                "tags_count": 0,
+                "tile_count": 2,
+            },
+            team=ANY,
+            request=ANY,
+        )
+
+    @patch("products.dashboards.backend.api.dashboard.report_user_action")
+    def test_update_reports_dashboard_updated_with_creation_mode(self, mock_report_user_action):
+        dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "to rename"})
+        mock_report_user_action.reset_mock()
+
+        self.dashboard_api.update_dashboard(dashboard_id, {"name": "renamed"})
+
+        mock_report_user_action.assert_called_once_with(
+            self.user,
+            "dashboard updated",
+            {
+                "created_at": mock.ANY,
+                "creation_mode": "default",
+                "dashboard_id": dashboard_id,
+                "has_description": False,
+                "is_shared": False,
+                "item_count": 0,
+                "pinned": False,
+                "tags_count": 0,
+            },
+            team=ANY,
+            request=ANY,
+        )
+
+    def test_invalid_template_key_returns_400(self):
+        _, response = self.dashboard_api.create_dashboard(
+            {"name": "bad template", "use_template": "NONEXISTENT_KEY_abc123"},
+            expected_status=status.HTTP_400_BAD_REQUEST,
+        )
+        self.assertEqual(response["attr"], "use_template")
+
+    @parameterized.expand(
+        [
+            ("same_team_only_team", "self", "team", status.HTTP_201_CREATED),
+            ("global", "none", "global", status.HTTP_201_CREATED),
+            ("same_org_organization", "sibling", "organization", status.HTTP_201_CREATED),
+            ("other_team_only_team", "other", "team", status.HTTP_400_BAD_REQUEST),
+            ("other_org_organization", "other", "organization", status.HTTP_400_BAD_REQUEST),
+        ]
+    )
+    def test_use_template_respects_team_scoping(self, _name: str, owner: str, scope: str, expected_status: int) -> None:
+        if owner == "self":
+            template_team: Team | None = self.team
+        elif owner == "sibling":
+            template_team = Team.objects.create(organization=self.organization, name="sibling team")
+        elif owner == "other":
+            other_org = Organization.objects.create(name="other org")
+            template_team = Team.objects.create(organization=other_org, name="other team")
+        else:
+            template_team = None
+
+        template_name = f"probe-{owner}"
+        DashboardTemplate.objects.create(
+            team=template_team,
+            template_name=template_name,
+            scope=scope,
+            dashboard_description="probe-description",
+            dashboard_filters={},
+            tiles=[{"type": "TEXT", "body": "probe-tile-body", "layouts": {}, "color": None}],
+            tags=["probe-tag"],
+        )
+
+        dashboard_id, response = self.dashboard_api.create_dashboard(
+            {"name": "probe", "use_template": template_name},
+            expected_status=expected_status,
+        )
+
+        if expected_status == status.HTTP_201_CREATED:
+            self.assertEqual(response["creation_mode"], "template")
+            dashboard = Dashboard.objects.get(id=dashboard_id, team=self.team)
+            self.assertEqual(dashboard.description, "probe-description")
+            tag_names = list(dashboard.tagged_items.values_list("tag__name", flat=True))
+            self.assertIn("probe-tag", tag_names)
+        else:
+            self.assertEqual(response["attr"], "use_template")
+            for dashboard in Dashboard.objects.filter(team=self.team, name="probe"):
+                self.assertNotIn("probe-description", dashboard.description or "")
+                tag_names = list(dashboard.tagged_items.values_list("tag__name", flat=True))
+                self.assertNotIn("probe-tag", tag_names)
 
     def test_dashboard_creation_validation(self):
         existing_dashboard = Dashboard.objects.create(team=self.team, name="existing dashboard", created_by=self.user)
@@ -961,12 +2026,13 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
             {"name": "another", "use_dashboard": existing_dashboard.id}
         )
 
-        after_duplication_insight_id = duplicate_response["tiles"][0]["insight"]["id"]
-        assert after_duplication_insight_id == insight_one_id
-        assert duplicate_response["tiles"][0]["insight"]["name"] == "the insight"
+        insight_tile = next(t for t in duplicate_response["tiles"] if t.get("insight"))
+        text_tile = next(t for t in duplicate_response["tiles"] if t.get("text"))
+        assert insight_tile["insight"]["id"] == insight_one_id
+        assert insight_tile["insight"]["name"] == "the insight"
 
-        after_duplication_tile_id = duplicate_response["tiles"][1]["text"]["id"]
-        assert after_duplication_tile_id == dashboard_with_tiles["tiles"][1]["text"]["id"]
+        original_text_tile = next(t for t in dashboard_with_tiles["tiles"] if t.get("text"))
+        assert text_tile["text"]["id"] == original_text_tile["text"]["id"]
 
     def test_dashboard_duplication_without_tile_duplicate_excludes_soft_deleted_tiles(self):
         existing_dashboard = Dashboard.objects.create(team=self.team, name="existing dashboard", created_by=self.user)
@@ -1009,12 +2075,31 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
             }
         )
 
-        after_duplication_insight_id = duplicate_response["tiles"][0]["insight"]["id"]
-        assert after_duplication_insight_id != insight_one_id
-        assert duplicate_response["tiles"][0]["insight"]["name"] == "the insight (Copy)"
+        insight_tile = next(t for t in duplicate_response["tiles"] if t.get("insight"))
+        text_tile = next(t for t in duplicate_response["tiles"] if t.get("text"))
+        assert insight_tile["insight"]["id"] != insight_one_id
+        assert insight_tile["insight"]["name"] == "the insight (Copy)"
 
-        after_duplication_tile_id = duplicate_response["tiles"][1]["text"]["id"]
-        assert after_duplication_tile_id != dashboard_with_tiles["tiles"][1]["text"]["id"]
+        original_text_tile = next(t for t in dashboard_with_tiles["tiles"] if t.get("text"))
+        assert text_tile["text"]["id"] != original_text_tile["text"]["id"]
+
+    def test_dashboard_duplication_reports_a_tile_it_cannot_copy(self) -> None:
+        existing_dashboard = Dashboard.objects.create(team=self.team, name="existing dashboard", created_by=self.user)
+        # A name already at the column limit no longer fits once duplication appends " (Copy)",
+        # so the copy fails validation. Any tile that fails it used to reach save() on an invalid
+        # serializer and return a 500 naming nothing.
+        self.dashboard_api.create_insight({"dashboards": [existing_dashboard.pk], "name": "n" * 400})
+
+        _, response = self.dashboard_api.create_dashboard(
+            {
+                "name": "another",
+                "use_dashboard": existing_dashboard.id,
+                "duplicate_tiles": True,
+            },
+            expected_status=status.HTTP_400_BAD_REQUEST,
+        )
+
+        assert "Can't copy the insight" in response["detail"]
 
     @parameterized.expand(
         [
@@ -1064,19 +2149,13 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         assert duplicate_response is not None
         assert len(duplicate_response.get("tiles", [])) == 2
 
-        insight_tile = next(tile for tile in duplicate_response["tiles"] if "insight" in tile)
-        text_tile = next(tile for tile in duplicate_response["tiles"] if "text" in tile)
+        # Every serialized tile carries both "insight" and "text" keys (the absent one is None),
+        # so select by which is populated — not by key presence or list order, which isn't guaranteed.
+        insight_tile = next(tile for tile in duplicate_response["tiles"] if tile.get("insight"))
+        text_tile = next(tile for tile in duplicate_response["tiles"] if tile.get("text"))
 
-        # this test only needs to check that insight name is still None,
-        # but it flaps in CI.
-        # my guess was that the order of the response is not guaranteed
-        # but even after lifting insight tile out specifically, it still flaps
-        # it isn't clear from the error if insight_tile or insight_tile["insight"] is None
-        with self.retry_assertion():
-            assert insight_tile is not None
-            assert insight_tile["insight"] is not None
-            assert insight_tile["insight"]["name"] is None
-            assert text_tile is not None
+        assert insight_tile["insight"]["name"] is None
+        assert text_tile["text"] is not None
 
     def test_dashboard_duplication(self):
         existing_dashboard = Dashboard.objects.create(team=self.team, name="existing dashboard", created_by=self.user)
@@ -1176,11 +2255,16 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
 
     def test_dashboard_duplication_copies_breakdown_colors(self):
         """Test that breakdown_colors are copied during duplication"""
+        # The shape the frontend persists: a list of BreakdownColorConfig objects
+        breakdown_colors = [
+            {"breakdownValue": "Chrome", "breakdownType": "event", "colorToken": "preset-1", "source": "manual"},
+            {"breakdownValue": "Firefox", "breakdownType": "event", "colorToken": "preset-2", "source": "manual"},
+        ]
         existing_dashboard = Dashboard.objects.create(
             team=self.team,
             name="Dashboard with colors",
             created_by=self.user,
-            breakdown_colors={"event1": "#FF0000", "event2": "#00FF00"},
+            breakdown_colors=breakdown_colors,
         )
 
         # Duplicate the dashboard
@@ -1189,10 +2273,10 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         )
 
         # Verify breakdown_colors are copied
-        self.assertEqual(response["breakdown_colors"], {"event1": "#FF0000", "event2": "#00FF00"})
+        self.assertEqual(response["breakdown_colors"], breakdown_colors)
 
         duplicated_dashboard = Dashboard.objects.get(id=response["id"])
-        self.assertEqual(duplicated_dashboard.breakdown_colors, {"event1": "#FF0000", "event2": "#00FF00"})
+        self.assertEqual(duplicated_dashboard.breakdown_colors, breakdown_colors)
 
     def test_dashboard_duplication_copies_variables(self):
         """Test that variables are copied during duplication"""
@@ -1257,26 +2341,80 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         duplicated_dashboard = Dashboard.objects.get(id=response["id"])
         self.assertEqual(duplicated_dashboard.data_color_theme_id, color_theme.id)
 
+    def test_dashboard_duplication_copies_quick_filter_ids(self):
+        qf1 = QuickFilter.objects.create(team=self.team, name="Filter 1", property_name="prop1")
+        qf2 = QuickFilter.objects.create(team=self.team, name="Filter 2", property_name="prop2")
+        qf3 = QuickFilter.objects.create(team=self.team, name="Filter 3", property_name="prop3")
+        quick_filter_ids = [str(qf1.id), str(qf2.id), str(qf3.id)]
+
+        existing_dashboard = Dashboard.objects.create(
+            team=self.team,
+            name="Dashboard with quick filters",
+            created_by=self.user,
+            quick_filter_ids=quick_filter_ids,
+        )
+
+        # Duplicate the dashboard
+        _, response = self.dashboard_api.create_dashboard(
+            {"name": "Duplicated dashboard", "use_dashboard": existing_dashboard.pk}
+        )
+
+        # Verify quick_filter_ids is copied
+        self.assertEqual(response["quick_filter_ids"], quick_filter_ids)
+
+        duplicated_dashboard = Dashboard.objects.get(id=response["id"])
+        self.assertEqual(duplicated_dashboard.quick_filter_ids, quick_filter_ids)
+
+    @parameterized.expand(
+        [
+            ("not_a_list", "not-a-list", status.HTTP_400_BAD_REQUEST),
+            ("invalid_uuid", ["not-a-uuid"], status.HTTP_400_BAD_REQUEST),
+            ("nonexistent_ids", ["00000000-0000-0000-0000-000000000001"], status.HTTP_400_BAD_REQUEST),
+            ("empty_list", [], status.HTTP_200_OK),
+            ("null_coerced_to_empty_list", None, status.HTTP_200_OK),
+        ]
+    )
+    def test_dashboard_patch_quick_filter_ids_validation(self, _name, value, expected_status):
+        dashboard = Dashboard.objects.create(team=self.team, name="test dashboard", created_by=self.user)
+
+        response = self.client.patch(
+            f"/api/environments/{self.team.id}/dashboards/{dashboard.id}/",
+            {"quick_filter_ids": value},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, expected_status)
+
+    def test_dashboard_patch_quick_filter_ids_with_existing_filters(self):
+        qf1 = QuickFilter.objects.create(team=self.team, name="Filter 1", property_name="prop1")
+        qf2 = QuickFilter.objects.create(team=self.team, name="Filter 2", property_name="prop2")
+        dashboard = Dashboard.objects.create(team=self.team, name="test dashboard", created_by=self.user)
+
+        response = self.client.patch(
+            f"/api/environments/{self.team.id}/dashboards/{dashboard.id}/",
+            {"quick_filter_ids": [str(qf1.id), str(qf2.id)]},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["quick_filter_ids"], [str(qf1.id), str(qf2.id)])
+
     def test_return_cached_results_dashboard_has_filters(self):
-        # create a dashboard with no filters
+        # create a dashboard with two 7-day insights
+        query_7d = TrendsQuery(
+            series=[EventsNode(event="$pageview")],
+            properties=[EventPropertyFilter(key="$browser", value="Mac OS X", operator=PropertyOperator.EXACT)],
+            dateRange=DateRange(date_from="-7d"),
+        ).model_dump()
         dashboard: Dashboard = Dashboard.objects.create(team=self.team, name="dashboard")
+        self.dashboard_api.create_insight({"query": query_7d, "dashboards": [dashboard.pk]})
+        self.dashboard_api.create_insight({"query": query_7d, "dashboards": [dashboard.pk]})
 
-        filter_dict = {
-            "events": [{"id": "$pageview"}],
-            "properties": [{"key": "$browser", "value": "Mac OS X"}],
-            "date_from": "-7d",
-            "insight": "TRENDS",
-        }
-
-        # create two insights with a -7d date from filter
-        self.dashboard_api.create_insight({"filters": filter_dict, "dashboards": [dashboard.pk]})
-        self.dashboard_api.create_insight({"filters": filter_dict, "dashboards": [dashboard.pk]})
-
-        query = filter_to_query(filter_dict).model_dump()
-
-        # cache insight results for trends with a -7d date from
-        response = self.client.post(f"/api/projects/{self.team.id}/query/", data={"query": query})
+        # warms the query cache for these 7-day insights
+        response = self.client.post(f"/api/projects/{self.team.pk}/query/", data={"query": query_7d})
         self.assertEqual(response.status_code, 200)
+
+        # confirm that the dashboard returns the cached result (8 days)
         dashboard_json = self.dashboard_api.get_dashboard(dashboard.pk)
         self.assertEqual(len(dashboard_json["tiles"][0]["insight"]["result"][0]["days"]), 8)
 
@@ -1286,20 +2424,22 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
             {"filters": {"date_from": "-24h"}},
         )
 
+        # check that the immediate dashboard response clears the old cached result (result is None),
+        # confirming stale 7-day data is not reused
         self.assertEqual(patch_response_json["tiles"][0]["insight"]["result"], None)
         dashboard.refresh_from_db()
         self.assertEqual(dashboard.filters, {"date_from": "-24h"})
 
-        # cache results
-        filter_dict["date_from"] = "-24h"
-        response = self.client.post(
-            f"/api/projects/{self.team.id}/query/",
-            data={"query": filter_to_query(filter_dict).model_dump()},
-        )
-
+        # warms the query cache for these 24-hour insights
+        query_24h = TrendsQuery(
+            series=[EventsNode(event="$pageview")],
+            properties=[EventPropertyFilter(key="$browser", value="Mac OS X", operator=PropertyOperator.EXACT)],
+            dateRange=DateRange(date_from="-24h"),
+        ).model_dump()
+        response = self.client.post(f"/api/projects/{self.team.pk}/query/", data={"query": query_24h})
         self.assertEqual(response.status_code, 200)
 
-        # Expecting this to only have one day as per the dashboard filter
+        # confirm that the dashboard returns the cached result (2 days)
         dashboard_json = self.dashboard_api.get_dashboard(dashboard.pk)
         self.assertEqual(len(dashboard_json["tiles"][0]["insight"]["result"][0]["days"]), 2)
 
@@ -1325,15 +2465,10 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         )
         DashboardTile.objects.create(insight=item, dashboard=dashboard)
         response = self.dashboard_api.get_dashboard(dashboard.pk)
-        self.assertEqual(
-            response["tiles"][0]["insight"]["filters"],
-            {
-                "events": [{"id": "$pageview"}],
-                "insight": "TRENDS",
-                "date_from": None,
-                "date_to": None,
-            },
-        )
+        self.assertEqual(response["tiles"][0]["insight"]["filters"], {})
+        query_source = response["tiles"][0]["insight"]["query"]["source"]
+        self.assertEqual(query_source["kind"], "TrendsQuery")
+        self.assertEqual(query_source["series"][0]["event"], "$pageview")
 
     def test_retrieve_dashboard_different_team(self):
         team2 = Team.objects.create(organization=Organization.objects.create(name="a"))
@@ -1359,31 +2494,19 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         self.assertEqual(dashboard["tiles"], [])
 
     def test_can_soft_delete_insight_after_soft_deleting_dashboard(self) -> None:
-        filter_dict = {
-            "events": [{"id": "$pageview"}],
-            "properties": [{"key": "$browser", "value": "Mac OS X"}],
-            "insight": "TRENDS",
-        }
-
         dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard"})
-        insight_id, _ = self.dashboard_api.create_insight({"filters": filter_dict, "dashboards": [dashboard_id]})
+        insight_id, _ = self.dashboard_api.create_insight({"dashboards": [dashboard_id]})
 
         self.dashboard_api.soft_delete(dashboard_id, "dashboards")
 
         insight_json = self.dashboard_api.get_insight(insight_id=insight_id)
-        self.assertEqual(insight_json["dashboards"], [])
+        self.assertEqual(insight_json["dashboard_tiles"], [])
 
         self.dashboard_api.soft_delete(insight_id, "insights")
 
     def test_can_soft_delete_dashboard_after_soft_deleting_insight(self) -> None:
-        filter_dict = {
-            "events": [{"id": "$pageview"}],
-            "properties": [{"key": "$browser", "value": "Mac OS X"}],
-            "insight": "TRENDS",
-        }
-
         dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard"})
-        insight_id, _ = self.dashboard_api.create_insight({"filters": filter_dict, "dashboards": [dashboard_id]})
+        insight_id, _ = self.dashboard_api.create_insight({"dashboards": [dashboard_id]})
 
         self.dashboard_api.soft_delete(insight_id, "insights")
 
@@ -1426,23 +2549,101 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
 
         insight_one_json = self.dashboard_api.get_insight(insight_id=insight_one_id)
         assert [t["dashboard_id"] for t in insight_one_json["dashboard_tiles"]] == [other_dashboard_id]
-        assert insight_one_json["dashboards"] == [other_dashboard_id]
         assert insight_one_json["deleted"] is False
         insight_two_json = self.dashboard_api.get_insight(insight_id=insight_two_id)
         assert [t["dashboard_id"] for t in insight_two_json["dashboard_tiles"]] == []
-        assert insight_two_json["dashboards"] == []
         assert insight_two_json["deleted"] is False
 
-    def test_can_move_tile_between_dashboards(self) -> None:
-        filter_dict = {
-            "events": [{"id": "$pageview"}],
-            "properties": [{"key": "$browser", "value": "Mac OS X"}],
-            "insight": "TRENDS",
-        }
-
+    def test_can_copy_tile_between_dashboards(self) -> None:
         dashboard_one_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard one"})
         dashboard_two_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard two"})
-        insight_id, _ = self.dashboard_api.create_insight({"filters": filter_dict, "dashboards": [dashboard_one_id]})
+        insight_id, _ = self.dashboard_api.create_insight({"dashboards": [dashboard_one_id]})
+
+        dashboard_one = self.dashboard_api.get_dashboard(dashboard_one_id)
+        assert len(dashboard_one["tiles"]) == 1
+        dashboard_two = self.dashboard_api.get_dashboard(dashboard_two_id)
+        assert len(dashboard_two["tiles"]) == 0
+
+        tile_id = dashboard_one["tiles"][0]["id"]
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/dashboards/{dashboard_two_id}/copy_tile",
+            {"fromDashboardId": dashboard_one_id, "tileId": tile_id},
+        )
+        assert response.status_code == status.HTTP_200_OK
+        assert len(response.json()["tiles"]) == 1
+
+        dashboard_one = self.dashboard_api.get_dashboard(dashboard_one_id)
+        assert len(dashboard_one["tiles"]) == 1
+        dashboard_two = self.dashboard_api.get_dashboard(dashboard_two_id)
+        assert len(dashboard_two["tiles"]) == 1
+        assert dashboard_two["tiles"][0]["insight"]["id"] == insight_id
+
+    def test_copy_tile_rejects_when_insight_already_on_destination(self) -> None:
+        dashboard_one_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard one"})
+        dashboard_two_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard two"})
+        _, _ = self.dashboard_api.create_insight({"dashboards": [dashboard_one_id, dashboard_two_id]})
+
+        dashboard_one = self.dashboard_api.get_dashboard(dashboard_one_id)
+        tile_id = dashboard_one["tiles"][0]["id"]
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/dashboards/{dashboard_two_id}/copy_tile",
+            {"fromDashboardId": dashboard_one_id, "tileId": tile_id},
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert "already" in json.dumps(response.json()).lower()
+
+    def test_can_copy_text_tile_between_dashboards(self) -> None:
+        dashboard_one_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard one"})
+        dashboard_two_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard two"})
+        _, dashboard_one = self.dashboard_api.create_text_tile(dashboard_one_id, text="hello")
+
+        assert len(dashboard_one["tiles"]) == 1
+        tile = dashboard_one["tiles"][0]
+        assert tile["text"]["dashboard_tiles"] == [
+            {"id": ANY, "dashboard_id": dashboard_one_id, "deleted": None},
+        ]
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/dashboards/{dashboard_two_id}/copy_tile",
+            {"fromDashboardId": dashboard_one_id, "tileId": tile["id"]},
+        )
+        assert response.status_code == status.HTTP_200_OK
+        assert len(response.json()["tiles"]) == 1
+        assert response.json()["tiles"][0]["text"]["body"] == "hello"
+
+        response2 = self.client.post(
+            f"/api/projects/{self.team.id}/dashboards/{dashboard_two_id}/copy_tile",
+            {"fromDashboardId": dashboard_one_id, "tileId": tile["id"]},
+        )
+        assert response2.status_code == status.HTTP_400_BAD_REQUEST
+        assert "already" in json.dumps(response2.json()).lower()
+
+    def test_copy_tile_restores_soft_deleted_insight_tile_on_destination(self) -> None:
+        dashboard_a_id, _ = self.dashboard_api.create_dashboard({"name": "a"})
+        dashboard_b_id, _ = self.dashboard_api.create_dashboard({"name": "b"})
+        insight_id, _ = self.dashboard_api.create_insight({"dashboards": [dashboard_a_id, dashboard_b_id]})
+
+        self.dashboard_api.update_insight(insight_id, {"dashboards": [dashboard_a_id]})
+
+        assert len(self.dashboard_api.get_dashboard(dashboard_b_id)["tiles"]) == 0
+
+        dashboard_a = self.dashboard_api.get_dashboard(dashboard_a_id)
+        tile_id = dashboard_a["tiles"][0]["id"]
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/dashboards/{dashboard_b_id}/copy_tile",
+            {"fromDashboardId": dashboard_a_id, "tileId": tile_id},
+        )
+        assert response.status_code == status.HTTP_200_OK
+        dashboard_b = self.dashboard_api.get_dashboard(dashboard_b_id)
+        assert len(dashboard_b["tiles"]) == 1
+        assert dashboard_b["tiles"][0]["insight"]["id"] == insight_id
+
+    def test_can_move_tile_between_dashboards(self) -> None:
+        dashboard_one_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard one"})
+        dashboard_two_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard two"})
+        insight_id, _ = self.dashboard_api.create_insight({"dashboards": [dashboard_one_id]})
 
         dashboard_one = self.dashboard_api.get_dashboard(dashboard_one_id)
         assert len(dashboard_one["tiles"]) == 1
@@ -1451,7 +2652,7 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
 
         patch_response = self.client.patch(
             f"/api/projects/{self.team.id}/dashboards/{dashboard_one_id}/move_tile",
-            {"tile": dashboard_one["tiles"][0], "toDashboard": dashboard_two_id},
+            {"tile": dashboard_one["tiles"][0], "to_dashboard": dashboard_two_id},
         )
         assert patch_response.status_code == status.HTTP_200_OK
         assert patch_response.json()["tiles"] == []
@@ -1460,25 +2661,75 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         assert len(dashboard_two["tiles"]) == 1
         assert dashboard_two["tiles"][0]["insight"]["id"] == insight_id
 
+    def test_move_text_tile_succeeds_when_destination_has_soft_deleted_shadow_tile(self) -> None:
+        """Soft-deleted rows still hold unique (dashboard, text_id); moving must delete them first."""
+        dashboard_a_id, _ = self.dashboard_api.create_dashboard({"name": "a"})
+        dashboard_b_id, _ = self.dashboard_api.create_dashboard({"name": "b"})
+        text = Text.objects.create(team=self.team, body="hello", created_by=self.user)
+        tile_a = DashboardTile.objects.create(
+            dashboard_id=dashboard_a_id,
+            text=text,
+            layouts={},
+        )
+        DashboardTile.objects_including_soft_deleted.create(
+            dashboard_id=dashboard_b_id,
+            text=text,
+            deleted=True,
+            layouts={},
+        )
+        patch_response = self.client.patch(
+            f"/api/projects/{self.team.id}/dashboards/{dashboard_a_id}/move_tile",
+            {"tile": {"id": tile_a.id}, "to_dashboard": dashboard_b_id},
+        )
+        assert patch_response.status_code == status.HTTP_200_OK
+        dashboard_b = self.dashboard_api.get_dashboard(dashboard_b_id)
+        assert len(dashboard_b["tiles"]) == 1
+        assert dashboard_b["tiles"][0]["text"]["id"] == text.id
+
     def test_move_tile_between_dashboards_is_project_scoped(self) -> None:
         other_org, _, other_team = Organization.objects.bootstrap(self.user, name="other org")
         other_dashboard = Dashboard.objects.create(team=other_team, name="other dashboard")
 
         dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "my dashboard"})
-        self.dashboard_api.create_insight(
-            {"filters": {"events": [{"id": "$pageview"}], "insight": "TRENDS"}, "dashboards": [dashboard_id]}
-        )
+        self.dashboard_api.create_insight({"dashboards": [dashboard_id]})
         dashboard = self.dashboard_api.get_dashboard(dashboard_id)
         tile = dashboard["tiles"][0]
 
         response = self.client.patch(
             f"/api/projects/{self.team.id}/dashboards/{dashboard_id}/move_tile",
-            {"tile": tile, "toDashboard": other_dashboard.id},
+            {"tile": tile, "to_dashboard": other_dashboard.id},
         )
         assert response.status_code == status.HTTP_404_NOT_FOUND
 
         dashboard = self.dashboard_api.get_dashboard(dashboard_id)
         assert len(dashboard["tiles"]) == 1
+
+    @parameterized.expand([("source",), ("target",)])
+    def test_move_tile_respects_access_control(self, blocked_dashboard: str) -> None:
+        self.organization.available_product_features = [
+            {"key": AvailableFeature.ACCESS_CONTROL, "name": AvailableFeature.ACCESS_CONTROL},
+            {"key": AvailableFeature.ROLE_BASED_ACCESS, "name": AvailableFeature.ROLE_BASED_ACCESS},
+        ]
+        self.organization.save()
+
+        user2 = self._create_user("test2@posthog.com", level=OrganizationMembership.Level.MEMBER)
+
+        dashboard_one_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard one"})
+        dashboard_two_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard two"})
+        self.dashboard_api.create_insight({"dashboards": [dashboard_one_id]})
+        dashboard_one = self.dashboard_api.get_dashboard(dashboard_one_id)
+        tile = dashboard_one["tiles"][0]
+
+        blocked_id = dashboard_one_id if blocked_dashboard == "source" else dashboard_two_id
+        AccessControl.objects.create(resource="dashboard", resource_id=blocked_id, team=self.team, access_level="none")
+
+        self.client.force_login(user2)
+
+        move_response = self.client.patch(
+            f"/api/projects/{self.team.id}/dashboards/{dashboard_one_id}/move_tile",
+            {"tile": tile, "to_dashboard": dashboard_two_id},
+        )
+        self.assertEqual(move_response.status_code, status.HTTP_403_FORBIDDEN)
 
     def test_update_text_tile_cannot_hijack_other_teams_tile(self) -> None:
         other_org, _, other_team = Organization.objects.bootstrap(self.user, name="other org")
@@ -1500,30 +2751,96 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         other_tile.refresh_from_db()
         assert other_tile.dashboard_id == other_dashboard.id
 
-    def test_relations_on_insights_when_dashboards_were_deleted(self) -> None:
-        filter_dict = {
-            "events": [{"id": "$pageview"}],
-            "properties": [{"key": "$browser", "value": "Mac OS X"}],
-            "insight": "TRENDS",
-        }
+    def test_cannot_inject_insight_id_into_tile_update(self) -> None:
+        other_org, _, other_team = Organization.objects.bootstrap(self.user, name="other org")
+        other_insight = Insight.objects.create(team=other_team, name="secret insight")
 
+        dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "my dashboard"})
+        insight_id, _ = self.dashboard_api.create_insight({"dashboards": [dashboard_id]})
+        dashboard_json = self.dashboard_api.get_dashboard(dashboard_id)
+        tile_id = dashboard_json["tiles"][0]["id"]
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/dashboards/{dashboard_id}",
+            {"tiles": [{"id": tile_id, "color": "blue", "insight_id": other_insight.id}]},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_200_OK
+
+        tile = DashboardTile.objects.get(id=tile_id)
+        assert tile.insight_id == insight_id
+        assert tile.color == "blue", "allowlisted field should still update"
+
+    def test_cannot_modify_text_tile_from_another_dashboard(self) -> None:
+        dashboard_a_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard A"})
+        dashboard_b_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard B"})
+
+        self.dashboard_api.create_text_tile(dashboard_b_id, text="original text on B")
+        dashboard_b_json = self.dashboard_api.get_dashboard(dashboard_b_id)
+        text_tile_on_b = dashboard_b_json["tiles"][0]["text"]
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/dashboards/{dashboard_a_id}",
+            {"tiles": [{"text": {"id": text_tile_on_b["id"], "body": "hijacked via dashboard A"}}]},
+            format="json",
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.json()["attr"] == "text"
+        assert "not found" in response.json()["detail"].lower()
+
+        text_obj = Text.objects.get(id=text_tile_on_b["id"])
+        assert text_obj.body == "original text on B"
+
+    def test_cannot_modify_button_tile_from_another_dashboard(self) -> None:
+        dashboard_a_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard A"})
+        dashboard_b_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard B"})
+
+        self.dashboard_api.create_button_tile(dashboard_b_id, url="https://example.com", text="original")
+        dashboard_b_json = self.dashboard_api.get_dashboard(dashboard_b_id)
+        button_tile_on_b = dashboard_b_json["tiles"][0]["button_tile"]
+
+        response = self.client.patch(
+            f"/api/projects/{self.team.id}/dashboards/{dashboard_a_id}",
+            {
+                "tiles": [
+                    {
+                        "button_tile": {
+                            "id": button_tile_on_b["id"],
+                            "url": "https://evil.com",
+                            "text": "hijacked",
+                            "placement": "left",
+                            "style": "primary",
+                        }
+                    }
+                ]
+            },
+            format="json",
+        )
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.json()["attr"] == "button_tile"
+        assert "not found" in response.json()["detail"].lower()
+
+        btn = ButtonTile.objects.get(id=button_tile_on_b["id"])
+        assert btn.text == "original"
+
+    def test_relations_on_insights_when_dashboards_were_deleted(self) -> None:
         dashboard_one_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard one"})
         dashboard_two_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard two"})
-        insight_id, _ = self.dashboard_api.create_insight(
-            {"filters": filter_dict, "dashboards": [dashboard_one_id, dashboard_two_id]}
-        )
+        insight_id, _ = self.dashboard_api.create_insight({"dashboards": [dashboard_one_id, dashboard_two_id]})
 
         self.dashboard_api.soft_delete(dashboard_one_id, "dashboards")
 
         insight_after_dashboard_deletion = self.dashboard_api.get_insight(insight_id)
-        assert insight_after_dashboard_deletion["dashboards"] == [dashboard_two_id]
+        assert [t["dashboard_id"] for t in insight_after_dashboard_deletion["dashboard_tiles"]] == [dashboard_two_id]
 
         dashboard_two_json = self.dashboard_api.get_dashboard(dashboard_two_id)
-        expected_dashboards_on_insight = dashboard_two_json["tiles"][0]["insight"]["dashboards"]
+        expected_dashboards_on_insight = [
+            t["dashboard_id"] for t in dashboard_two_json["tiles"][0]["insight"]["dashboard_tiles"]
+        ]
         assert expected_dashboards_on_insight == [dashboard_two_id]
 
-    @patch("posthog.api.dashboards.dashboard.report_user_action")
-    def test_create_from_template_json(self, mock_capture) -> None:
+    @patch("products.dashboards.backend.api.dashboard.report_user_action")
+    def test_create_from_template_json(self, mock_report_user_action) -> None:
         response = self.client.post(
             f"/api/projects/{self.team.id}/dashboards/create_from_template_json",
             {"template": valid_template, "creation_context": "onboarding"},
@@ -1543,14 +2860,13 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
 
         self.assertEqual(len(dashboard["tiles"]), 1)
 
-        mock_capture.assert_called_once_with(
+        mock_report_user_action.assert_called_once_with(
             self.user,
             "dashboard created",
             {
-                "$current_url": "https://posthog.com/my-referer",
-                "$session_id": "my-session-id",
                 "created_at": mock.ANY,
                 "creation_context": "onboarding",
+                "creation_mode": "default",
                 "dashboard_id": dashboard["id"],
                 "duplicated": False,
                 "from_template": True,
@@ -1560,8 +2876,54 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
                 "pinned": False,
                 "tags_count": 0,
                 "template_key": valid_template["template_name"],
+                "template_scope": None,
             },
+            team=ANY,
+            request=ANY,
         )
+
+    @parameterized.expand(
+        [
+            (None, None),
+            ("team", "team"),
+            ("global", "global"),
+            ("feature_flag", "feature_flag"),
+        ]
+    )
+    @patch("products.dashboards.backend.api.dashboard.report_user_action")
+    def test_create_from_template_json_analytics_template_scope(
+        self, scope_in_body: str | None, expected_template_scope: str | None, mock_report_user_action: MagicMock
+    ) -> None:
+        template = valid_template if scope_in_body is None else {**valid_template, "scope": scope_in_body}
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/dashboards/create_from_template_json",
+            {"template": template},
+        )
+        assert response.status_code == 200, response.content
+        props = mock_report_user_action.call_args[0][2]
+        assert props["template_scope"] == expected_template_scope
+
+    def test_create_from_template_json_accepts_api_shaped_created_by_nested_object(self) -> None:
+        """Regression: frontend may POST the template list payload including read-only nested created_by."""
+        template = {
+            **valid_template,
+            "created_by": {
+                "id": self.user.id,
+                "uuid": str(self.user.uuid),
+                "distinct_id": self.user.distinct_id,
+                "first_name": "ad",
+                "last_name": "",
+                "email": "test1@posthog.com",
+                "is_email_verified": True,
+                "hedgehog_config": None,
+                "role_at_organization": "engineering",
+            },
+        }
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/dashboards/create_from_template_json",
+            {"template": template},
+        )
+        assert response.status_code == 200, response.content
 
     def test_create_from_template_json_must_provide_at_least_one_tile(self) -> None:
         template: dict = {**valid_template, "tiles": []}
@@ -1584,8 +2946,10 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         )
         assert response.status_code == 200
 
+        dashboard_id = response.json()["id"]
         assert response.json()["tiles"] == [
             {
+                "button_tile": None,
                 "color": None,
                 "filters_overrides": {},
                 "id": ANY,
@@ -1594,16 +2958,45 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
                 "last_refresh": None,
                 "layouts": {},
                 "order": 0,
+                "show_description": None,
+                "widget": None,
                 "text": {
                     "body": "hello world",
                     "created_by": None,
+                    "dashboard_tiles": [
+                        {"dashboard_id": dashboard_id, "deleted": None, "id": ANY},
+                    ],
                     "id": ANY,
                     "last_modified_at": ANY,
                     "last_modified_by": None,
                     "team": self.team.pk,
                 },
+                "transparent_background": None,
             },
         ]
+
+    @parameterized.expand(
+        [
+            ("inline_fields", {"type": "BUTTON", "url": "/replay/home", "text": "Watch replays", "layouts": {}}),
+            (
+                "nested_button_tile",
+                {"type": "BUTTON", "button_tile": {"url": "/replay/home", "text": "Watch replays"}, "layouts": {}},
+            ),
+        ]
+    )
+    def test_create_from_template_json_can_provide_button_tile(self, _name: str, button_tile: dict) -> None:
+        template: dict = {**valid_template, "tiles": [button_tile]}
+
+        response = self.client.post(
+            f"/api/projects/{self.team.id}/dashboards/create_from_template_json",
+            {"template": template},
+        )
+        assert response.status_code == 200, response.json()
+
+        tiles = response.json()["tiles"]
+        assert len(tiles) == 1
+        assert tiles[0]["button_tile"]["url"] == "/replay/home"
+        assert tiles[0]["button_tile"]["text"] == "Watch replays"
 
     def test_create_from_template_json_can_provide_query_tile(self) -> None:
         template: dict = {
@@ -1660,13 +3053,13 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
                             "id": ANY,
                         }
                     ],
-                    "dashboards": [response.json()["id"]],
                     "deleted": False,
                     "derived_name": None,
                     "description": None,
                     "effective_privilege_level": 37,
                     "effective_restriction_level": 21,
                     "favorited": False,
+                    "filter_override_context": None,
                     "filters": {},
                     "filters_hash": ANY,
                     "hasMore": None,
@@ -1693,7 +3086,7 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
                     "resolved_date_range": ANY,
                     "query_status": None,
                     "result": None,
-                    "saved": False,
+                    "saved": True,
                     "short_id": ANY,
                     "tags": [],
                     "timezone": None,
@@ -1702,11 +3095,15 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
                     "hogql": ANY,
                     "types": ANY,
                 },
+                "button_tile": None,
                 "is_cached": False,
                 "last_refresh": None,
                 "layouts": {},
                 "order": 0,
+                "show_description": None,
                 "text": None,
+                "transparent_background": None,
+                "widget": None,
             },
         ]
 
@@ -2205,6 +3602,298 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         self.assertEqual(regular_response["persisted_variables"], dashboard_variables)
         self.assertEqual(sse_dashboard["persisted_variables"], dashboard_variables)
 
+    def test_tile_insights_carry_alerts_on_regular_and_sse_endpoints(self):
+        # Alert threshold lines on dashboards render from the tile insight's inline alerts, and
+        # InsightSerializer.get_alerts silently serializes [] when the loading path forgot the
+        # alerts prefetch — so both dashboard-loading endpoints must emit them.
+        dashboard_id, _ = self.dashboard_api.create_dashboard({"name": "dashboard"})
+        insight_id, _ = self.dashboard_api.create_insight(
+            {
+                "dashboards": [dashboard_id],
+                "query": {
+                    "kind": "DataVisualizationNode",
+                    "source": {"kind": "HogQLQuery", "query": "select count() from events"},
+                },
+            }
+        )
+        threshold = Threshold.objects.create(
+            team=self.team,
+            insight_id=insight_id,
+            created_by=self.user,
+            configuration={"type": "absolute", "bounds": {"upper": 1}},
+        )
+        alert = AlertConfiguration.objects.create(
+            team=self.team,
+            insight_id=insight_id,
+            created_by=self.user,
+            name="tile alert",
+            threshold=threshold,
+            condition={"type": "absolute_value"},
+            config={"type": "HogQLAlertConfig", "evaluation": "last_row"},
+        )
+
+        regular_response = self.dashboard_api.get_dashboard(dashboard_id)
+        assert [a["id"] for a in regular_response["tiles"][0]["insight"]["alerts"]] == [str(alert.id)]
+
+        sse_response = self.client.get(f"/api/projects/{self.team.id}/dashboards/{dashboard_id}/stream_tiles/")
+        assert sse_response.status_code == status.HTTP_200_OK
+        sse_content = b"".join(sse_response.streaming_content).decode("utf-8")  # type: ignore
+        metadata_line = next(
+            (
+                line[len("data: ") :]
+                for line in sse_content.split("\n")
+                if line.startswith("data: ") and '"type":"metadata"' in line
+            ),
+            None,
+        )
+        assert metadata_line is not None, f"Could not find metadata in SSE response. Content: {repr(sse_content)}"
+        streamed_tiles = json.loads(metadata_line)["dashboard"]["tiles"]
+        assert [a["id"] for a in streamed_tiles[0]["insight"]["alerts"]] == [str(alert.id)]
+
+    @patch("posthog.caching.calculate_results.calculate_for_query_based_insight")
+    def test_dashboard_refresh_serializes_broken_query_tile_in_place(self, mock_calculate: MagicMock) -> None:
+        mock_calculate.side_effect = ExposedHogQLError("Invalid HogQL syntax")
+        dashboard = Dashboard.objects.create(team=self.team, name="dashboard with broken tile", created_by=self.user)
+        insight = Insight.objects.create(
+            team=self.team,
+            query={"kind": "DataTableNode", "source": {"kind": "EventsQuery", "select": ["*"]}},
+        )
+        DashboardTile.objects.create(dashboard=dashboard, insight=insight)
+
+        response = self.client.get(f"/api/environments/{self.team.id}/dashboards/{dashboard.id}/?refresh=blocking")
+
+        # The failure must ride on the tile insight's query_status, not trip get_tiles' generic
+        # DashboardTileError fallback, and must not fail the whole response.
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        tile = response.json()["tiles"][0]
+        self.assertIsNone(tile.get("error"))
+        query_status = tile["insight"]["query_status"]
+        self.assertTrue(query_status["error"])
+        self.assertIn("Invalid HogQL syntax", query_status["error_message"])
+        self.assertEqual(query_status["error_code"], "hogql_error")
+
+    def test_streamed_tile_error_preserves_insight_metadata_without_exception_detail(self):
+        dashboard = Dashboard.objects.create(
+            team=self.team,
+            name="Test Dashboard",
+            created_by=self.user,
+            filters={},
+        )
+        insight = Insight.objects.create(
+            team=self.team,
+            name="Browser usage",
+            filters={},
+            query={
+                "kind": "InsightVizNode",
+                "source": {
+                    "kind": "TrendsQuery",
+                    "series": [{"kind": "EventsNode", "event": "$pageview"}],
+                },
+            },
+        )
+        tile = DashboardTile.objects.create(
+            dashboard=dashboard,
+            insight=insight,
+        )
+
+        request = MagicMock()
+        request.user = self.user
+        request.query_params = {}
+        request.data = {}
+        context = {
+            "request": request,
+            "team_id": self.team.id,
+            "get_team": lambda: self.team,
+            "insight_variables": [],
+            "dashboard": dashboard,
+            "raw_results_supported": True,
+            "user_access_control": UserAccessControl(self.user, team=self.team),
+        }
+        with patch.object(InsightSerializer, "get_result", side_effect=RuntimeError("select secret_customer_property")):
+            order, streamed_tile = serialize_tile_with_context(tile, 0, context)
+
+        self.assertEqual(order, 0)
+
+        self.assertEqual(streamed_tile["id"], tile.id)
+        self.assertEqual(streamed_tile["insight"]["id"], insight.id)
+        self.assertEqual(streamed_tile["insight"]["name"], "Browser usage")
+        self.assertEqual(streamed_tile["insight"]["query"], insight.query)
+        self.assertEqual(
+            streamed_tile["error"],
+            {
+                "type": "DashboardTileError",
+                "message": "There is a problem loading this dashboard tile.",
+            },
+        )
+        self.assertNotIn("secret_customer_property", json.dumps(streamed_tile))
+
+    def test_streamed_tile_error_redacts_insight_metadata_for_restricted_user(self):
+        self.organization.available_product_features = [
+            {"key": AvailableFeature.ACCESS_CONTROL, "name": AvailableFeature.ACCESS_CONTROL},
+        ]
+        self.organization.save()
+
+        restricted_user = self._create_user("restricted@posthog.com", level=OrganizationMembership.Level.MEMBER)
+
+        dashboard = Dashboard.objects.create(
+            team=self.team,
+            name="Test Dashboard",
+            created_by=self.user,
+            filters={},
+        )
+        insight = Insight.objects.create(
+            team=self.team,
+            name="Confidential usage",
+            filters={},
+            query={
+                "kind": "InsightVizNode",
+                "source": {
+                    "kind": "TrendsQuery",
+                    "series": [{"kind": "EventsNode", "event": "$pageview"}],
+                },
+            },
+        )
+        tile = DashboardTile.objects.create(
+            dashboard=dashboard,
+            insight=insight,
+        )
+        AccessControl.objects.create(resource="insight", resource_id=insight.id, team=self.team, access_level="none")
+
+        request = MagicMock()
+        request.user = restricted_user
+        request.query_params = {}
+        request.data = {}
+        context = {
+            "request": request,
+            "team_id": self.team.id,
+            "get_team": lambda: self.team,
+            "insight_variables": [],
+            "dashboard": dashboard,
+            "raw_results_supported": True,
+            "user_access_control": UserAccessControl(restricted_user, team=self.team),
+        }
+        with patch.object(InsightSerializer, "get_result", side_effect=RuntimeError("boom")):
+            order, streamed_tile = serialize_tile_with_context(tile, 0, context)
+
+        self.assertEqual(order, 0)
+        self.assertEqual(streamed_tile["error"]["type"], "DashboardTileError")
+
+        insight_payload = streamed_tile["insight"]
+        self.assertEqual(insight_payload["id"], insight.id)
+        self.assertEqual(insight_payload["short_id"], insight.short_id)
+        self.assertEqual(insight_payload["user_access_level"], "none")
+
+        self.assertNotIn("name", insight_payload)
+        self.assertNotIn("query", insight_payload)
+        self.assertNotIn("filters", insight_payload)
+
+    def test_non_streamed_dashboard_degrades_to_error_tile_on_insight_failure(self):
+        dashboard = Dashboard.objects.create(
+            team=self.team,
+            name="Test Dashboard",
+            created_by=self.user,
+            filters={},
+        )
+        insight = Insight.objects.create(
+            team=self.team,
+            name="Browser usage",
+            filters={},
+            query={
+                "kind": "InsightVizNode",
+                "source": {
+                    "kind": "TrendsQuery",
+                    "series": [{"kind": "EventsNode", "event": "$pageview"}],
+                },
+            },
+        )
+        DashboardTile.objects.create(dashboard=dashboard, insight=insight)
+
+        request = MagicMock()
+        request.user = self.user
+        request.query_params = {}
+        request.data = {}
+        user_permissions = UserPermissions(self.user, team=self.team)
+        mock_view = MagicMock()
+        mock_view.action = "retrieve"
+        mock_view.user_permissions = user_permissions
+        context = {
+            "request": request,
+            "view": mock_view,
+            "team_id": self.team.id,
+            "get_team": lambda: self.team,
+            "insight_variables": [],
+            "dashboard": dashboard,
+            "raw_results_supported": True,
+            "user_access_control": UserAccessControl(self.user, team=self.team),
+            "user_permissions": user_permissions,
+        }
+        with patch.object(InsightSerializer, "get_result", side_effect=RuntimeError("boom")):
+            dashboard_data = DashboardSerializer(dashboard, context=context).data
+
+        tiles = dashboard_data["tiles"]
+        self.assertEqual(len(tiles), 1)
+        failed_tile = tiles[0]
+        self.assertEqual(failed_tile["insight"]["id"], insight.id)
+        self.assertEqual(failed_tile["insight"]["name"], "Browser usage")
+        self.assertEqual(
+            failed_tile["error"],
+            {"type": "DashboardTileError", "message": "There is a problem loading this dashboard tile."},
+        )
+        self.assertNotIn("boom", json.dumps(dashboard_data))
+
+    def test_streamed_tile_error_falls_back_to_minimal_tile_when_fallback_serializer_fails(self):
+        dashboard = Dashboard.objects.create(
+            team=self.team,
+            name="Test Dashboard",
+            created_by=self.user,
+            filters={},
+        )
+        insight = Insight.objects.create(
+            team=self.team,
+            name="Confidential usage",
+            filters={},
+            query={
+                "kind": "InsightVizNode",
+                "source": {
+                    "kind": "TrendsQuery",
+                    "series": [{"kind": "EventsNode", "event": "$pageview"}],
+                },
+            },
+        )
+        tile = DashboardTile.objects.create(dashboard=dashboard, insight=insight)
+
+        request = MagicMock()
+        request.user = self.user
+        request.query_params = {}
+        request.data = {}
+        context = {
+            "request": request,
+            "team_id": self.team.id,
+            "get_team": lambda: self.team,
+            "insight_variables": [],
+            "dashboard": dashboard,
+            "raw_results_supported": True,
+            "user_access_control": UserAccessControl(self.user, team=self.team),
+        }
+        with (
+            patch.object(InsightSerializer, "get_result", side_effect=RuntimeError("primary boom")),
+            patch.object(
+                DashboardTileErrorSerializer,
+                "to_representation",
+                side_effect=RuntimeError("fallback boom"),
+            ),
+        ):
+            order, streamed_tile = serialize_tile_with_context(tile, 0, context)
+
+        self.assertEqual(order, 0)
+        self.assertEqual(streamed_tile["id"], tile.id)
+        self.assertEqual(
+            streamed_tile["error"],
+            {"type": "DashboardTileError", "message": "There is a problem loading this dashboard tile."},
+        )
+        self.assertNotIn("insight", streamed_tile)
+        self.assertNotIn("Confidential usage", json.dumps(streamed_tile))
+
     def test_create_unlisted_dashboard_creates_tags(self):
         """Test that unlisted dashboards get tags"""
         response = self.client.post(
@@ -2218,11 +3907,19 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
 
         # Verify dashboard was created with unlisted mode
         self.assertEqual(dashboard.creation_mode, "unlisted")
-        self.assertEqual(dashboard.name, "LLM Analytics Default")
+        self.assertEqual(dashboard.name, "AI observability default")
 
         # Verify tags were created
         tags = list(dashboard.tagged_items.values_list("tag__name", flat=True))
         self.assertEqual(tags, ["llm-analytics"])
+
+        insights = Insight.objects.filter(dashboard_tiles__dashboard=dashboard)
+        self.assertGreater(insights.count(), 0)
+        for insight in insights:
+            self.assertEqual(
+                list(insight.tagged_items.values_list("tag__name", flat=True)),
+                ["ai-observability"],
+            )
 
     def test_create_unlisted_dashboard_enforces_uniqueness(self):
         """Test that creating duplicate unlisted dashboards returns 409"""
@@ -2277,3 +3974,500 @@ class TestDashboard(APIBaseTest, QueryMatchingTest):
         self.assertNotIn(unlisted.id, ids)
         self.assertIn(normal.id, ids)
         self.assertNotIn(template.id, ids)
+
+    def test_reorder_tiles(self):
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard")
+        insight1 = Insight.objects.create(team=self.team, name="Insight 1")
+        insight2 = Insight.objects.create(team=self.team, name="Insight 2")
+        tile1 = DashboardTile.objects.create(dashboard=dashboard, insight=insight1)
+        tile2 = DashboardTile.objects.create(dashboard=dashboard, insight=insight2)
+
+        response = self.client.post(
+            f"/api/environments/{self.team.pk}/dashboards/{dashboard.pk}/reorder_tiles/",
+            {"tile_order": [tile2.pk, tile1.pk]},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual(response.json()["id"], dashboard.pk)
+
+        tile1.refresh_from_db()
+        tile2.refresh_from_db()
+        # tiles with no existing layout fall back to the default 6-wide × 5-tall:
+        # tile2 lands at (0,0), tile1 packs to its right at (6,0)
+        self.assertEqual(tile2.layouts["sm"], {"x": 0, "y": 0, "w": 6, "h": 5})
+        self.assertEqual(tile1.layouts["sm"], {"x": 6, "y": 0, "w": 6, "h": 5})
+        # xs is the 1-column mobile grid; w must always be 1
+        self.assertEqual(tile1.layouts["xs"]["w"], 1)
+        self.assertEqual(tile2.layouts["xs"]["w"], 1)
+
+    def test_reorder_tiles_invalid_tile_ids(self):
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard")
+
+        response = self.client.post(
+            f"/api/environments/{self.team.pk}/dashboards/{dashboard.pk}/reorder_tiles/",
+            {"tile_order": [999999]},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_reorder_tiles_on_deleted_dashboard_returns_404(self):
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard", deleted=True)
+        insight = Insight.objects.create(team=self.team, name="Insight 1")
+        tile = DashboardTile.objects.create(dashboard=dashboard, insight=insight)
+
+        response = self.client.post(
+            f"/api/environments/{self.team.pk}/dashboards/{dashboard.pk}/reorder_tiles/",
+            {"tile_order": [tile.pk]},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_reorder_tiles_duplicate_tile_ids_returns_400(self):
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard")
+        insight = Insight.objects.create(team=self.team, name="Insight 1")
+        tile = DashboardTile.objects.create(dashboard=dashboard, insight=insight)
+
+        response = self.client.post(
+            f"/api/environments/{self.team.pk}/dashboards/{dashboard.pk}/reorder_tiles/",
+            {"tile_order": [tile.pk, tile.pk]},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertEqual(response.json()["detail"], "tile_order must contain unique tile IDs")
+
+    def test_reorder_tiles_empty_tile_order_returns_400(self):
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard")
+
+        response = self.client.post(
+            f"/api/environments/{self.team.pk}/dashboards/{dashboard.pk}/reorder_tiles/",
+            {"tile_order": []},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_reorder_tiles_with_text_tiles(self):
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard")
+        text1 = Text.objects.create(body="Text tile 1", team=self.team)
+        text2 = Text.objects.create(body="Text tile 2", team=self.team)
+        tile1 = DashboardTile.objects.create(dashboard=dashboard, text=text1)
+        tile2 = DashboardTile.objects.create(dashboard=dashboard, text=text2)
+
+        response = self.client.post(
+            f"/api/environments/{self.team.pk}/dashboards/{dashboard.pk}/reorder_tiles/",
+            {"tile_order": [tile2.pk, tile1.pk]},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        tile1.refresh_from_db()
+        tile2.refresh_from_db()
+        self.assertEqual(tile2.layouts["sm"], {"x": 0, "y": 0, "w": 6, "h": 5})
+        self.assertEqual(tile1.layouts["sm"], {"x": 6, "y": 0, "w": 6, "h": 5})
+        self.assertEqual(tile1.layouts["xs"]["w"], 1)
+        self.assertEqual(tile2.layouts["xs"]["w"], 1)
+
+    def test_reorder_tiles_with_mixed_tile_types(self):
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard")
+        insight = Insight.objects.create(team=self.team, name="Insight 1")
+        text = Text.objects.create(body="Text tile", team=self.team)
+        insight_tile = DashboardTile.objects.create(dashboard=dashboard, insight=insight)
+        text_tile = DashboardTile.objects.create(dashboard=dashboard, text=text)
+
+        # Reorder: text first, insight second
+        response = self.client.post(
+            f"/api/environments/{self.team.pk}/dashboards/{dashboard.pk}/reorder_tiles/",
+            {"tile_order": [text_tile.pk, insight_tile.pk]},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        text_tile.refresh_from_db()
+        insight_tile.refresh_from_db()
+        self.assertEqual(text_tile.layouts["sm"], {"x": 0, "y": 0, "w": 6, "h": 5})
+        self.assertEqual(insight_tile.layouts["sm"], {"x": 6, "y": 0, "w": 6, "h": 5})
+        self.assertEqual(text_tile.layouts["xs"]["w"], 1)
+        self.assertEqual(insight_tile.layouts["xs"]["w"], 1)
+
+    def test_reorder_tiles_preserves_existing_widths_by_default(self):
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard")
+        insight1 = Insight.objects.create(team=self.team, name="Insight 1")
+        insight2 = Insight.objects.create(team=self.team, name="Insight 2")
+        # Both tiles have been manually resized to full row width and a custom height
+        tile1 = DashboardTile.objects.create(
+            dashboard=dashboard,
+            insight=insight1,
+            layouts={"sm": {"x": 0, "y": 0, "w": 12, "h": 8}, "xs": {"x": 0, "y": 0, "w": 1, "h": 8}},
+        )
+        tile2 = DashboardTile.objects.create(
+            dashboard=dashboard,
+            insight=insight2,
+            layouts={"sm": {"x": 0, "y": 8, "w": 12, "h": 8}, "xs": {"x": 0, "y": 8, "w": 1, "h": 8}},
+        )
+
+        response = self.client.post(
+            f"/api/environments/{self.team.pk}/dashboards/{dashboard.pk}/reorder_tiles/",
+            {"tile_order": [tile2.pk, tile1.pk]},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        tile1.refresh_from_db()
+        tile2.refresh_from_db()
+        # Widths and heights are preserved; positions are repacked in the new order
+        self.assertEqual(tile2.layouts["sm"], {"x": 0, "y": 0, "w": 12, "h": 8})
+        self.assertEqual(tile1.layouts["sm"], {"x": 0, "y": 8, "w": 12, "h": 8})
+        # xs is the 1-column mobile grid; w must always be 1 regardless of sm width
+        self.assertEqual(tile1.layouts["xs"]["w"], 1)
+        self.assertEqual(tile2.layouts["xs"]["w"], 1)
+
+    def test_reorder_tiles_preserve_packs_mixed_widths(self):
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard")
+        insight1 = Insight.objects.create(team=self.team, name="Insight 1")
+        insight2 = Insight.objects.create(team=self.team, name="Insight 2")
+        insight3 = Insight.objects.create(team=self.team, name="Insight 3")
+        tile1 = DashboardTile.objects.create(
+            dashboard=dashboard,
+            insight=insight1,
+            layouts={"sm": {"x": 0, "y": 0, "w": 4, "h": 5}},
+        )
+        tile2 = DashboardTile.objects.create(
+            dashboard=dashboard,
+            insight=insight2,
+            layouts={"sm": {"x": 0, "y": 0, "w": 8, "h": 5}},
+        )
+        tile3 = DashboardTile.objects.create(
+            dashboard=dashboard,
+            insight=insight3,
+            layouts={"sm": {"x": 0, "y": 0, "w": 12, "h": 5}},
+        )
+
+        response = self.client.post(
+            f"/api/environments/{self.team.pk}/dashboards/{dashboard.pk}/reorder_tiles/",
+            {"tile_order": [tile1.pk, tile2.pk, tile3.pk]},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        tile1.refresh_from_db()
+        tile2.refresh_from_db()
+        tile3.refresh_from_db()
+        # tile1 (w=4) at (0,0); tile2 (w=8) packs to its right at (4,0); tile3 (w=12) wraps to next row.
+        self.assertEqual((tile1.layouts["sm"]["x"], tile1.layouts["sm"]["y"], tile1.layouts["sm"]["w"]), (0, 0, 4))
+        self.assertEqual((tile2.layouts["sm"]["x"], tile2.layouts["sm"]["y"], tile2.layouts["sm"]["w"]), (4, 0, 8))
+        self.assertEqual((tile3.layouts["sm"]["x"], tile3.layouts["sm"]["y"], tile3.layouts["sm"]["w"]), (0, 5, 12))
+        # xs is the single-column mobile stack: tiles stack top-to-bottom in list order,
+        # accumulating each tile's height independently of the sm packing.
+        self.assertEqual(tile1.layouts["xs"], {"x": 0, "y": 0, "w": 1, "h": 5})
+        self.assertEqual(tile2.layouts["xs"], {"x": 0, "y": 5, "w": 1, "h": 5})
+        self.assertEqual(tile3.layouts["xs"], {"x": 0, "y": 10, "w": 1, "h": 5})
+
+    def test_reorder_tiles_preserve_packs_into_lowest_segment_with_uneven_heights(self):
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard")
+        insight1 = Insight.objects.create(team=self.team, name="Insight 1")
+        insight2 = Insight.objects.create(team=self.team, name="Insight 2")
+        insight3 = Insight.objects.create(team=self.team, name="Insight 3")
+        # Two half-width tiles of different heights, then a third half-width tile.
+        tile1 = DashboardTile.objects.create(
+            dashboard=dashboard, insight=insight1, layouts={"sm": {"x": 0, "y": 0, "w": 6, "h": 3}}
+        )
+        tile2 = DashboardTile.objects.create(
+            dashboard=dashboard, insight=insight2, layouts={"sm": {"x": 0, "y": 0, "w": 6, "h": 5}}
+        )
+        tile3 = DashboardTile.objects.create(
+            dashboard=dashboard, insight=insight3, layouts={"sm": {"x": 0, "y": 0, "w": 6, "h": 2}}
+        )
+
+        response = self.client.post(
+            f"/api/environments/{self.team.pk}/dashboards/{dashboard.pk}/reorder_tiles/",
+            {"tile_order": [tile1.pk, tile2.pk, tile3.pk]},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        tile1.refresh_from_db()
+        tile2.refresh_from_db()
+        tile3.refresh_from_db()
+        # tile1 (h=3) at (0,0); tile2 packs right at (6,0). Left column is now lower (3) than the
+        # right (5), so tile3 must slot into the lower-left segment at (0,3) rather than below tile2.
+        self.assertEqual(tile1.layouts["sm"], {"x": 0, "y": 0, "w": 6, "h": 3})
+        self.assertEqual(tile2.layouts["sm"], {"x": 6, "y": 0, "w": 6, "h": 5})
+        self.assertEqual(tile3.layouts["sm"], {"x": 0, "y": 3, "w": 6, "h": 2})
+        # xs stacks in list order accumulating each tile's own height (0, 3, then 3+5=8),
+        # independent of the lowest-segment sm packing that placed tile3 at sm y=3.
+        self.assertEqual(tile1.layouts["xs"], {"x": 0, "y": 0, "w": 1, "h": 3})
+        self.assertEqual(tile2.layouts["xs"], {"x": 0, "y": 3, "w": 1, "h": 5})
+        self.assertEqual(tile3.layouts["xs"], {"x": 0, "y": 8, "w": 1, "h": 2})
+
+    @parameterized.expand(
+        [
+            (
+                "two_column",
+                {"x": 0, "y": 0, "w": 6, "h": 5},
+                {"x": 6, "y": 0, "w": 6, "h": 5},
+            ),
+            (
+                "full_width",
+                {"x": 0, "y": 0, "w": 12, "h": 5},
+                {"x": 0, "y": 5, "w": 12, "h": 5},
+            ),
+        ]
+    )
+    def test_reorder_tiles_layout_mode_overrides_existing_widths(
+        self, layout_mode: str, expected_first: dict, expected_second: dict
+    ):
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard")
+        insight1 = Insight.objects.create(team=self.team, name="Insight 1")
+        insight2 = Insight.objects.create(team=self.team, name="Insight 2")
+        tile1 = DashboardTile.objects.create(
+            dashboard=dashboard,
+            insight=insight1,
+            layouts={"sm": {"x": 0, "y": 0, "w": 4, "h": 8}},
+        )
+        tile2 = DashboardTile.objects.create(
+            dashboard=dashboard,
+            insight=insight2,
+            layouts={"sm": {"x": 4, "y": 0, "w": 4, "h": 8}},
+        )
+
+        response = self.client.post(
+            f"/api/environments/{self.team.pk}/dashboards/{dashboard.pk}/reorder_tiles/",
+            {"tile_order": [tile1.pk, tile2.pk], "layout": layout_mode},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        tile1.refresh_from_db()
+        tile2.refresh_from_db()
+        self.assertEqual(tile1.layouts["sm"], expected_first)
+        self.assertEqual(tile2.layouts["sm"], expected_second)
+        self.assertEqual(tile1.layouts["xs"]["w"], 1)
+        self.assertEqual(tile2.layouts["xs"]["w"], 1)
+
+    def test_reorder_tiles_invalid_layout_returns_400(self):
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard")
+        insight = Insight.objects.create(team=self.team, name="Insight 1")
+        tile = DashboardTile.objects.create(dashboard=dashboard, insight=insight)
+
+        response = self.client.post(
+            f"/api/environments/{self.team.pk}/dashboards/{dashboard.pk}/reorder_tiles/",
+            {"tile_order": [tile.pk], "layout": "stacked"},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    @parameterized.expand(
+        [
+            ("text", "text", "## Section heading\n\nIntro markdown."),
+            ("image", "image", "![Dashboard image](https://example.com/image.png)"),
+        ]
+    )
+    def test_create_text_tile_accepts_tile_types(self, _name: str, tile_type: str, tile_body: str) -> None:
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard")
+
+        response = self.client.post(
+            f"/api/environments/{self.team.pk}/dashboards/{dashboard.pk}/create_text_tile/",
+            {
+                "type": tile_type,
+                "body": tile_body,
+                "layouts": {"sm": {"x": 0, "y": 0, "w": 12, "h": 1}},
+            },
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        body = response.json()
+        self.assertIsNotNone(body["id"])
+        self.assertIsNone(body["insight"])
+        self.assertEqual(body["text"]["body"], tile_body)
+        self.assertEqual(body["layouts"]["sm"], {"x": 0, "y": 0, "w": 12, "h": 1})
+
+        dashboard_response = self.client.get(f"/api/environments/{self.team.pk}/dashboards/{dashboard.pk}/")
+        self.assertEqual(dashboard_response.status_code, status.HTTP_200_OK)
+        tiles = dashboard_response.json()["tiles"]
+        self.assertEqual(len(tiles), 1)
+        self.assertEqual(tiles[0]["text"]["body"], tile_body)
+
+    def test_create_text_tile_without_layouts_uses_default(self):
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard")
+
+        response = self.client.post(
+            f"/api/environments/{self.team.pk}/dashboards/{dashboard.pk}/create_text_tile/",
+            {"body": "Just a divider"},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+        self.assertEqual(response.json()["text"]["body"], "Just a divider")
+
+    @parameterized.expand(
+        [
+            ("empty", ""),
+            ("over_max_length", "x" * 4001),
+        ]
+    )
+    def test_create_text_tile_rejects_invalid_body(self, _name, body):
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard")
+
+        response = self.client.post(
+            f"/api/environments/{self.team.pk}/dashboards/{dashboard.pk}/create_text_tile/",
+            {"body": body},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_create_text_tile_on_deleted_dashboard_returns_404(self):
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard", deleted=True)
+
+        response = self.client.post(
+            f"/api/environments/{self.team.pk}/dashboards/{dashboard.pk}/create_text_tile/",
+            {"body": "Some text"},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_update_text_tile_updates_body_and_layout(self):
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard")
+        text = Text.objects.create(body="original", team=self.team, created_by=self.user)
+        tile = DashboardTile.objects.create(
+            dashboard=dashboard,
+            text=text,
+            layouts={"sm": {"x": 0, "y": 0, "w": 6, "h": 1}},
+        )
+
+        response = self.client.post(
+            f"/api/environments/{self.team.pk}/dashboards/{dashboard.pk}/update_text_tile/",
+            {
+                "tile_id": tile.pk,
+                "body": "## Updated heading",
+                "layouts": {"sm": {"x": 0, "y": 5, "w": 12, "h": 2}},
+            },
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        body = response.json()
+        self.assertEqual(body["text"]["body"], "## Updated heading")
+        self.assertEqual(body["layouts"]["sm"], {"x": 0, "y": 5, "w": 12, "h": 2})
+
+        text.refresh_from_db()
+        tile.refresh_from_db()
+        self.assertEqual(text.body, "## Updated heading")
+        self.assertEqual(text.last_modified_by, self.user)
+        self.assertEqual(tile.layouts["sm"], {"x": 0, "y": 5, "w": 12, "h": 2})
+
+    def test_update_text_tile_leaves_omitted_fields_unchanged(self):
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard")
+        text = Text.objects.create(body="original", team=self.team)
+        tile = DashboardTile.objects.create(
+            dashboard=dashboard,
+            text=text,
+            layouts={"sm": {"x": 1, "y": 2, "w": 6, "h": 1}},
+        )
+
+        response = self.client.post(
+            f"/api/environments/{self.team.pk}/dashboards/{dashboard.pk}/update_text_tile/",
+            {"tile_id": tile.pk, "body": "new body"},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+        tile.refresh_from_db()
+        self.assertEqual(tile.layouts["sm"], {"x": 1, "y": 2, "w": 6, "h": 1})
+        text.refresh_from_db()
+        self.assertEqual(text.body, "new body")
+
+    @parameterized.expand(
+        [
+            ("null", None),
+            ("empty", ""),
+        ]
+    )
+    def test_update_text_tile_rejects_empty_or_null_body(self, _name, body):
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard")
+        text = Text.objects.create(body="original", team=self.team)
+        tile = DashboardTile.objects.create(dashboard=dashboard, text=text)
+
+        response = self.client.post(
+            f"/api/environments/{self.team.pk}/dashboards/{dashboard.pk}/update_text_tile/",
+            {"tile_id": tile.pk, "body": body},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+        text.refresh_from_db()
+        self.assertEqual(text.body, "original")
+
+    def test_update_text_tile_rejects_insight_tile(self):
+        dashboard = Dashboard.objects.create(team=self.team, name="Test Dashboard")
+        insight = Insight.objects.create(team=self.team, name="Insight 1")
+        tile = DashboardTile.objects.create(dashboard=dashboard, insight=insight)
+
+        response = self.client.post(
+            f"/api/environments/{self.team.pk}/dashboards/{dashboard.pk}/update_text_tile/",
+            {"tile_id": tile.pk, "body": "should fail"},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def _make_unknown_tile_id_args(self):
+        dashboard_a = Dashboard.objects.create(team=self.team, name="A")
+        dashboard_b = Dashboard.objects.create(team=self.team, name="B")
+        text = Text.objects.create(body="A's tile", team=self.team)
+        tile_on_a = DashboardTile.objects.create(dashboard=dashboard_a, text=text)
+        return [
+            ("unknown_tile_id", dashboard_a.pk, 9999999),
+            ("tile_on_other_dashboard", dashboard_b.pk, tile_on_a.pk),
+        ]
+
+    def test_update_text_tile_returns_404_for_unknown_tile(self):
+        for name, dashboard_pk, tile_id in self._make_unknown_tile_id_args():
+            with self.subTest(name):
+                response = self.client.post(
+                    f"/api/environments/{self.team.pk}/dashboards/{dashboard_pk}/update_text_tile/",
+                    {"tile_id": tile_id, "body": "should fail"},
+                    content_type="application/json",
+                )
+                self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_add_insight_to_multiple_dashboards_via_patch(self):
+        dashboard1 = Dashboard.objects.create(team=self.team, name="Dashboard 1")
+        dashboard2 = Dashboard.objects.create(team=self.team, name="Dashboard 2")
+        insight = Insight.objects.create(team=self.team, name="Shared Insight")
+
+        # Add insight to first dashboard
+        response = self.client.patch(
+            f"/api/environments/{self.team.pk}/insights/{insight.pk}/",
+            {"dashboards": [dashboard1.pk]},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual([t["dashboard_id"] for t in response.json()["dashboard_tiles"]], [dashboard1.pk])
+        self.assertTrue(DashboardTile.objects.filter(dashboard=dashboard1, insight=insight).exists())
+
+        # Append to second dashboard — must include both IDs (full replacement)
+        response = self.client.patch(
+            f"/api/environments/{self.team.pk}/insights/{insight.pk}/",
+            {"dashboards": [dashboard1.pk, dashboard2.pk]},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertCountEqual(
+            [t["dashboard_id"] for t in response.json()["dashboard_tiles"]], [dashboard1.pk, dashboard2.pk]
+        )
+        self.assertTrue(DashboardTile.objects.filter(dashboard=dashboard1, insight=insight).exists())
+        self.assertTrue(DashboardTile.objects.filter(dashboard=dashboard2, insight=insight).exists())
+
+    def test_omitting_dashboard_from_dashboards_removes_tile(self):
+        dashboard1 = Dashboard.objects.create(team=self.team, name="Dashboard 1")
+        dashboard2 = Dashboard.objects.create(team=self.team, name="Dashboard 2")
+        insight = Insight.objects.create(team=self.team, name="Shared Insight")
+        DashboardTile.objects.create(dashboard=dashboard1, insight=insight)
+        DashboardTile.objects.create(dashboard=dashboard2, insight=insight)
+
+        # Remove from dashboard2 by only including dashboard1
+        response = self.client.patch(
+            f"/api/environments/{self.team.pk}/insights/{insight.pk}/",
+            {"dashboards": [dashboard1.pk]},
+            content_type="application/json",
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        self.assertEqual([t["dashboard_id"] for t in response.json()["dashboard_tiles"]], [dashboard1.pk])
+        self.assertTrue(DashboardTile.objects.filter(dashboard=dashboard1, insight=insight).exists())
+        self.assertFalse(DashboardTile.objects.filter(dashboard=dashboard2, insight=insight, deleted=False).exists())

@@ -3,8 +3,11 @@ from posthog.schema import CohortPropertyFilter, PropertyOperator, RecordingsQue
 from posthog.hogql import ast
 from posthog.hogql.parser import parse_select
 
-from posthog.models import Cohort, Team
+from posthog.models import Team
 from posthog.session_recordings.queries.sub_queries.base_query import SessionRecordingsListingBaseQuery
+from posthog.session_recordings.queries.utils import is_anonymous_cohort_fix_enabled, poe_is_active
+
+from products.cohorts.backend.models.cohort import Cohort
 
 
 class CohortPropertyGroupsSubQuery(SessionRecordingsListingBaseQuery):
@@ -18,6 +21,11 @@ class CohortPropertyGroupsSubQuery(SessionRecordingsListingBaseQuery):
 
     The JOIN-based approach allows ClickHouse to use more efficient join algorithms
     (hash join, merge join) and doesn't require loading all IDs into memory upfront.
+
+    When the anonymous-user cohort fix is enabled and PoE is active, this subquery is
+    skipped entirely — ReplayFiltersEventsSubQuery handles cohort filtering against the
+    events table instead, which correctly preserves anonymous events (events whose
+    person_id is not in person_distinct_id2).
     """
 
     def __init__(self, team: Team, query: RecordingsQuery):
@@ -26,6 +34,13 @@ class CohortPropertyGroupsSubQuery(SessionRecordingsListingBaseQuery):
     def get_query(self) -> ast.SelectQuery | ast.SelectSetQuery | None:
         cohort_filters = self._extract_cohort_filters()
         if not cohort_filters:
+            return None
+
+        # Hand the cohort filter off to ReplayFiltersEventsSubQuery when we can.
+        # That path filters against the events table (so events whose person_id isn't
+        # in person_distinct_id2 are still considered), but it only works for AND queries
+        # because its NOT-IN handling rides on _negative_blocklist_query, which no-ops on OR.
+        if poe_is_active(self._team) and self._query.operand != "OR" and is_anonymous_cohort_fix_enabled(self._team):
             return None
 
         return self._build_join_based_query(cohort_filters)
@@ -77,7 +92,9 @@ class CohortPropertyGroupsSubQuery(SessionRecordingsListingBaseQuery):
 
             # HogQL automatically adds team_id filter, so we only need cohort_id (and version)
             if is_static:
-                subquery = f"(SELECT person_id, 1 AS matched FROM static_cohort_people WHERE cohort_id = {{{cohort_id_placeholder}}})"
+                # DISTINCT because `person_static_cohort` can hold repeated rows for the same member
+                # (its sort key includes a per-row UUID), which would fan out through the LEFT JOIN.
+                subquery = f"(SELECT DISTINCT person_id, 1 AS matched FROM static_cohort_people WHERE cohort_id = {{{cohort_id_placeholder}}})"
             else:
                 version_placeholder = f"version_{idx}"
                 placeholders[version_placeholder] = ast.Constant(value=version)

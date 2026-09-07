@@ -5,15 +5,24 @@ import dagster_slack
 from dagster_aws.s3.io_manager import s3_pickle_io_manager
 from dagster_aws.s3.resources import S3Resource
 
+from posthog.dags.common.loggers import structlog_console_logger
 from posthog.dags.common.resources import (
     ClayWebhookResource,
     ClickhouseClusterResource,
     PostgresResource,
+    PostgresURL,
     PostgresURLResource,
     PostHogAnalyticsResource,
     RedisResource,
     kafka_producer_resource,
 )
+
+# Default loggers for every code location's jobs. Overrides Dagster's
+# colored_console_logger so `context.log` emits structlog JSON to stdout (like
+# Django) and reaches the PostHog Logs product. Shared as a single instance —
+# Dagster errors if the same logger key maps to different objects across
+# merged definitions.
+loggers = {"console": structlog_console_logger}
 
 # Define resources for different environments
 resources_by_env = {
@@ -39,6 +48,9 @@ resources_by_env = {
         ),
         # Persons DB resource (parses connection URL)
         "persons_database": PostgresURLResource(
+            connection_url=dagster.EnvVar("PERSONS_DB_WRITER_URL"),
+        ),
+        "persons_database_url": PostgresURL(
             connection_url=dagster.EnvVar("PERSONS_DB_WRITER_URL"),
         ),
         # Kafka producer (auto-configured from Django settings)
@@ -75,6 +87,9 @@ resources_by_env = {
         "posthoganalytics": PostHogAnalyticsResource(personal_api_key=dagster.EnvVar("PERSONAL_API_KEY")),
         # Persons DB resource (parses connection URL)
         "persons_database": PostgresURLResource(
+            connection_url=dagster.EnvVar("PERSONS_DB_WRITER_URL"),
+        ),
+        "persons_database_url": PostgresURL(
             connection_url=dagster.EnvVar("PERSONS_DB_WRITER_URL"),
         ),
         # Kafka producer (auto-configured from Django settings)

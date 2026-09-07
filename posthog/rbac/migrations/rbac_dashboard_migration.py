@@ -3,10 +3,10 @@ from django.db import transaction
 import structlog
 
 from posthog.exceptions_capture import capture_exception
-from posthog.models.dashboard import Dashboard
 from posthog.models.organization import Organization, OrganizationMembership
 
-from ee.models.rbac.access_control import AccessControl
+from products.access_control.backend.models.access_control import AccessControl
+from products.dashboards.backend.models.dashboard import Dashboard
 
 logger = structlog.get_logger(__name__)
 

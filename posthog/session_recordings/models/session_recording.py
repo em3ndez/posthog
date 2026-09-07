@@ -3,13 +3,41 @@ from typing import Any, Optional, Union
 
 from django.db import models
 
+import structlog
+
 from posthog.models.person.missing_person import MissingPerson
-from posthog.models.person.person import READ_DB_FOR_PERSONS, Person
+from posthog.models.person.person import Person
 from posthog.models.team.team import Team
 from posthog.models.utils import UUIDTModel
+from posthog.personhog_client.client import personhog_call
+from posthog.personhog_client.metrics import PERSONHOG_TEAM_MISMATCH_TOTAL, get_client_name
 from posthog.session_recordings.models.metadata import RecordingMatchingEvents, RecordingMetadata
 from posthog.session_recordings.models.session_recording_event import SessionRecordingViewed
-from posthog.session_recordings.queries.session_replay_events import SessionReplayEvents
+
+logger = structlog.get_logger(__name__)
+
+
+def _fetch_person_by_distinct_id_via_personhog(team_id: int, distinct_id: str) -> Person | None:
+    from posthog.personhog_client.caller_tag import personhog_caller_tag
+    from posthog.personhog_client.client import get_personhog_client
+    from posthog.personhog_client.converters import proto_person_to_model
+    from posthog.personhog_client.proto import GetPersonByDistinctIdRequest
+
+    client = get_personhog_client()
+    if client is None:
+        raise RuntimeError("personhog client not configured")
+
+    with personhog_caller_tag("replay/recording-person"):
+        resp = client.get_person_by_distinct_id(GetPersonByDistinctIdRequest(team_id=team_id, distinct_id=distinct_id))
+    if resp.person and resp.person.id and resp.person.team_id == team_id:
+        # Only pass the queried distinct_id — the list endpoint also intentionally
+        # sets a single distinct_id to avoid expensive all-distinct-ids lookups.
+        # The MinimalPersonSerializer truncates to 10 anyway.
+        return proto_person_to_model(resp.person, distinct_ids=[distinct_id])
+    if resp.person and resp.person.id and resp.person.team_id != team_id:
+        PERSONHOG_TEAM_MISMATCH_TOTAL.labels(operation="load_person", client_name=get_client_name()).inc()
+        logger.warning("personhog_team_mismatch", operation="load_person", team_id=team_id, dropped=1)
+    return None
 
 
 class SessionRecording(UUIDTModel):
@@ -45,8 +73,6 @@ class SessionRecording(UUIDTModel):
 
     start_url = models.CharField(blank=True, null=True, max_length=512)
 
-    # we can't store storage version in the stored content
-    # as we might need to know the version before knowing how to load the data
     storage_version = models.CharField(blank=True, null=True, max_length=20)
 
     retention_period_days = models.IntegerField(blank=True, null=True)
@@ -61,6 +87,11 @@ class SessionRecording(UUIDTModel):
     activity_score: Optional[float] = None
     expiry_time: Optional[datetime] = None
     recording_ttl: Optional[int] = None
+    total_size: Optional[int] = None
+    event_count: Optional[int] = None
+    # False when this recording was included in listing results via session_recording_id
+    # despite not matching the listing filters
+    matches_filters: Optional[bool] = None
 
     # Metadata can be loaded from Clickhouse or S3
     _metadata: Optional[RecordingMetadata] = None
@@ -69,10 +100,14 @@ class SessionRecording(UUIDTModel):
         if self._metadata:
             return True
 
-        if self.object_storage_path or self.full_recording_v2_path:
+        if self.full_recording_v2_path:
             # Nothing todo as we have all the metadata in the model
             pass
         else:
+            # Deferred: session_replay_events pulls the HogQL/schema layer, and this model
+            # loads at django.setup() in every process.
+            from posthog.session_recordings.queries.session_replay_events import SessionReplayEvents  # noqa: PLC0415
+
             # Try to load from Clickhouse
             metadata = SessionReplayEvents().get_metadata(
                 team=self.team,
@@ -95,13 +130,19 @@ class SessionRecording(UUIDTModel):
             self.set_start_url_from_urls(first_url=metadata["first_url"])
             self.mouse_activity_count = metadata["mouse_activity_count"]
             self.active_seconds = metadata["active_seconds"]
-            self.inactive_seconds = metadata["duration"] - metadata["active_seconds"]
+            # `active_seconds` sums per-block active time, so blocks that overlap in wall clock
+            # (concurrent tabs in one session) each count their own and the total can exceed the
+            # elapsed span. Only the totals are stored, so the overlap cannot be subtracted out.
+            self.inactive_seconds = max(metadata["duration"] - metadata["active_seconds"], 0)
             self.console_log_count = metadata["console_log_count"]
             self.console_warn_count = metadata["console_warn_count"]
             self.console_error_count = metadata["console_error_count"]
             self.retention_period_days = metadata["retention_period_days"]
             self.expiry_time = metadata["expiry_time"]
             self.recording_ttl = metadata["recording_ttl"]
+            self.ongoing = metadata["ongoing"]
+            self.total_size = metadata["total_size"]
+            self.event_count = metadata["event_count"]
 
         return True
 
@@ -130,14 +171,16 @@ class SessionRecording(UUIDTModel):
         if self._person:
             return
 
-        try:
-            self.person = Person.objects.db_manager(READ_DB_FOR_PERSONS).get(
-                persondistinctid__distinct_id=self.distinct_id,
-                persondistinctid__team_id=self.team.pk,
-                team=self.team,
-            )
-        except Person.DoesNotExist:
-            pass
+        distinct_id = self.distinct_id
+        if not distinct_id:
+            return
+
+        def _fn() -> None:
+            person = _fetch_person_by_distinct_id_via_personhog(self.team.pk, distinct_id)
+            if person is not None:
+                self.person = person
+
+        personhog_call("load_person", _fn)
 
     def check_viewed_for_user(self, user: Any, save_viewed=False) -> None:
         if not save_viewed:

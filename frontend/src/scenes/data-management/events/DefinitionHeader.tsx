@@ -1,13 +1,24 @@
 import React from 'react'
 
-import { IconBadge, IconBolt, IconCursor, IconEye, IconLeave, IconList, IconLogomark, IconPlay } from '@posthog/icons'
+import {
+    IconBadge,
+    IconBolt,
+    IconCursor,
+    IconEye,
+    IconLeave,
+    IconList,
+    IconLogomark,
+    IconPerson,
+    IconPlay,
+    IconServer,
+} from '@posthog/icons'
 
 import { PropertyKeyInfo } from 'lib/components/PropertyKeyInfo'
 import { TaxonomicFilterGroupType } from 'lib/components/TaxonomicFilter/types'
+import { IconEyeHidden, IconSelectAll } from 'lib/lemon-ui/icons'
 import { LemonTableLink } from 'lib/lemon-ui/LemonTable/LemonTableLink'
 import { LinkProps } from 'lib/lemon-ui/Link'
 import { Tooltip } from 'lib/lemon-ui/Tooltip'
-import { IconEyeHidden, IconSelectAll } from 'lib/lemon-ui/icons'
 
 import { getCoreFilterDefinition } from '~/taxonomy/helpers'
 import { CORE_FILTER_DEFINITIONS_BY_GROUP } from '~/taxonomy/taxonomy'
@@ -57,6 +68,50 @@ export function getPropertyDefinitionIcon(definition: PropertyDefinition): JSX.E
         <IconWithBadge
             icon={<IconList />}
             tooltipTitle="Event property"
+            className="taxonomy-icon taxonomy-icon-muted"
+            verified={definition.verified}
+            hidden={definition.hidden}
+        />
+    )
+}
+
+export function getAccountFieldDefinitionIcon(): JSX.Element {
+    return (
+        <IconWithBadge icon={<IconList />} tooltipTitle="Account field" className="taxonomy-icon taxonomy-icon-muted" />
+    )
+}
+
+export function getAccountCustomPropertyDefinitionIcon(
+    definition: PropertyDefinition & { is_canonical?: boolean }
+): JSX.Element {
+    if (definition.is_canonical) {
+        return (
+            <IconWithBadge
+                icon={<IconLogomark />}
+                tooltipTitle="PostHog sets this property automatically"
+                className="taxonomy-icon taxonomy-icon-muted"
+            />
+        )
+    }
+    return getPropertyDefinitionIcon(definition)
+}
+
+export function getPersonPropertyDefinitionIcon(definition: PropertyDefinition): JSX.Element {
+    if (CORE_FILTER_DEFINITIONS_BY_GROUP.person_properties[definition.name]) {
+        return (
+            <IconWithBadge
+                icon={<IconLogomark />}
+                tooltipTitle="PostHog person property"
+                className="taxonomy-icon taxonomy-icon-muted"
+                verified={definition.verified}
+                hidden={definition.hidden}
+            />
+        )
+    }
+    return (
+        <IconWithBadge
+            icon={<IconPerson />}
+            tooltipTitle="Person property"
             className="taxonomy-icon taxonomy-icon-muted"
             verified={definition.verified}
             hidden={definition.hidden}
@@ -132,6 +187,17 @@ export function getEventDefinitionIcon(definition: EventDefinition & { value?: s
             />
         )
     }
+    if (definition.is_data_warehouse) {
+        return (
+            <IconWithBadge
+                icon={<IconServer />}
+                verified={definition.verified}
+                hidden={definition.hidden}
+                tooltipTitle="Data warehouse event"
+                className="taxonomy-icon taxonomy-icon-muted"
+            />
+        )
+    }
     return (
         <IconWithBadge
             icon={<IconCursor />}
@@ -144,14 +210,14 @@ export function getEventDefinitionIcon(definition: EventDefinition & { value?: s
 }
 
 export function getEventMetadataDefinitionIcon(definition: PropertyDefinition): JSX.Element {
-    if (CORE_FILTER_DEFINITIONS_BY_GROUP.event_metadata[definition.id]) {
+    if (CORE_FILTER_DEFINITIONS_BY_GROUP.event_metadata[definition.name]) {
         return <IconLogomark />
     }
     return <IconList />
 }
 
 export function getRevenueAnalyticsDefinitionIcon(definition: PropertyDefinition): JSX.Element {
-    if (CORE_FILTER_DEFINITIONS_BY_GROUP.revenue_analytics_properties[definition.id]) {
+    if (CORE_FILTER_DEFINITIONS_BY_GROUP.revenue_analytics_properties[definition.name]) {
         return <IconLogomark />
     }
 

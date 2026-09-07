@@ -1,6 +1,6 @@
 # Ingestion Acceptance Tests
 
-End-to-end tests that verify the PostHog ingestion pipeline is functioning correctly. These tests capture real events via the PostHog SDK and query them back via the HogQL API to ensure the full pipeline works as expected.
+End-to-end tests that verify the PostHog ingestion pipeline is functioning correctly. These tests capture real events via the PostHog SDK and query them back via direct ClickHouse queries to ensure events land in ClickHouse as expected.
 
 ## Goal
 
@@ -28,7 +28,7 @@ Detect ingestion pipeline issues in production before users notice them. The tes
                     ┌───────────────┴───────────────┐
                     ▼                               ▼
            ┌──────────────┐                ┌──────────────┐
-           │ PostHog SDK  │                │  HogQL API   │
+           │ PostHog SDK  │                │  ClickHouse  │
            │  (capture)   │                │   (query)    │
            └──────────────┘                └──────────────┘
                     │                               │
@@ -69,12 +69,12 @@ class TestExample(AcceptanceTest):
 
 **Available client methods:**
 
-- `capture_event(name, distinct_id, properties)` - Send an event
-- `alias(alias, distinct_id)` - Create an alias
-- `merge_dangerously(into_id, from_id)` - Merge two persons
-- `query_event_by_uuid(uuid)` - Poll for an event by UUID
-- `query_person_by_distinct_id(distinct_id)` - Poll for a person
-- `query_events_by_person_id(person_id, expected_count)` - Poll for events by person
+- `capture_event(name, distinct_id, properties)` - Send an event via SDK
+- `alias(alias, distinct_id)` - Create an alias via SDK
+- `merge_dangerously(into_id, from_id)` - Merge two persons via SDK
+- `query_event_by_uuid(uuid)` - Poll ClickHouse for an event by UUID
+- `query_person_by_distinct_id(distinct_id)` - Poll ClickHouse for a person
+- `query_events_by_person_id(person_id, expected_event_uuids)` - Poll ClickHouse for events by person
 
 **Available assertion methods:**
 
@@ -85,15 +85,18 @@ class TestExample(AcceptanceTest):
 
 All configuration is loaded from environment variables with the `INGESTION_ACCEPTANCE_TEST_` prefix:
 
-| Variable                | Required | Default | Description                                       |
-| ----------------------- | -------- | ------- | ------------------------------------------------- |
-| `API_HOST`              | Yes      | -       | PostHog API host (e.g., `https://us.posthog.com`) |
-| `PROJECT_API_KEY`       | Yes      | -       | Project API key for capturing events              |
-| `PROJECT_ID`            | Yes      | -       | Project ID for querying events                    |
-| `PERSONAL_API_KEY`      | Yes      | -       | Personal API key for HogQL queries                |
-| `EVENT_TIMEOUT_SECONDS` | No       | 90      | Max time to wait for events to appear             |
-| `POLL_INTERVAL_SECONDS` | No       | 10.0    | Interval between query attempts                   |
-| `SLACK_WEBHOOK_URL`     | No       | -       | Slack incoming webhook for failure notifications  |
+| Variable                | Required | Default                                                                                                         | Description                                                                                                     |
+| ----------------------- | -------- | --------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| `API_HOST`              | Yes      | -                                                                                                               | PostHog API host (e.g., `https://us.posthog.com`)                                                               |
+| `PROJECT_API_KEY`       | Yes      | -                                                                                                               | Project token for capturing events                                                                              |
+| `TEAM_ID`               | Yes      | -                                                                                                               | Team ID for ClickHouse queries                                                                                  |
+| `EVENT_TIMEOUT_SECONDS` | No       | 90                                                                                                              | Max time to wait for events to appear                                                                           |
+| `POLL_INTERVAL_SECONDS` | No       | 10.0                                                                                                            | Interval between query attempts                                                                                 |
+| `SLACK_WEBHOOK_URL`     | No       | -                                                                                                               | Slack incoming webhook for failure notifications                                                                |
+| `ENVIRONMENT`           | No       | derived                                                                                                         | Deployment name in alerts (`prod-us`, `prod-eu`, `dev`); derived from `API_HOST`                                |
+| `GRAFANA_URL`           | No       | derived                                                                                                         | Grafana base URL for the Loki link; `https://grafana.<environment>.posthog.dev` for `prod-us`, `prod-eu`, `dev` |
+| `LOKI_DATASOURCE_UID`   | No       | `P44D702D3E93867EC`                                                                                             | Loki datasource UID used in the Grafana Explore link                                                            |
+| `RUNBOOK_URL`           | No       | [ingestion-acceptance-test](https://runbooks.posthog.com/services/ingestion/runbooks/ingestion-acceptance-test) | Runbook link included in alerts                                                                                 |
 
 ## Running Locally
 
@@ -101,10 +104,9 @@ All configuration is loaded from environment variables with the `INGESTION_ACCEP
 # Set required environment variables
 export INGESTION_ACCEPTANCE_TEST_API_HOST="https://us.posthog.com"
 export INGESTION_ACCEPTANCE_TEST_PROJECT_API_KEY="phc_xxx"
-export INGESTION_ACCEPTANCE_TEST_PROJECT_ID="12345"
-export INGESTION_ACCEPTANCE_TEST_PERSONAL_API_KEY="phx_xxx"
+export INGESTION_ACCEPTANCE_TEST_TEAM_ID="12345"
 
-# Run directly
+# Run directly (requires ClickHouse connection via Django settings)
 python -m posthog.temporal.ingestion_acceptance_test
 ```
 
@@ -115,7 +117,7 @@ ingestion_acceptance_test/
 ├── __init__.py
 ├── __main__.py              # CLI entry point for local runs
 ├── activities.py            # Temporal activity definition
-├── client.py                # PostHog SDK wrapper with HTTP retry and HogQL queries
+├── client.py                # PostHog SDK wrapper with retry and direct ClickHouse queries
 ├── config.py                # Pydantic settings for environment config
 ├── results.py               # Test result dataclasses
 ├── runner.py                # Test execution engine
@@ -134,15 +136,12 @@ ingestion_acceptance_test/
 
 Unit tests are located at `posthog/temporal/tests/ingestion_acceptance_test/`.
 
-## HTTP Resilience
+## SDK Capture Resilience
 
-The client includes automatic retry for transient HTTP failures:
+The client includes automatic retry for transient SDK capture failures:
 
-- **Timeout:** 30 seconds per request
-- **Retries:** 3 attempts with exponential backoff
-- **Retry on:** 500, 502, 503, 504 (server errors)
-- **Retry on:** Connection errors and read timeouts
-- **No retry on:** 429 (rate limiting) - retrying immediately won't help
+- **Retries:** 5 attempts with exponential backoff
+- **Retry on:** Connection errors and timeouts
 
 ## ClickHouse Query Optimization
 
@@ -150,8 +149,23 @@ Event queries include a timestamp filter (`timestamp >= test_start_date - 1 day`
 
 ## Notifications
 
-Slack notifications are sent only when tests fail or error. Successful runs are silent to avoid noise. The notification includes:
+Slack notifications are sent only when tests fail or error. Successful runs are silent to avoid noise. The notification is shaped so a person or SherlockHog can start investigating from the message alone:
 
 - Pass/fail/error counts
-- Failed test names with error messages
-- Environment info (API host, project ID, duration)
+- Per failed test: a failure class, the exception type and message, and the events the test sent (uuid, event name, distinct_id)
+- `Environment:` / `Severity:` / `Team:` / `Lane:` / `Project:` / `Failure class:` metadata lines
+- Links to the Temporal run, the worker logs in Loki, and the runbook when configured
+
+Failure classes:
+
+| Class              | Meaning                                                           | Start looking at                                                |
+| ------------------ | ----------------------------------------------------------------- | --------------------------------------------------------------- |
+| `connection_error` | The test could not reach ClickHouse or the API                    | The harness and ClickHouse offline health                       |
+| `event_missing`    | An event was accepted by capture but never appeared in ClickHouse | Ingestion, then the ClickHouse write path for the event's shard |
+| `person_missing`   | A person never appeared in ClickHouse                             | Person processing                                               |
+| `assertion`        | Data was found but did not match                                  | The test and recent ingestion changes                           |
+| `error`            | Any other exception in the test                                   | The traceback in the Temporal run                               |
+
+The suite-level class is the most serious one present. `connection_error` and `error` are reported as `Severity: warning`; the others as `critical`.
+
+The timeout alert classifies the run by what the still-running tests were waiting for: an event poll gives `event_missing`, a person poll `person_missing`, and no pending poll `error`.

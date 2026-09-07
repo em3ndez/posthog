@@ -1,8 +1,8 @@
-import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/OnboardingDocsContentWrapper'
+import { OnboardingComponentsContext, createInstallation } from 'scenes/onboarding/shared/OnboardingDocsContentWrapper'
 
 import { StepDefinition } from '../steps'
 
-export const getNodeJSSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
+export const getNodeJSInstallSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => {
     const { CodeBlock, Markdown, dedent } = ctx
 
     return [
@@ -35,6 +35,13 @@ export const getNodeJSSteps = (ctx: OnboardingComponentsContext): StepDefinition
                                 pnpm add posthog-node
                             `,
                             },
+                            {
+                                language: 'bash',
+                                file: 'bun',
+                                code: dedent`
+                                bun add posthog-node
+                            `,
+                            },
                         ]}
                     />
                 </>
@@ -45,7 +52,7 @@ export const getNodeJSSteps = (ctx: OnboardingComponentsContext): StepDefinition
             badge: 'required',
             content: (
                 <>
-                    <Markdown>Initialize the PostHog client with your project API key:</Markdown>
+                    <Markdown>Initialize the PostHog client with your project token:</Markdown>
                     <CodeBlock
                         blocks={[
                             {
@@ -55,7 +62,7 @@ export const getNodeJSSteps = (ctx: OnboardingComponentsContext): StepDefinition
                                 import { PostHog } from 'posthog-node'
 
                                 const client = new PostHog(
-                                    '<ph_project_api_key>',
+                                    '<ph_project_token>',
                                     {
                                         host: '<ph_client_api_host>'
                                     }
@@ -67,18 +74,24 @@ export const getNodeJSSteps = (ctx: OnboardingComponentsContext): StepDefinition
                 </>
             ),
         },
-        {
-            title: 'Send an event',
-            badge: 'recommended',
-            content: (
-                <>
-                    <Markdown>Once installed, you can manually send events to test your integration:</Markdown>
-                    <CodeBlock
-                        blocks={[
-                            {
-                                language: 'javascript',
-                                file: 'Node.js',
-                                code: dedent`
+    ]
+}
+
+export const getNodeJSEventStep = (ctx: OnboardingComponentsContext): StepDefinition => {
+    const { CodeBlock, Markdown, dedent } = ctx
+
+    return {
+        title: 'Send an event',
+        badge: 'recommended',
+        content: (
+            <>
+                <Markdown>Once installed, you can manually send events to test your integration:</Markdown>
+                <CodeBlock
+                    blocks={[
+                        {
+                            language: 'javascript',
+                            file: 'Node.js',
+                            code: dedent`
                                 client.capture({
                                     distinctId: 'distinct_id_of_the_user',
                                     event: 'event_name',
@@ -88,13 +101,17 @@ export const getNodeJSSteps = (ctx: OnboardingComponentsContext): StepDefinition
                                     },
                                 })
                             `,
-                            },
-                        ]}
-                    />
-                </>
-            ),
-        },
-    ]
+                        },
+                    ]}
+                />
+            </>
+        ),
+    }
 }
+
+export const getNodeJSSteps = (ctx: OnboardingComponentsContext): StepDefinition[] => [
+    ...getNodeJSInstallSteps(ctx),
+    getNodeJSEventStep(ctx),
+]
 
 export const NodeJSInstallation = createInstallation(getNodeJSSteps)

@@ -1,16 +1,18 @@
 import { useActions, useValues } from 'kea'
 
-import { LemonInput } from '@posthog/lemon-ui'
+import * as readingIsMagicPng from '@posthog/brand/hoggies/png/reading-is-magic'
+import { IconOpenSidebar } from '@posthog/icons'
+import { LemonButton, LemonInput } from '@posthog/lemon-ui'
 
+import { pngHoggie } from 'lib/brand/hoggies'
 import { ProductIntroduction } from 'lib/components/ProductIntroduction/ProductIntroduction'
 import { Sparkline } from 'lib/components/Sparkline'
 import { TZLabel } from 'lib/components/TZLabel'
 import ViewRecordingButton from 'lib/components/ViewRecordingButton/ViewRecordingButton'
-import { ReadingHog } from 'lib/components/hedgehogs'
 import { LemonTable } from 'lib/lemon-ui/LemonTable'
 import { Link } from 'lib/lemon-ui/Link'
-import { Scene } from 'scenes/sceneTypes'
 import { sceneConfigurations } from 'scenes/scenes'
+import { Scene } from 'scenes/sceneTypes'
 import { urls } from 'scenes/urls'
 
 import { SceneContent } from '~/layout/scenes/components/SceneContent'
@@ -20,22 +22,74 @@ import { ProductKey } from '~/queries/schema/schema-general'
 
 import { IngestionWarning, IngestionWarningSummary, ingestionWarningsLogic } from './ingestionWarningsLogic'
 
-const WARNING_TYPE_TO_DESCRIPTION = {
+const HedgehogReadingIsMagic = pngHoggie(readingIsMagicPng)
+
+export const WARNING_TYPE_TO_DESCRIPTION: Record<string, string> = {
     cannot_merge_already_identified: 'Refused to merge an already identified user',
     cannot_merge_with_illegal_distinct_id: 'Refused to merge with an illegal distinct id',
+    merge_move_limit_exceeded: 'A merge exceeded its distinct id move limit and was dropped',
+    merge_settled_failure: 'A merge settled without merging and cannot be retried',
     skipping_event_invalid_uuid: 'Refused to process event with invalid uuid',
     ignored_invalid_timestamp: 'Ignored an invalid timestamp, event was still ingested',
     event_timestamp_in_future: 'An event was sent more than 23 hours in the future',
     ingestion_capacity_overflow: 'Event ingestion has overflowed capacity',
     message_size_too_large: 'Discarded event exceeding 1MB limit',
+    person_properties_size_violation: 'Person properties exceeded the size limit and were trimmed or rejected',
     replay_timestamp_invalid: 'Replay event timestamp is invalid',
     replay_timestamp_too_far: 'Replay event timestamp was too far in the future',
     replay_message_too_large: 'Replay data was dropped because it was too large to ingest',
     set_on_exception: '$set or $set_once is ignored on exception events and should not be sent',
     schema_validation_failed: 'Event rejected due to schema validation failure',
+    invalid_heatmap_data: 'Invalid heatmap data',
+    invalid_group_set: 'Discarded a $groupidentify event whose $group_set is not an object',
+    // Emitted by the capture service when it drops events at validation time
+    missing_event_name: 'Discarded event with no event name',
+    event_name_too_long: 'Discarded event whose name exceeds the length limit',
+    missing_distinct_id: 'Discarded event with no distinct ID',
+    distinct_id_too_large: 'Discarded event whose distinct ID exceeds the size limit',
+    distinct_id_truncated: 'Ingested event after shortening its distinct ID to the 200 character limit',
+    invalid_event_timestamp: 'Discarded event with an invalid timestamp',
+    malformed_event_properties: 'Discarded event with malformed properties',
+    invalid_options: 'Discarded event with invalid capture options',
+    empty_batch: 'Rejected a request containing no events',
+    invalid_batch: 'Rejected a batch with invalid metadata',
+    missing_event_uuid: 'Rejected a batch containing an event with no UUID',
+    invalid_event_uuid: 'Rejected a batch containing an event with an invalid UUID',
+    duplicate_event_uuid: 'Rejected a batch containing duplicate event UUIDs',
+    high_volume_distinct_id: 'Skipped person profile processing for a high-volume distinct ID',
+    // Emitted by the capture service for its AI endpoints
+    invalid_ai_event: 'Discarded an AI event with an unsupported event name or no $ai_model',
+    invalid_ai_payload: 'Rejected a malformed AI or OpenTelemetry request',
+    no_ai_spans_ingested: 'Accepted an OpenTelemetry export with no AI spans, so nothing was ingested',
+    // Emitted by the capture service for its session replay endpoint
+    missing_session_id: 'Discarded a session replay batch with no $session_id',
+    invalid_session_id: 'Discarded a session replay batch with an invalid $session_id',
+    missing_snapshot_data: 'Discarded a session replay batch with no $snapshot_data',
 }
 
-const WARNING_TYPE_RENDERER = {
+// Explicit anchor on https://posthog.com/docs/data/ingestion-warnings for each warning type.
+// Don't derive this from the display label — labels and section headings drift apart
+// (e.g. set_on_exception's heading is "Invalid set operations on exception events"), which
+// would land the link at the top of the page instead of the relevant section. Types without
+// a documented section are omitted and fall back to the page root.
+export const WARNING_TYPE_TO_DOCS_ANCHOR: Record<string, string> = {
+    cannot_merge_already_identified: 'refused-to-merge-an-already-identified-user',
+    cannot_merge_with_illegal_distinct_id: 'refused-to-merge-with-an-illegal-distinct-id',
+    merge_move_limit_exceeded: 'a-merge-exceeded-its-distinct-id-move-limit-and-was-dropped',
+    merge_settled_failure: 'a-merge-settled-without-merging-and-cannot-be-retried',
+    skipping_event_invalid_uuid: 'refused-to-process-event-with-invalid-uuid',
+    ignored_invalid_timestamp: 'ignored-an-invalid-timestamp-event-was-still-ingested',
+    event_timestamp_in_future: 'an-event-was-sent-more-than-23-hours-in-the-future',
+    ingestion_capacity_overflow: 'event-ingestion-has-overflowed-capacity',
+    message_size_too_large: 'discarded-event-exceeding-1mb-limit',
+    replay_timestamp_invalid: 'replay-event-timestamp-is-invalid',
+    replay_timestamp_too_far: 'replay-event-timestamp-was-too-far-in-the-future',
+    set_on_exception: 'invalid-set-operations-on-exception-events',
+    invalid_heatmap_data: 'invalid-heatmap-data',
+    high_volume_distinct_id: 'skipped-person-profile-processing-for-a-high-volume-distinct-id',
+}
+
+export const WARNING_TYPE_RENDERER = {
     cannot_merge_already_identified: function Render(warning: IngestionWarning): JSX.Element {
         const details = warning.details as {
             sourcePersonDistinctId: string
@@ -68,6 +122,47 @@ const WARNING_TYPE_RENDERER = {
                 <Link to={urls.personByDistinctId(details.illegalDistinctId)}>{details.illegalDistinctId}</Link> with{' '}
                 <Link to={urls.personByDistinctId(details.otherDistinctId)}>{details.otherDistinctId}</Link> via an
                 $identify or $create_alias call (event uuid: <code>{details.eventUuid}</code>).
+            </>
+        )
+    },
+    merge_move_limit_exceeded: function Render(warning: IngestionWarning): JSX.Element {
+        const details = warning.details as {
+            sourcePersonDistinctId: string
+            targetPersonDistinctId: string
+            eventUuid: string
+        }
+        return (
+            <>
+                Refused to merge{' '}
+                <Link to={urls.personByDistinctId(details.sourcePersonDistinctId)}>
+                    {details.sourcePersonDistinctId}
+                </Link>{' '}
+                into{' '}
+                <Link to={urls.personByDistinctId(details.targetPersonDistinctId)}>
+                    {details.targetPersonDistinctId}
+                </Link>{' '}
+                because it has more distinct ids than one merge may move (event uuid: <code>{details.eventUuid}</code>).
+            </>
+        )
+    },
+    merge_settled_failure: function Render(warning: IngestionWarning): JSX.Element {
+        const details = warning.details as {
+            sourcePersonDistinctId: string
+            targetPersonDistinctId: string
+            eventUuid: string
+        }
+        return (
+            <>
+                A merge of{' '}
+                <Link to={urls.personByDistinctId(details.sourcePersonDistinctId)}>
+                    {details.sourcePersonDistinctId}
+                </Link>{' '}
+                into{' '}
+                <Link to={urls.personByDistinctId(details.targetPersonDistinctId)}>
+                    {details.targetPersonDistinctId}
+                </Link>{' '}
+                settled without merging, and the result is recorded, so a retry cannot change it (event uuid:{' '}
+                <code>{details.eventUuid}</code>).
             </>
         )
     },
@@ -265,7 +360,7 @@ const WARNING_TYPE_RENDERER = {
                 distinct_id <Link to={urls.personByDistinctId(details.distinctId)}>{details.distinctId}</Link> (event
                 uuid: <code>{details.eventUuid}</code>):
                 <ul>
-                    {details.errors.map((error, index) => (
+                    {(details.errors ?? []).map((error, index) => (
                         <li key={index}>
                             {error.reason === 'missing_required' ? (
                                 <>
@@ -300,81 +395,97 @@ export function IngestionWarningsView(): JSX.Element {
                     type: sceneConfigurations[Scene.IngestionWarnings].iconType || 'default_icon_type',
                 }}
             />
-            <SceneSection>
-                <LemonInput
-                    fullWidth
-                    value={searchQuery}
-                    onChange={setSearchQuery}
-                    type="search"
-                    placeholder="Try pasting a person or session id or an ingestion warning type"
-                />
-                <LemonTable
-                    dataSource={data}
-                    loading={dataLoading}
-                    columns={[
-                        {
-                            title: 'Warning',
-                            dataIndex: 'type',
-                            render: function Render(_, summary: IngestionWarningSummary) {
-                                const type = WARNING_TYPE_TO_DESCRIPTION[summary.type] || summary.type
-                                return (
-                                    <>
-                                        {type} (
-                                        <Link
-                                            to={`https://posthog.com/docs/data#${type
-                                                .toLowerCase()
-                                                .replace(',', '')
-                                                .split(' ')
-                                                .join('-')}`}
-                                        >
-                                            docs)
-                                        </Link>
-                                    </>
-                                )
-                            },
-                        },
-                        {
-                            title: 'Graph',
-                            render: function Render(_, summary: IngestionWarningSummary) {
-                                return <Sparkline className="h-8" labels={dates} data={summaryDatasets[summary.type]} />
-                            },
-                        },
-                        {
-                            title: 'Events',
-                            dataIndex: 'count',
-                            align: 'right',
-                            sorter: (a, b) => a.count - b.count,
-                        },
-                        {
-                            title: 'Last Seen',
-                            dataIndex: 'lastSeen',
-                            render: function Render(_, summary: IngestionWarningSummary) {
-                                return <TZLabel time={summary.lastSeen} showSeconds />
-                            },
-                            align: 'right',
-                            sorter: (a, b) => (new Date(a.lastSeen) > new Date(b.lastSeen) ? 1 : -1),
-                        },
-                    ]}
-                    expandable={{
-                        expandedRowRender: RenderNestedWarnings,
-                    }}
-                    defaultSorting={{
-                        columnKey: 'lastSeen',
-                        order: -1,
-                    }}
-                    noSortingCancellation
-                />
-            </SceneSection>
-            {showProductIntro && (
+            {showProductIntro ? (
                 <ProductIntroduction
                     productName="Ingestion warnings"
                     thingName="ingestion warning"
                     productKey={ProductKey.INGESTION_WARNINGS}
                     isEmpty={true}
-                    description="Nice! You've had no ingestion warnings in the past 30 days. If we detect any issues with your data, we'll show them here."
+                    titleOverride="Nice! No ingestion warnings in the past 30 days"
+                    description="Your incoming events look clean. If we detect any issues with your data, we'll show them here."
                     docsURL="https://posthog.com/docs/data/data-management#ingestion-warnings"
-                    customHog={ReadingHog}
+                    customHog={HedgehogReadingIsMagic}
+                    actionElementOverride={
+                        <LemonButton
+                            type="primary"
+                            to={urls.eventDefinitions()}
+                            data-attr="ingestion-warnings-empty-state-events"
+                            sideIcon={<IconOpenSidebar className="w-4 h-4" />}
+                        >
+                            Explore your events
+                        </LemonButton>
+                    }
                 />
+            ) : (
+                <SceneSection>
+                    <LemonInput
+                        fullWidth
+                        value={searchQuery}
+                        onChange={setSearchQuery}
+                        type="search"
+                        placeholder="Try pasting a person or session id or an ingestion warning type"
+                    />
+                    <LemonTable
+                        dataSource={data}
+                        loading={dataLoading}
+                        columns={[
+                            {
+                                title: 'Warning',
+                                dataIndex: 'type',
+                                render: function Render(_, summary: IngestionWarningSummary) {
+                                    const type =
+                                        WARNING_TYPE_TO_DESCRIPTION[
+                                            summary.type as keyof typeof WARNING_TYPE_TO_DESCRIPTION
+                                        ] || summary.type
+                                    const docsAnchor = WARNING_TYPE_TO_DOCS_ANCHOR[summary.type]
+                                    const docsUrl = docsAnchor
+                                        ? `https://posthog.com/docs/data/ingestion-warnings#${docsAnchor}`
+                                        : 'https://posthog.com/docs/data/ingestion-warnings'
+                                    return (
+                                        <>
+                                            {type} (<Link to={docsUrl}>docs)</Link>
+                                        </>
+                                    )
+                                },
+                            },
+                            {
+                                title: 'Graph',
+                                render: function Render(_, summary: IngestionWarningSummary) {
+                                    return (
+                                        <Sparkline
+                                            className="h-8"
+                                            labels={dates}
+                                            data={summaryDatasets[summary.type]}
+                                        />
+                                    )
+                                },
+                            },
+                            {
+                                title: 'Events',
+                                dataIndex: 'count',
+                                align: 'right',
+                                sorter: (a, b) => a.count - b.count,
+                            },
+                            {
+                                title: 'Last Seen',
+                                dataIndex: 'lastSeen',
+                                render: function Render(_, summary: IngestionWarningSummary) {
+                                    return <TZLabel time={summary.lastSeen} showSeconds />
+                                },
+                                align: 'right',
+                                sorter: (a, b) => (new Date(a.lastSeen) > new Date(b.lastSeen) ? 1 : -1),
+                            },
+                        ]}
+                        expandable={{
+                            expandedRowRender: RenderNestedWarnings,
+                        }}
+                        defaultSorting={{
+                            columnKey: 'lastSeen',
+                            order: -1,
+                        }}
+                        noSortingCancellation
+                    />
+                </SceneSection>
             )}
         </SceneContent>
     )
@@ -389,7 +500,7 @@ function RenderNestedWarnings(warningSummary: IngestionWarningSummary): JSX.Elem
                     title: 'Description',
                     key: 'description',
                     render: function Render(_, warning: IngestionWarning) {
-                        const renderer = WARNING_TYPE_RENDERER[warning.type]
+                        const renderer = WARNING_TYPE_RENDERER[warning.type as keyof typeof WARNING_TYPE_RENDERER]
                         return renderer ? renderer(warning) : <pre>{JSON.stringify(warning.details, null, 2)}</pre>
                     },
                 },

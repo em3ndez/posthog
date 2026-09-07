@@ -1,23 +1,10 @@
-module.exports = {
-    transform: {
-        '^.+\\.(t|j)s$': [
-            'ts-jest',
-            {
-                tsconfig: './tsconfig.json',
-            },
-        ],
-    },
-    testEnvironment: 'node',
-    clearMocks: true,
-    coverageProvider: 'v8',
-    setupFilesAfterEnv: ['./jest.setup.ts'],
-    testMatch: ['<rootDir>/tests/**/*.test.ts', '<rootDir>/src/**/*.test.ts'],
-    testTimeout: 60000,
-    modulePathIgnorePatterns: ['<rootDir>/.tmp/'],
+const config = require('./jest.config.shared')
 
-    // NOTE: This should be kept in sync with tsconfig.json
-    moduleNameMapper: {
-        '^~/tests/(.*)$': '<rootDir>/tests/$1',
-        '^~/(.*)$': '<rootDir>/src/$1',
-    },
+module.exports = {
+    ...config,
+    testMatch: ['<rootDir>/tests/**/!(*.serial).test.ts', '<rootDir>/src/**/!(*.serial).test.ts'],
+    // Only applies to `test.concurrent` bodies (the ingestion e2e harness). Those spend most of
+    // their time waiting on ClickHouse's Kafka engine flush, so overlapping more of them per
+    // worker shortens the file far more than it costs in CPU. Jest's default is 5.
+    maxConcurrency: 15,
 }

@@ -3,12 +3,17 @@ External API endpoints for the Conversations product.
 
 These endpoints are used by the CDP worker for workflow actions and can be opened
 to third-party developers in the future.
-Authenticated via team API token passed as a Bearer token in the Authorization header.
+Authenticated via team secret API token passed as a Bearer token in the Authorization header.
+
+This auth path is legacy (#82564 tracks the worker's move to the scoped-JWT internal
+route, api/internal.py). Both routes share the handlers in api/ticket_actions.py.
 """
 
 import hashlib
 
-from rest_framework import serializers, status
+from django.db.models import Q
+
+from rest_framework import status
 from rest_framework.permissions import AllowAny
 from rest_framework.request import Request
 from rest_framework.response import Response
@@ -17,13 +22,12 @@ from rest_framework.views import APIView
 
 from posthog.models import Team
 
-from products.conversations.backend.cache import invalidate_unread_count_cache
-from products.conversations.backend.models import Ticket
-from products.conversations.backend.models.constants import Priority, Status
+from products.conversations.backend.api.ticket_actions import handle_ticket_get, handle_ticket_patch
+from products.conversations.backend.metrics import TICKET_ACTION_AUTH_COUNTER
 
 
 class _ExternalTicketThrottle(SimpleRateThrottle):
-    """Rate limit by Bearer token (team api_token)."""
+    """Rate limit by Bearer token (team secret_api_token)."""
 
     def get_cache_key(self, request, view):
         auth_header = request.headers.get("Authorization", "")
@@ -34,12 +38,12 @@ class _ExternalTicketThrottle(SimpleRateThrottle):
 
 class ExternalTicketBurstThrottle(_ExternalTicketThrottle):
     scope = "external_ticket_burst"
-    rate = "60/minute"
+    rate = "120/minute"
 
 
 class ExternalTicketSustainedThrottle(_ExternalTicketThrottle):
     scope = "external_ticket_sustained"
-    rate = "600/hour"
+    rate = "1200/hour"
 
 
 def _authenticate_team(request: Request) -> tuple[Team, None] | tuple[None, Response]:
@@ -52,17 +56,18 @@ def _authenticate_team(request: Request) -> tuple[Team, None] | tuple[None, Resp
     if not api_key:
         return None, Response({"error": "Empty API key"}, status=status.HTTP_401_UNAUTHORIZED)
 
+    # Authenticate against secret_api_token (not api_token) because api_token
+    # is the public project key embedded in client-side JS and visible to anyone.
     try:
-        team = Team.objects.get(api_token=api_key, conversations_enabled=True)
-    except Team.DoesNotExist:
+        team = Team.objects.get(
+            Q(secret_api_token=api_key) | Q(secret_api_token_backup=api_key),
+            conversations_enabled=True,
+        )
+    except (Team.DoesNotExist, Team.MultipleObjectsReturned):
         return None, Response({"error": "Invalid API key"}, status=status.HTTP_401_UNAUTHORIZED)
 
+    TICKET_ACTION_AUTH_COUNTER.labels(auth_method="secret_api_token", http_method=(request.method or "").lower()).inc()
     return team, None
-
-
-class ExternalTicketUpdateSerializer(serializers.Serializer):
-    status = serializers.ChoiceField(choices=[s.value for s in Status], required=False)
-    priority = serializers.ChoiceField(choices=[p.value for p in Priority], required=False)
 
 
 class ExternalTicketView(APIView):
@@ -70,7 +75,7 @@ class ExternalTicketView(APIView):
     GET /api/conversations/external/ticket/<ticket_id>  — Fetch ticket data
     PATCH /api/conversations/external/ticket/<ticket_id> — Update ticket fields
 
-    Authenticated via Bearer token (team api_token) in Authorization header.
+    Authenticated via Bearer token (team secret_api_token) in Authorization header.
     """
 
     authentication_classes = []
@@ -84,28 +89,7 @@ class ExternalTicketView(APIView):
 
         assert team is not None
 
-        try:
-            ticket = Ticket.objects.get(id=ticket_id, team_id=team.id)
-        except Ticket.DoesNotExist:
-            return Response({"error": "Ticket not found"}, status=status.HTTP_404_NOT_FOUND)
-
-        return Response(
-            {
-                "id": str(ticket.id),
-                "ticket_number": ticket.ticket_number,
-                "status": ticket.status,
-                "priority": ticket.priority,
-                "channel_source": ticket.channel_source,
-                "distinct_id": ticket.distinct_id,
-                "created_at": ticket.created_at.isoformat(),
-                "updated_at": ticket.updated_at.isoformat(),
-                "message_count": ticket.message_count,
-                "last_message_at": ticket.last_message_at.isoformat() if ticket.last_message_at else None,
-                "last_message_text": ticket.last_message_text,
-                "unread_team_count": ticket.unread_team_count,
-                "unread_customer_count": ticket.unread_customer_count,
-            }
-        )
+        return handle_ticket_get(team, ticket_id)
 
     def patch(self, request: Request, ticket_id: str) -> Response:
         team, error = _authenticate_team(request)
@@ -114,32 +98,4 @@ class ExternalTicketView(APIView):
 
         assert team is not None
 
-        serializer = ExternalTicketUpdateSerializer(data=request.data)
-        if not serializer.is_valid():
-            return Response({"error": serializer.errors}, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            ticket = Ticket.objects.get(id=ticket_id, team_id=team.id)
-        except Ticket.DoesNotExist:
-            return Response({"error": "Ticket not found"}, status=status.HTTP_404_NOT_FOUND)
-
-        update_fields: list[str] = []
-
-        new_status = serializer.validated_data.get("status")
-        if new_status is not None:
-            old_status = ticket.status
-            ticket.status = new_status
-            update_fields.append("status")
-
-            if old_status == "resolved" or new_status == "resolved":
-                invalidate_unread_count_cache(team.id)
-
-        new_priority = serializer.validated_data.get("priority")
-        if new_priority is not None:
-            ticket.priority = new_priority
-            update_fields.append("priority")
-
-        if update_fields:
-            ticket.save(update_fields=[*update_fields, "updated_at"])
-
-        return Response({"ok": True})
+        return handle_ticket_patch(request, team, ticket_id)
